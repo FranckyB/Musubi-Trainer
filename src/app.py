@@ -1,10 +1,27 @@
 import subprocess
 import sys
 import argparse
-import json
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, List
+from typing import Callable, Iterable
+
+from .app_settings import (
+    KLEIN_DIT_KEY,
+    KLEIN_MODEL_VERSION_KEY,
+    KLEIN_TEXT_ENCODER_KEY,
+    KLEIN_VAE_KEY,
+    LTX_DIT_KEY,
+    LTX_MODEL_VERSION_KEY,
+    LTX_TEXT_ENCODER_KEY,
+    LTX_VAE_KEY,
+    MUSUBI_DIR_KEY,
+    SETTINGS_FILE,
+    WINDOW_X_KEY,
+    WINDOW_Y_KEY,
+    load_settings,
+    load_window_position,
+    save_settings,
+)
+from .runtime_config import RuntimeConfig, runtime_config_from_settings
 
 
 # Training settings
@@ -14,95 +31,9 @@ NETWORK_ALPHA = 32
 LR = "1e-4"
 STEPS = 3000
 
-# Base directories
-MUSUBI_DIR = Path(r"D:\musubi-tuner")
-TRAINING_DIR = MUSUBI_DIR / "training"
-
 # Model files
-MODEL_VERSION = "klein-base-9b"
 VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 LATENT_SUFFIX = "f2k9b"
-SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
-WINDOW_X_KEY = "window_x"
-WINDOW_Y_KEY = "window_y"
-MUSUBI_DIR_KEY = "musubi_dir"
-KLEIN_MODEL_DIR_KEY = "klein_model_dir"
-LTX_MODEL_DIR_KEY = "ltx_model_dir"
-
-
-@dataclass(frozen=True)
-class RuntimeConfig:
-    musubi_dir: Path
-    training_dir: Path
-    model_version: str
-    dit: Path
-    vae: Path
-    text_encoder: Path
-
-
-def load_settings() -> dict[str, str]:
-    if not SETTINGS_FILE.exists():
-        return {}
-
-    try:
-        raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-    if not isinstance(raw, dict):
-        return {}
-
-    return {str(k): str(v) for k, v in raw.items()}
-
-
-def save_settings(settings: dict[str, str]) -> None:
-    SETTINGS_FILE.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-
-
-def parse_int_setting(settings: dict[str, str], key: str) -> int | None:
-    raw = settings.get(key)
-    if raw is None:
-        return None
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return None
-
-
-def load_window_position(settings: dict[str, str]) -> tuple[int, int] | None:
-    x = parse_int_setting(settings, WINDOW_X_KEY)
-    y = parse_int_setting(settings, WINDOW_Y_KEY)
-    if x is None or y is None:
-        return None
-    return x, y
-
-
-def runtime_config_from_settings(settings: dict[str, str]) -> RuntimeConfig | None:
-    musubi_raw = settings.get(MUSUBI_DIR_KEY, "").strip()
-    if not musubi_raw:
-        return None
-
-    musubi_dir = Path(musubi_raw).expanduser()
-    klein_model_raw = settings.get(KLEIN_MODEL_DIR_KEY, "").strip()
-    if klein_model_raw:
-        klein_model_dir = Path(klein_model_raw).expanduser()
-    else:
-        klein_model_dir = musubi_dir / "models" / "klein"
-
-    return RuntimeConfig(
-        musubi_dir=musubi_dir,
-        training_dir=musubi_dir / "training",
-        model_version=MODEL_VERSION,
-        dit=klein_model_dir / "flux-2-klein-base-9b.safetensors",
-        vae=klein_model_dir / "ae.safetensors",
-        text_encoder=klein_model_dir / "text_encoder" / "model-00001-of-00004.safetensors",
-    )
-
-
-def parse_model_names(raw: str) -> List[str]:
-    """Split comma-separated names and trim surrounding whitespace."""
-    names = [part.strip() for part in raw.split(",")]
-    return [name for name in names if name]
 
 
 def scan_training_folders(training_dir: Path) -> list[str]:
@@ -228,6 +159,13 @@ def run_steps_for_model(
     do_train: bool,
     logger: Callable[[str], None],
 ) -> None:
+    def require_model_file(path_value: Path | None, label: str) -> Path:
+        if path_value is None:
+            raise RuntimeError(f"{label} is not configured. Open Settings and select a file for {label}.")
+        if not path_value.is_file():
+            raise RuntimeError(f"{label} file does not exist: {path_value}")
+        return path_value
+
     dataset_config = runtime_config.training_dir / model_name / "dataset.toml"
     output_dir = runtime_config.training_dir / model_name / "output"
     output_name = f"{model_name}_Klein"
@@ -243,6 +181,7 @@ def run_steps_for_model(
         logger(f"  prep: dataset.toml {toml_status}, captions created {prep_result['created']}")
 
     if do_cache_latents:
+        vae_path = require_model_file(runtime_config.vae, "Klein VAE")
         run_command(
             [
                 sys.executable,
@@ -250,7 +189,7 @@ def run_steps_for_model(
                 "--dataset_config",
                 str(dataset_config),
                 "--vae",
-                str(runtime_config.vae),
+                str(vae_path),
                 "--batch_size",
                 "16",
                 "--model_version",
@@ -260,6 +199,7 @@ def run_steps_for_model(
         )
 
     if do_cache_text:
+        text_encoder_path = require_model_file(runtime_config.text_encoder, "Klein Text Encoder")
         run_command(
             [
                 sys.executable,
@@ -267,7 +207,7 @@ def run_steps_for_model(
                 "--dataset_config",
                 str(dataset_config),
                 "--text_encoder",
-                str(runtime_config.text_encoder),
+                str(text_encoder_path),
                 "--batch_size",
                 "16",
                 "--model_version",
@@ -277,14 +217,17 @@ def run_steps_for_model(
         )
 
     if do_train:
+        dit_path = require_model_file(runtime_config.dit, "Klein Model")
+        vae_path = require_model_file(runtime_config.vae, "Klein VAE")
+        text_encoder_path = require_model_file(runtime_config.text_encoder, "Klein Text Encoder")
         run_command(
             [
                 sys.executable,
                 "flux_2_train_network.py",
-                "--dit", str(runtime_config.dit),
-                "--vae", str(runtime_config.vae),
+                "--dit", str(dit_path),
+                "--vae", str(vae_path),
                 "--vae_dtype", "bf16",
-                "--text_encoder", str(runtime_config.text_encoder),
+                "--text_encoder", str(text_encoder_path),
                 "--model_version", runtime_config.model_version,
                 "--optimizer_type", "adamw8bit",
                 "--timestep_sampling", "flux2_shift",
@@ -397,6 +340,8 @@ def launch_ui() -> int:
     fg_muted = "#a9a9a9"
     border_dark = "#3a3a3a"
     color_green = "#35c46a"
+    workspace_dir = Path(__file__).resolve().parent.parent
+    default_models_dir = workspace_dir / "Models"
 
     def center_window(window: tk.Misc) -> None:
         window.update_idletasks()
@@ -483,6 +428,19 @@ def launch_ui() -> int:
         relief="flat",
     )
     style.map("TButton", background=[("active", "#404040")])
+    style.configure(
+        "TEntry",
+        fieldbackground="#1f1f1f",
+        foreground=fg_text,
+        bordercolor=border_dark,
+        lightcolor=border_dark,
+        darkcolor=border_dark,
+    )
+    style.map(
+        "TEntry",
+        fieldbackground=[("readonly", "#1f1f1f"), ("disabled", "#2a2a2a")],
+        foreground=[("disabled", fg_muted)],
+    )
     style.configure("TCheckbutton", background=bg_panel, foreground=fg_text)
     style.map("TCheckbutton", background=[("active", bg_panel)], foreground=[("disabled", fg_muted)])
     style.configure(
@@ -527,8 +485,11 @@ def launch_ui() -> int:
 
     vars_by_name: dict[str, tk.BooleanVar] = {}
     card_widgets: list[tk.Widget] = []
-    thumbnail_refs: list[ImageTk.PhotoImage] = []
+    thumbnail_cache: dict[tuple[str, bool, int, int], ImageTk.PhotoImage] = {}
+    status_cache: dict[str, dict[str, bool]] = {}
+    first_image_cache: dict[str, Path | None] = {}
     resize_after_id: str | None = None
+    last_canvas_width = 0
     dataset_order: list[str] = []
     active_dataset_name: str | None = None
     runtime_config = runtime_config_from_settings(settings_state)
@@ -537,8 +498,14 @@ def launch_ui() -> int:
         current_dir = ""
         if runtime_config is not None:
             current_dir = str(runtime_config.musubi_dir)
-        current_klein_dir = settings_state.get(KLEIN_MODEL_DIR_KEY, "").strip()
-        current_ltx_dir = settings_state.get(LTX_MODEL_DIR_KEY, "").strip()
+        current_klein_model_version = settings_state.get(KLEIN_MODEL_VERSION_KEY, "").strip() or "klein-base-9b"
+        current_klein_dit = settings_state.get(KLEIN_DIT_KEY, "").strip()
+        current_klein_vae = settings_state.get(KLEIN_VAE_KEY, "").strip()
+        current_klein_text_encoder = settings_state.get(KLEIN_TEXT_ENCODER_KEY, "").strip()
+        current_ltx_model_version = settings_state.get(LTX_MODEL_VERSION_KEY, "").strip()
+        current_ltx_dit = settings_state.get(LTX_DIT_KEY, "").strip()
+        current_ltx_vae = settings_state.get(LTX_VAE_KEY, "").strip()
+        current_ltx_text_encoder = settings_state.get(LTX_TEXT_ENCODER_KEY, "").strip()
 
         result: RuntimeConfig | None = None
         dialog = tk.Toplevel(root)
@@ -558,17 +525,31 @@ def launch_ui() -> int:
         musubi_section.grid(row=0, column=0, sticky="ew")
         musubi_section.columnconfigure(1, weight=1)
 
-        model_section = ttk.LabelFrame(frame, text="Model Configs", padding=8)
-        model_section.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        model_section.columnconfigure(1, weight=1)
+        klein_section = ttk.LabelFrame(frame, text="Klein", padding=8)
+        klein_section.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        klein_section.columnconfigure(1, weight=1)
+
+        ltx_section = ttk.LabelFrame(frame, text="LTX", padding=8)
+        ltx_section.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ltx_section.columnconfigure(1, weight=1)
 
         selected_musubi_path = current_dir
-        selected_klein_path = current_klein_dir
-        selected_ltx_path = current_ltx_dir
+        selected_klein_dit = current_klein_dit
+        selected_klein_vae = current_klein_vae
+        selected_klein_text_encoder = current_klein_text_encoder
+        selected_ltx_dit = current_ltx_dit
+        selected_ltx_vae = current_ltx_vae
+        selected_ltx_text_encoder = current_ltx_text_encoder
 
         musubi_display_var = tk.StringVar(value=current_dir if current_dir else "(none)")
-        klein_display_var = tk.StringVar(value=current_klein_dir if current_klein_dir else "(none)")
-        ltx_display_var = tk.StringVar(value=current_ltx_dir if current_ltx_dir else "(none)")
+        klein_model_version_var = tk.StringVar(value=current_klein_model_version)
+        klein_dit_var = tk.StringVar(value=current_klein_dit if current_klein_dit else "(none)")
+        klein_vae_var = tk.StringVar(value=current_klein_vae if current_klein_vae else "(none)")
+        klein_text_encoder_var = tk.StringVar(value=current_klein_text_encoder if current_klein_text_encoder else "(none)")
+        ltx_model_version_var = tk.StringVar(value=current_ltx_model_version)
+        ltx_dit_var = tk.StringVar(value=current_ltx_dit if current_ltx_dit else "(none)")
+        ltx_vae_var = tk.StringVar(value=current_ltx_vae if current_ltx_vae else "(none)")
+        ltx_text_encoder_var = tk.StringVar(value=current_ltx_text_encoder if current_ltx_text_encoder else "(none)")
 
         ttk.Label(musubi_section, text="Musubi-Tuner folder:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         musubi_display = ttk.Label(
@@ -576,40 +557,125 @@ def launch_ui() -> int:
         )
         musubi_display.grid(row=0, column=1, sticky="ew")
 
-        ttk.Label(model_section, text="Klein model folder:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        klein_display = ttk.Label(
-            model_section, textvariable=klein_display_var, anchor="w", relief="sunken", padding=(6, 4)
-        )
-        klein_display.grid(row=0, column=1, sticky="ew")
+        ttk.Label(klein_section, text="Model version:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        klein_model_version_entry = ttk.Entry(klein_section, textvariable=klein_model_version_var)
+        klein_model_version_entry.grid(row=0, column=1, sticky="ew")
 
-        ttk.Label(model_section, text="LTX model folder:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ltx_display = ttk.Label(
-            model_section, textvariable=ltx_display_var, anchor="w", relief="sunken", padding=(6, 4)
+        ttk.Label(klein_section, text="Model:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        klein_dit_display = ttk.Label(
+            klein_section, textvariable=klein_dit_var, anchor="w", relief="sunken", padding=(6, 4)
         )
-        ltx_display.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+        klein_dit_display.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+
+        ttk.Label(klein_section, text="VAE:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        klein_vae_display = ttk.Label(
+            klein_section, textvariable=klein_vae_var, anchor="w", relief="sunken", padding=(6, 4)
+        )
+        klein_vae_display.grid(row=2, column=1, sticky="ew", pady=(8, 0))
+
+        ttk.Label(klein_section, text="Text Encoder:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        klein_text_encoder_display = ttk.Label(
+            klein_section, textvariable=klein_text_encoder_var, anchor="w", relief="sunken", padding=(6, 4)
+        )
+        klein_text_encoder_display.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+
+        ttk.Label(ltx_section, text="Model version:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ltx_model_version_entry = ttk.Entry(ltx_section, textvariable=ltx_model_version_var)
+        ltx_model_version_entry.grid(row=0, column=1, sticky="ew")
+
+        ttk.Label(ltx_section, text="Model:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ltx_dit_display = ttk.Label(
+            ltx_section, textvariable=ltx_dit_var, anchor="w", relief="sunken", padding=(6, 4)
+        )
+        ltx_dit_display.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+
+        ttk.Label(ltx_section, text="VAE:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ltx_vae_display = ttk.Label(
+            ltx_section, textvariable=ltx_vae_var, anchor="w", relief="sunken", padding=(6, 4)
+        )
+        ltx_vae_display.grid(row=2, column=1, sticky="ew", pady=(8, 0))
+
+        ttk.Label(ltx_section, text="Text Encoder:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ltx_text_encoder_display = ttk.Label(
+            ltx_section, textvariable=ltx_text_encoder_var, anchor="w", relief="sunken", padding=(6, 4)
+        )
+        ltx_text_encoder_display.grid(row=3, column=1, sticky="ew", pady=(8, 0))
 
         def browse_musubi() -> None:
             nonlocal selected_musubi_path
-            picked = filedialog.askdirectory(initialdir=selected_musubi_path or str(Path.home()))
+            picked = filedialog.askdirectory(
+                parent=dialog,
+                title="Select Musubi-Tuner folder",
+                initialdir=selected_musubi_path or str(Path.home()),
+            )
             if picked:
                 selected_musubi_path = picked
                 musubi_display_var.set(picked)
 
-        def browse_klein() -> None:
-            nonlocal selected_klein_path
-            initial_dir = selected_klein_path or selected_musubi_path or str(Path.home())
-            picked = filedialog.askdirectory(initialdir=initial_dir)
-            if picked:
-                selected_klein_path = picked
-                klein_display_var.set(picked)
+        def browse_file(current_path: str, initial_dir_hint: str, title: str) -> str | None:
+            initial_dir = initial_dir_hint
+            if default_models_dir.exists() and default_models_dir.is_dir():
+                initial_dir = str(default_models_dir)
+            if current_path:
+                current_parent = Path(current_path).expanduser().parent
+                initial_dir = str(current_parent)
+            picked = filedialog.askopenfilename(
+                parent=dialog,
+                title=title,
+                initialdir=initial_dir or str(Path.home()),
+                filetypes=[("Safetensors", "*.safetensors"), ("All files", "*.*")],
+            )
+            return picked if picked else None
 
-        def browse_ltx() -> None:
-            nonlocal selected_ltx_path
-            initial_dir = selected_ltx_path or selected_musubi_path or str(Path.home())
-            picked = filedialog.askdirectory(initialdir=initial_dir)
+        def browse_klein_dit() -> None:
+            nonlocal selected_klein_dit
+            picked = browse_file(selected_klein_dit, selected_musubi_path, "Select Klein model file")
             if picked:
-                selected_ltx_path = picked
-                ltx_display_var.set(picked)
+                selected_klein_dit = picked
+                klein_dit_var.set(picked)
+
+        def browse_klein_vae() -> None:
+            nonlocal selected_klein_vae
+            picked = browse_file(selected_klein_vae, selected_musubi_path, "Select Klein VAE file")
+            if picked:
+                selected_klein_vae = picked
+                klein_vae_var.set(picked)
+
+        def browse_klein_text_encoder() -> None:
+            nonlocal selected_klein_text_encoder
+            picked = browse_file(
+                selected_klein_text_encoder,
+                selected_musubi_path,
+                "Select Klein text encoder file",
+            )
+            if picked:
+                selected_klein_text_encoder = picked
+                klein_text_encoder_var.set(picked)
+
+        def browse_ltx_dit() -> None:
+            nonlocal selected_ltx_dit
+            picked = browse_file(selected_ltx_dit, selected_musubi_path, "Select LTX model file")
+            if picked:
+                selected_ltx_dit = picked
+                ltx_dit_var.set(picked)
+
+        def browse_ltx_vae() -> None:
+            nonlocal selected_ltx_vae
+            picked = browse_file(selected_ltx_vae, selected_musubi_path, "Select LTX VAE file")
+            if picked:
+                selected_ltx_vae = picked
+                ltx_vae_var.set(picked)
+
+        def browse_ltx_text_encoder() -> None:
+            nonlocal selected_ltx_text_encoder
+            picked = browse_file(
+                selected_ltx_text_encoder,
+                selected_musubi_path,
+                "Select LTX text encoder file",
+            )
+            if picked:
+                selected_ltx_text_encoder = picked
+                ltx_text_encoder_var.set(picked)
 
         def save_and_close() -> None:
             nonlocal result, settings_state
@@ -622,21 +688,48 @@ def launch_ui() -> int:
                 messagebox.showerror("Invalid folder", "Choose a valid Musubi-Tuner folder.", parent=dialog)
                 return
 
-            if selected_klein_path:
-                klein_path = Path(selected_klein_path).expanduser()
-                if not klein_path.exists() or not klein_path.is_dir():
-                    messagebox.showerror("Invalid folder", "Choose a valid Klein model folder.", parent=dialog)
+            klein_model_version = klein_model_version_var.get().strip()
+            if not klein_model_version:
+                messagebox.showerror("Missing value", "Klein model version is required.", parent=dialog)
+                return
+
+            for label, raw_path in (
+                ("Klein Model", selected_klein_dit),
+                ("Klein VAE", selected_klein_vae),
+                ("Klein Text Encoder", selected_klein_text_encoder),
+            ):
+                if not raw_path:
+                    continue
+                resolved = Path(raw_path).expanduser()
+                if not resolved.exists() or not resolved.is_file():
+                    messagebox.showerror("Invalid file", f"Choose a valid file for {label}.", parent=dialog)
                     return
 
-            if selected_ltx_path:
-                ltx_path = Path(selected_ltx_path).expanduser()
-                if not ltx_path.exists() or not ltx_path.is_dir():
-                    messagebox.showerror("Invalid folder", "Choose a valid LTX model folder.", parent=dialog)
+            for label, raw_path in (
+                ("LTX Model", selected_ltx_dit),
+                ("LTX VAE", selected_ltx_vae),
+                ("LTX Text Encoder", selected_ltx_text_encoder),
+            ):
+                if not raw_path:
+                    continue
+                resolved = Path(raw_path).expanduser()
+                if not resolved.exists() or not resolved.is_file():
+                    messagebox.showerror("Invalid file", f"Choose a valid file for {label}.", parent=dialog)
                     return
 
             settings_state[MUSUBI_DIR_KEY] = str(musubi_path)
-            settings_state[KLEIN_MODEL_DIR_KEY] = str(Path(selected_klein_path).expanduser()) if selected_klein_path else ""
-            settings_state[LTX_MODEL_DIR_KEY] = str(Path(selected_ltx_path).expanduser()) if selected_ltx_path else ""
+            settings_state[KLEIN_MODEL_VERSION_KEY] = klein_model_version
+            settings_state[KLEIN_DIT_KEY] = str(Path(selected_klein_dit).expanduser()) if selected_klein_dit else ""
+            settings_state[KLEIN_VAE_KEY] = str(Path(selected_klein_vae).expanduser()) if selected_klein_vae else ""
+            settings_state[KLEIN_TEXT_ENCODER_KEY] = (
+                str(Path(selected_klein_text_encoder).expanduser()) if selected_klein_text_encoder else ""
+            )
+            settings_state[LTX_MODEL_VERSION_KEY] = ltx_model_version_var.get().strip()
+            settings_state[LTX_DIT_KEY] = str(Path(selected_ltx_dit).expanduser()) if selected_ltx_dit else ""
+            settings_state[LTX_VAE_KEY] = str(Path(selected_ltx_vae).expanduser()) if selected_ltx_vae else ""
+            settings_state[LTX_TEXT_ENCODER_KEY] = (
+                str(Path(selected_ltx_text_encoder).expanduser()) if selected_ltx_text_encoder else ""
+            )
             save_settings(settings_state)
             result = runtime_config_from_settings(settings_state)
             dialog.destroy()
@@ -644,16 +737,25 @@ def launch_ui() -> int:
         def cancel_and_close() -> None:
             dialog.destroy()
 
-        ttk.Button(musubi_section, text="Browse", command=browse_musubi).grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(model_section, text="Browse", command=browse_klein).grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(model_section, text="Browse", command=browse_ltx).grid(row=1, column=2, padx=(8, 0), pady=(8, 0))
+        ttk.Button(musubi_section, text="Browse Folder", command=browse_musubi).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(klein_section, text="Browse File", command=browse_klein_dit).grid(row=1, column=2, padx=(8, 0), pady=(8, 0))
+        ttk.Button(klein_section, text="Browse File", command=browse_klein_vae).grid(row=2, column=2, padx=(8, 0), pady=(8, 0))
+        ttk.Button(klein_section, text="Browse File", command=browse_klein_text_encoder).grid(
+            row=3, column=2, padx=(8, 0), pady=(8, 0)
+        )
+
+        ttk.Button(ltx_section, text="Browse File", command=browse_ltx_dit).grid(row=1, column=2, padx=(8, 0), pady=(8, 0))
+        ttk.Button(ltx_section, text="Browse File", command=browse_ltx_vae).grid(row=2, column=2, padx=(8, 0), pady=(8, 0))
+        ttk.Button(ltx_section, text="Browse File", command=browse_ltx_text_encoder).grid(
+            row=3, column=2, padx=(8, 0), pady=(8, 0)
+        )
 
         ttk.Label(frame, text="LTX path is saved for future support.").grid(
-            row=2, column=0, sticky="w", pady=(10, 8)
+            row=3, column=0, sticky="w", pady=(10, 8)
         )
 
         button_row = ttk.Frame(frame)
-        button_row.grid(row=3, column=0, sticky="e")
+        button_row.grid(row=4, column=0, sticky="e")
         ttk.Button(button_row, text="Cancel", command=cancel_and_close).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(button_row, text="Save", command=save_and_close).grid(row=0, column=1)
 
@@ -662,11 +764,11 @@ def launch_ui() -> int:
 
         content_w = frame.winfo_reqwidth() + 20
         content_h = frame.winfo_reqheight() + 20
-        win_w = max(620, min(840, content_w))
-        win_h = max(280, content_h)
+        win_w = max(780, min(1080, content_w))
+        win_h = max(520, content_h)
         dialog.geometry(f"{win_w}x{win_h}")
         center_window(dialog)
-        musubi_display.focus_set()
+        klein_model_version_entry.focus_set()
         root.wait_window(dialog)
 
         if required and result is None:
@@ -769,18 +871,38 @@ def launch_ui() -> int:
         root.update_idletasks()
 
     def first_image_path(dataset_name: str) -> Path | None:
+        cached = first_image_cache.get(dataset_name)
+        if dataset_name in first_image_cache:
+            return cached
+
         images_dir = runtime_config.training_dir / dataset_name / "images"
         if not images_dir.exists():
+            first_image_cache[dataset_name] = None
             return None
 
-        for suffix in (".png", ".jpg", ".jpeg"):
-            matches = sorted([p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() == suffix])
-            if matches:
-                return matches[0]
-        return None
+        image_candidates = sorted(
+            [p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTENSIONS]
+        )
+        chosen = image_candidates[0] if image_candidates else None
+        first_image_cache[dataset_name] = chosen
+        return chosen
 
     def make_thumbnail(image_path: Path | None, ready_to_train: bool, thumb_px: int) -> ImageTk.PhotoImage:
         thumb_size = (thumb_px, thumb_px)
+        cache_path = "__none__"
+        cache_mtime_ns = 0
+        if image_path is not None:
+            cache_path = str(image_path)
+            try:
+                cache_mtime_ns = image_path.stat().st_mtime_ns
+            except OSError:
+                cache_mtime_ns = 0
+
+        cache_key = (cache_path, ready_to_train, thumb_px, cache_mtime_ns)
+        cached_thumb = thumbnail_cache.get(cache_key)
+        if cached_thumb is not None:
+            return cached_thumb
+
         if image_path is None:
             image = Image.new("RGB", thumb_size, color="#3a3a3a")
         else:
@@ -820,7 +942,7 @@ def launch_ui() -> int:
             draw.ellipse((x1, y1, x2, y2), fill="#525c69")
 
         photo = ImageTk.PhotoImage(image)
-        thumbnail_refs.append(photo)
+        thumbnail_cache[cache_key] = photo
         return photo
 
     def toggle_dataset(name: str) -> None:
@@ -859,10 +981,14 @@ def launch_ui() -> int:
         nonlocal dataset_order, active_dataset_name
         selected_before = {name for name, var in vars_by_name.items() if var.get()}
 
+        if force:
+            status_cache.clear()
+            first_image_cache.clear()
+            thumbnail_cache.clear()
+
         for widget in card_widgets:
             widget.destroy()
         card_widgets.clear()
-        thumbnail_refs.clear()
         vars_by_name.clear()
 
         scanned_names = scan_training_folders(runtime_config.training_dir)
@@ -874,6 +1000,10 @@ def launch_ui() -> int:
             dataset_order = existing + new_names
 
         names = dataset_order
+        stale_names = [name for name in list(status_cache.keys()) if name not in names]
+        for stale_name in stale_names:
+            status_cache.pop(stale_name, None)
+            first_image_cache.pop(stale_name, None)
 
         if not names:
             empty_label = ttk.Label(inner, text="No folders found.")
@@ -903,7 +1033,10 @@ def launch_ui() -> int:
             var = tk.BooleanVar(value=name in selected_before)
             vars_by_name[name] = var
 
-            status = dataset_status(runtime_config.training_dir, name)
+            status = status_cache.get(name)
+            if status is None:
+                status = dataset_status(runtime_config.training_dir, name)
+                status_cache[name] = status
 
             card_style = "ActiveCard.TFrame" if name == active_dataset_name else "Card.TFrame"
             card = ttk.Frame(inner, padding=6, style=card_style, width=card_width, height=card_height)
@@ -940,8 +1073,15 @@ def launch_ui() -> int:
 
             card_widgets.append(card)
 
-    def request_relayout() -> None:
-        nonlocal resize_after_id
+    def request_relayout(canvas_width: int | None = None) -> None:
+        nonlocal resize_after_id, last_canvas_width
+        width = canvas_width if canvas_width is not None else canvas.winfo_width()
+        if width <= 1:
+            return
+        if width == last_canvas_width:
+            return
+        last_canvas_width = width
+
         if resize_after_id is not None:
             root.after_cancel(resize_after_id)
         resize_after_id = root.after(120, rebuild_folder_list)
@@ -1027,7 +1167,7 @@ def launch_ui() -> int:
     move_down_button.grid(row=0, column=4, padx=(0, 8), sticky="w")
     run_button.grid(row=0, column=5, padx=(0, 8), sticky="w")
 
-    canvas.bind("<Configure>", lambda _e: request_relayout())
+    canvas.bind("<Configure>", lambda e: request_relayout(e.width))
     list_container.bind("<Enter>", bind_dataset_wheel)
     list_container.bind("<Leave>", unbind_dataset_wheel)
     canvas.bind("<Enter>", bind_dataset_wheel)
