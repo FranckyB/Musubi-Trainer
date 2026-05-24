@@ -1,6 +1,8 @@
 import subprocess
 import sys
 import argparse
+import re
+import configparser
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -15,9 +17,12 @@ from .app_settings import (
     LTX_VAE_KEY,
     MUSUBI_DIR_KEY,
     SETTINGS_FILE,
+    WINDOW_HEIGHT_KEY,
+    WINDOW_WIDTH_KEY,
     WINDOW_X_KEY,
     WINDOW_Y_KEY,
     load_settings,
+    load_window_size,
     load_window_position,
     save_settings,
 )
@@ -34,6 +39,71 @@ STEPS = 3000
 # Model files
 VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 LATENT_SUFFIX = "f2k9b"
+DATASET_ORDER_KEY = "dataset_order"
+
+
+def load_ui_config(config_path: Path) -> dict[str, int]:
+    defaults = {
+        "window_width": 780,
+        "window_height": 1000,
+        "min_window_width": 780,
+        "min_window_height": 1000,
+        "card_gap": 8,
+        "card_width": 172,
+        "thumbnail_size": 152,
+        "card_height": 212,
+        "relayout_debounce_ms": 120,
+    }
+
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(config_path, encoding="utf-8")
+    except Exception:
+        return defaults
+
+    if "ui" not in parser:
+        return defaults
+
+    ui = parser["ui"]
+    resolved = defaults.copy()
+    for key, fallback in defaults.items():
+        try:
+            resolved[key] = max(1, ui.getint(key, fallback=fallback))
+        except (TypeError, ValueError):
+            resolved[key] = fallback
+    return resolved
+
+
+def load_dataset_order(settings: dict[str, str]) -> list[str]:
+    raw = settings.get(DATASET_ORDER_KEY, "").strip()
+    if not raw:
+        return []
+    return [name for name in raw.split("|") if name]
+
+
+def save_dataset_order(settings: dict[str, str], dataset_order: list[str]) -> None:
+    settings[DATASET_ORDER_KEY] = "|".join(dataset_order)
+
+
+def latest_checkpoint_for_dataset(training_dir: Path, dataset_name: str) -> tuple[Path | None, int]:
+    output_dir = training_dir / dataset_name / "output"
+    if not output_dir.exists():
+        return None, 0
+
+    pattern = re.compile(rf"^{re.escape(dataset_name)}_Klein-step(\d+)\.safetensors$", re.IGNORECASE)
+    latest_step = 0
+    latest_path: Path | None = None
+
+    for checkpoint_path in output_dir.glob("*.safetensors"):
+        match = pattern.match(checkpoint_path.name)
+        if not match:
+            continue
+        step = int(match.group(1))
+        if step > latest_step:
+            latest_step = step
+            latest_path = checkpoint_path
+
+    return latest_path, latest_step
 
 
 def scan_training_folders(training_dir: Path) -> list[str]:
@@ -157,6 +227,8 @@ def run_steps_for_model(
     do_cache_latents: bool,
     do_cache_text: bool,
     do_train: bool,
+    resume_checkpoint: Path | None,
+    train_steps_override: int | None,
     logger: Callable[[str], None],
 ) -> None:
     def require_model_file(path_value: Path | None, label: str) -> Path:
@@ -220,6 +292,7 @@ def run_steps_for_model(
         dit_path = require_model_file(runtime_config.dit, "Klein Model")
         vae_path = require_model_file(runtime_config.vae, "Klein VAE")
         text_encoder_path = require_model_file(runtime_config.text_encoder, "Klein Text Encoder")
+        train_steps = train_steps_override if train_steps_override is not None else STEPS
         run_command(
             [
                 sys.executable,
@@ -238,7 +311,7 @@ def run_steps_for_model(
                 "--network_dim", str(NETWORK_DIM),
                 "--network_alpha", str(NETWORK_ALPHA),
                 "--learning_rate", LR,
-                "--max_train_steps", str(STEPS),
+                "--max_train_steps", str(train_steps),
                 "--mixed_precision", "bf16",
                 "--sdpa",
                 "--gradient_checkpointing",
@@ -246,6 +319,7 @@ def run_steps_for_model(
                 "--max_data_loader_n_workers", "2",
                 "--save_every_n_steps", "250",
                 "--seed", "42",
+                *( ["--resume", str(resume_checkpoint)] if resume_checkpoint is not None else [] ),
             ],
             cwd=runtime_config.musubi_dir,
         )
@@ -291,6 +365,16 @@ def train_models(
         effective_do_cache_latents = do_cache_latents
         effective_do_cache_text = do_cache_text
         effective_do_train = do_train
+        resume_checkpoint, resume_step = latest_checkpoint_for_dataset(runtime_config.training_dir, model_name)
+        train_steps_override: int | None = None
+
+        if resume_step >= STEPS:
+            logger(f"  checkpoint already complete at step {resume_step}: skipping")
+            continue
+
+        if resume_checkpoint is not None and resume_step > 0:
+            train_steps_override = max(1, STEPS - resume_step)
+            logger(f"  resuming from {resume_checkpoint.name} (step {resume_step}), remaining steps {train_steps_override}")
 
         if all_steps_selected:
             status = dataset_status(runtime_config.training_dir, model_name)
@@ -309,6 +393,8 @@ def train_models(
                 do_cache_latents=effective_do_cache_latents,
                 do_cache_text=effective_do_cache_text,
                 do_train=effective_do_train,
+                resume_checkpoint=resume_checkpoint if train_steps_override is not None else None,
+                train_steps_override=train_steps_override,
                 logger=logger,
             )
             logger(f"[{index}/{len(model_names)}] Completed: {model_name}")
@@ -340,7 +426,11 @@ def launch_ui() -> int:
     fg_muted = "#a9a9a9"
     border_dark = "#3a3a3a"
     color_green = "#35c46a"
+    color_start_enabled = "#35c46a"
+    color_start_enabled_active = "#4dd97f"
+    color_start_disabled = "#3b3b3b"
     workspace_dir = Path(__file__).resolve().parent.parent
+    ui_config = load_ui_config(Path(__file__).resolve().parent / "app.config")
     default_models_dir = workspace_dir / "Models"
 
     def center_window(window: tk.Misc) -> None:
@@ -354,23 +444,35 @@ def launch_ui() -> int:
         window.geometry(f"+{pos_x}+{pos_y}")
 
     root = tk.Tk()
-    root.title("Klein Training Launcher")
-    root.geometry("660x840")
-    root.minsize(620, 800)
+    root.title("Musubi Training Launcher")
+    root.geometry(f"{ui_config['window_width']}x{ui_config['window_height']}")
+    root.minsize(ui_config["min_window_width"], ui_config["min_window_height"])
     root.configure(bg=bg_root)
 
     settings_state = load_settings()
     window_position_applied = False
-    save_position_after_id: str | None = None
 
     def apply_initial_main_window_position() -> None:
         nonlocal window_position_applied
         root.update_idletasks()
 
-        width = max(root.winfo_width(), root.winfo_reqwidth())
-        height = max(root.winfo_height(), root.winfo_reqheight())
+        min_width = root.winfo_reqwidth()
+        min_height = root.winfo_reqheight()
+
+        saved_size = load_window_size(settings_state)
+        if saved_size is None:
+            width = max(root.winfo_width(), min_width)
+            height = max(root.winfo_height(), min_height)
+        else:
+            saved_width, saved_height = saved_size
+            width = max(min_width, saved_width)
+            height = max(min_height, saved_height)
+
         screen_w = root.winfo_screenwidth()
         screen_h = root.winfo_screenheight()
+
+        width = min(width, screen_w)
+        height = min(height, screen_h)
 
         saved_pos = load_window_position(settings_state)
         if saved_pos is None:
@@ -388,19 +490,24 @@ def launch_ui() -> int:
         nonlocal settings_state
         settings_state[WINDOW_X_KEY] = str(root.winfo_x())
         settings_state[WINDOW_Y_KEY] = str(root.winfo_y())
+        settings_state[WINDOW_WIDTH_KEY] = str(root.winfo_width())
+        settings_state[WINDOW_HEIGHT_KEY] = str(root.winfo_height())
         save_settings(settings_state)
 
     def schedule_main_window_position_save(_event: tk.Event) -> None:
-        nonlocal save_position_after_id
         if not window_position_applied:
             return
         if root.state() != "normal":
             return
-        if save_position_after_id is not None:
-            root.after_cancel(save_position_after_id)
-        save_position_after_id = root.after(250, save_main_window_position_now)
+        save_main_window_position_now()
+
+    def on_root_close() -> None:
+        if window_position_applied and root.winfo_exists():
+            save_main_window_position_now()
+        root.destroy()
 
     root.bind("<Configure>", schedule_main_window_position_save)
+    root.protocol("WM_DELETE_WINDOW", on_root_close)
     root.after(0, apply_initial_main_window_position)
 
     style = ttk.Style(root)
@@ -461,8 +568,28 @@ def launch_ui() -> int:
         lightcolor="#5a5a5a",
         darkcolor="#5a5a5a",
     )
+    style.configure(
+        "SelectedCard.TFrame",
+        background=bg_card,
+        relief="solid",
+        borderwidth=2,
+        bordercolor="#5db6ff",
+        lightcolor="#5db6ff",
+        darkcolor="#5db6ff",
+    )
+    style.configure(
+        "DoneCard.TFrame",
+        background="#262626",
+        relief="solid",
+        borderwidth=1,
+        bordercolor="#3e5a47",
+        lightcolor="#3e5a47",
+        darkcolor="#3e5a47",
+    )
     style.configure("CardTitle.TLabel", background=bg_card, foreground=fg_text)
     style.configure("CardMeta.TLabel", background=bg_card, foreground=fg_muted)
+    style.configure("DoneCardTitle.TLabel", background="#262626", foreground=fg_text)
+    style.configure("DoneCardMeta.TLabel", background="#262626", foreground=fg_muted)
     style.configure("Card.TCheckbutton", background=bg_card, foreground=fg_text)
     style.map("Card.TCheckbutton", background=[("active", bg_card)], foreground=[("disabled", fg_muted)])
     style.configure(
@@ -482,17 +609,60 @@ def launch_ui() -> int:
         background=[("active", "#454545")],
         arrowcolor=[("active", "#b0b0b0")],
     )
+    style.configure(
+        "StartDisabled.TButton",
+        background=color_start_disabled,
+        foreground="#c6c6c6",
+        padding=(10, 8),
+        borderwidth=2,
+        bordercolor="#4a4a4a",
+        lightcolor="#565656",
+        darkcolor="#2f2f2f",
+        relief="raised",
+        font=("Segoe UI", 10, "bold"),
+    )
+    style.map(
+        "StartDisabled.TButton",
+        background=[("active", color_start_disabled), ("disabled", color_start_disabled)],
+        foreground=[("disabled", "#c6c6c6")],
+    )
+    style.configure(
+        "StartEnabled.TButton",
+        background=color_start_enabled,
+        foreground="#ffffff",
+        padding=(10, 8),
+        borderwidth=2,
+        bordercolor="#2ea95a",
+        lightcolor="#63e394",
+        darkcolor="#238149",
+        relief="raised",
+        font=("Segoe UI", 10, "bold"),
+    )
+    style.map(
+        "StartEnabled.TButton",
+        background=[("active", color_start_enabled_active), ("disabled", color_start_disabled)],
+        foreground=[("active", "#ffffff"), ("disabled", "#c6c6c6")],
+    )
 
     vars_by_name: dict[str, tk.BooleanVar] = {}
     card_widgets: list[tk.Widget] = []
     thumbnail_cache: dict[tuple[str, bool, int, int], ImageTk.PhotoImage] = {}
-    status_cache: dict[str, dict[str, bool]] = {}
     first_image_cache: dict[str, Path | None] = {}
+    checkpoint_cache: dict[str, tuple[Path | None, int]] = {}
+    run_state_by_name: dict[str, str] = {}
+    card_frame_by_name: dict[str, ttk.Frame] = {}
     resize_after_id: str | None = None
     last_canvas_width = 0
-    dataset_order: list[str] = []
-    active_dataset_name: str | None = None
+    run_in_progress = False
+    dataset_order: list[str] = load_dataset_order(settings_state)
+    drag_dataset_name: str | None = None
+    drag_moved = False
     runtime_config = runtime_config_from_settings(settings_state)
+
+    def persist_dataset_order() -> None:
+        nonlocal settings_state
+        save_dataset_order(settings_state, dataset_order)
+        save_settings(settings_state)
 
     def open_settings_dialog(required: bool) -> RuntimeConfig | None:
         current_dir = ""
@@ -790,8 +960,8 @@ def launch_ui() -> int:
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=0)
     root.rowconfigure(1, weight=0)
-    root.rowconfigure(2, weight=0)
-    root.rowconfigure(3, weight=5, minsize=360)
+    root.rowconfigure(2, weight=5, minsize=360)
+    root.rowconfigure(3, weight=0)
     root.rowconfigure(4, weight=2)
 
     header = ttk.Frame(root, padding=8)
@@ -804,15 +974,14 @@ def launch_ui() -> int:
     controls.grid(row=1, column=0, sticky="ew")
 
     def apply_settings_from_dialog(required: bool = False) -> bool:
-        nonlocal runtime_config, dataset_order, active_dataset_name
+        nonlocal runtime_config, dataset_order
         updated = open_settings_dialog(required=required)
         if updated is None:
             return False
 
         runtime_config = updated
         training_path_var.set(f"Training folder: {runtime_config.training_dir}")
-        dataset_order = []
-        active_dataset_name = None
+        dataset_order = load_dataset_order(settings_state)
         rebuild_folder_list(force=True)
         return True
 
@@ -822,44 +991,40 @@ def launch_ui() -> int:
     menubar.add_cascade(label="Settings", menu=settings_menu)
     root.config(menu=menubar)
 
-    steps_frame = ttk.LabelFrame(root, text="Steps", padding=8)
-    steps_frame.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
-    steps_frame.columnconfigure(0, weight=0)
-    steps_frame.columnconfigure(1, weight=0)
-    steps_frame.columnconfigure(2, weight=0)
-    steps_frame.columnconfigure(3, weight=0)
-
-    do_prep_dataset_var = tk.BooleanVar(value=True)
-    do_cache_latents_var = tk.BooleanVar(value=True)
-    do_cache_text_var = tk.BooleanVar(value=True)
-    do_train_var = tk.BooleanVar(value=True)
-
-    ttk.Checkbutton(steps_frame, text="Prep Dataset", variable=do_prep_dataset_var).grid(
-        row=0, column=0, sticky="w", padx=(0, 10)
-    )
-    ttk.Checkbutton(steps_frame, text="Cache Latents", variable=do_cache_latents_var).grid(
-        row=0, column=1, sticky="w", padx=(0, 10)
-    )
-    ttk.Checkbutton(steps_frame, text="Cache Text Encoder", variable=do_cache_text_var).grid(
-        row=0, column=2, sticky="w", padx=(0, 10)
-    )
-    ttk.Checkbutton(steps_frame, text="Train", variable=do_train_var).grid(row=0, column=3, sticky="w")
-
     list_container = ttk.LabelFrame(root, text="Datasets (click thumbnail/title to toggle)", padding=8)
-    list_container.grid(row=3, column=0, sticky="nsew", padx=8, pady=(0, 8))
+    list_container.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 0))
     list_container.columnconfigure(0, weight=1)
+    list_container.columnconfigure(1, weight=0, minsize=12)
     list_container.rowconfigure(0, weight=1)
 
     canvas = tk.Canvas(list_container, highlightthickness=0, bg=bg_panel)
     scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=canvas.yview, style="Dataset.Vertical.TScrollbar")
     inner = ttk.Frame(canvas, style="TFrame")
 
-    inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+    def update_scrollbar_visibility() -> None:
+        bbox = canvas.bbox("all")
+        content_height = 0 if bbox is None else max(0, bbox[3] - bbox[1])
+        viewport_height = max(0, canvas.winfo_height())
+        should_show = content_height > (viewport_height + 1)
+        if should_show:
+            scrollbar.grid(row=0, column=1, sticky="ns")
+        else:
+            scrollbar.grid_remove()
+
+    def on_inner_configure(_event: tk.Event) -> None:
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        update_scrollbar_visibility()
+
+    inner.bind("<Configure>", on_inner_configure)
     canvas.create_window((0, 0), window=inner, anchor="nw")
     canvas.configure(yscrollcommand=scrollbar.set)
 
     canvas.grid(row=0, column=0, sticky="nsew")
     scrollbar.grid(row=0, column=1, sticky="ns")
+
+    start_bar = ttk.Frame(root, padding=(8, 0, 8, 8))
+    start_bar.grid(row=3, column=0, sticky="ew")
+    start_bar.columnconfigure(0, weight=1)
 
     log_box = ScrolledText(root, height=10, wrap="word")
     log_box.grid(row=4, column=0, sticky="nsew", padx=8, pady=(0, 8))
@@ -887,7 +1052,7 @@ def launch_ui() -> int:
         first_image_cache[dataset_name] = chosen
         return chosen
 
-    def make_thumbnail(image_path: Path | None, ready_to_train: bool, thumb_px: int) -> ImageTk.PhotoImage:
+    def make_thumbnail(image_path: Path | None, run_state: str, thumb_px: int) -> ImageTk.PhotoImage:
         thumb_size = (thumb_px, thumb_px)
         cache_path = "__none__"
         cache_mtime_ns = 0
@@ -898,7 +1063,7 @@ def launch_ui() -> int:
             except OSError:
                 cache_mtime_ns = 0
 
-        cache_key = (cache_path, ready_to_train, thumb_px, cache_mtime_ns)
+        cache_key = (cache_path, run_state, thumb_px, cache_mtime_ns)
         cached_thumb = thumbnail_cache.get(cache_key)
         if cached_thumb is not None:
             return cached_thumb
@@ -908,14 +1073,35 @@ def launch_ui() -> int:
         else:
             try:
                 image = Image.open(image_path).convert("RGB")
-                image.thumbnail(thumb_size)
-                bg = Image.new("RGB", thumb_size, color="#3a3a3a")
-                offset_x = (thumb_size[0] - image.width) // 2
-                offset_y = (thumb_size[1] - image.height) // 2
-                bg.paste(image, (offset_x, offset_y))
-                image = bg
+                src_w, src_h = image.size
+                dst_w, dst_h = thumb_size
+
+                # Fill the entire thumbnail area and center-crop any overflow.
+                scale = max(dst_w / src_w, dst_h / src_h)
+                resized_w = max(1, int(round(src_w * scale)))
+                resized_h = max(1, int(round(src_h * scale)))
+                image = image.resize((resized_w, resized_h), Image.Resampling.LANCZOS)
+
+                crop_x = max(0, (resized_w - dst_w) // 2)
+                crop_y = max(0, (resized_h - dst_h) // 2)
+                image = image.crop((crop_x, crop_y, crop_x + dst_w, crop_y + dst_h))
             except Exception:
                 image = Image.new("RGB", thumb_size, color="#3a3a3a")
+
+        if run_state == "done":
+            ghost_overlay = Image.new("RGB", thumb_size, color="#141414")
+            image = Image.blend(image, ghost_overlay, alpha=0.45)
+
+        # Add a true 50% white border around every thumbnail.
+        image_rgba = image.convert("RGBA")
+        border_overlay = Image.new("RGBA", thumb_size, (0, 0, 0, 0))
+        border_draw = ImageDraw.Draw(border_overlay)
+        border_draw.rectangle(
+            (0, 0, thumb_size[0] - 1, thumb_size[1] - 1),
+            outline=(255, 255, 255, 128),
+            width=1,
+        )
+        image = Image.alpha_composite(image_rgba, border_overlay).convert("RGB")
 
         draw = ImageDraw.Draw(image)
         badge_d = max(18, thumb_px // 5)
@@ -925,7 +1111,7 @@ def launch_ui() -> int:
         x2 = x1 + badge_d
         y2 = y1 + badge_d
 
-        if ready_to_train:
+        if run_state == "done":
             draw.ellipse((x1, y1, x2, y2), fill=color_green)
             line_w = max(2, badge_d // 8)
             draw.line(
@@ -938,140 +1124,173 @@ def launch_ui() -> int:
                 fill="white",
                 width=line_w,
             )
-        else:
-            draw.ellipse((x1, y1, x2, y2), fill="#525c69")
+        elif run_state == "in_progress":
+            draw.ellipse((x1, y1, x2, y2), fill="#d08a22")
+            line_w = max(2, badge_d // 7)
+            bar_pad_x = max(3, badge_d // 4)
+            bar_top = y1 + max(3, badge_d // 4)
+            bar_bottom = y2 - max(3, badge_d // 4)
+            draw.line((x1 + bar_pad_x, bar_top, x1 + bar_pad_x, bar_bottom), fill="white", width=line_w)
+            draw.line((x2 - bar_pad_x, bar_top, x2 - bar_pad_x, bar_bottom), fill="white", width=line_w)
 
         photo = ImageTk.PhotoImage(image)
         thumbnail_cache[cache_key] = photo
         return photo
 
     def toggle_dataset(name: str) -> None:
+        if run_state_by_name.get(name) == "done":
+            return
         current = vars_by_name[name].get()
         vars_by_name[name].set(not current)
 
-    def on_card_click(name: str) -> None:
-        nonlocal active_dataset_name
-        active_dataset_name = name
-        toggle_dataset(name)
-        rebuild_folder_list()
-
-    def set_active_dataset(name: str) -> None:
-        nonlocal active_dataset_name
-        active_dataset_name = name
-        rebuild_folder_list()
-
-    def move_active_dataset(direction: int) -> None:
-        nonlocal dataset_order
-        if not dataset_order:
+    def apply_card_style(name: str) -> None:
+        card = card_frame_by_name.get(name)
+        if card is None:
             return
-
-        if active_dataset_name is None:
-            messagebox.showinfo("No active dataset", "Click a dataset card first, then move it.")
+        run_state = run_state_by_name.get(name, "pending")
+        if run_state == "done":
+            card.configure(style="DoneCard.TFrame")
             return
+        selected = vars_by_name.get(name).get() if name in vars_by_name else False
+        card.configure(style=("SelectedCard.TFrame" if selected else "Card.TFrame"))
 
-        idx = dataset_order.index(active_dataset_name)
-        new_idx = idx + direction
-        if new_idx < 0 or new_idx >= len(dataset_order):
-            return
+    def on_card_press(name: str) -> None:
+        nonlocal drag_dataset_name, drag_moved
+        drag_dataset_name = name
+        drag_moved = False
 
-        dataset_order[idx], dataset_order[new_idx] = dataset_order[new_idx], dataset_order[idx]
-        rebuild_folder_list(force=True)
+    def on_card_motion() -> None:
+        nonlocal drag_moved
+        if drag_dataset_name is not None:
+            drag_moved = True
+
+    def on_card_release(target_name: str) -> str:
+        nonlocal drag_dataset_name, drag_moved, dataset_order
+        if drag_dataset_name is None:
+            return "break"
+
+        source_name = drag_dataset_name
+        moved = drag_moved
+        drag_dataset_name = None
+        drag_moved = False
+
+        if moved:
+            if source_name != target_name and source_name in dataset_order and target_name in dataset_order:
+                source_idx = dataset_order.index(source_name)
+                target_idx = dataset_order.index(target_name)
+                dataset_order.insert(target_idx, dataset_order.pop(source_idx))
+                persist_dataset_order()
+                rebuild_folder_list(force=True)
+            return "break"
+
+        toggle_dataset(source_name)
+        apply_card_style(source_name)
+        update_start_button_state()
+        return "break"
 
     def rebuild_folder_list(force: bool = False) -> None:
-        nonlocal dataset_order, active_dataset_name
+        nonlocal dataset_order
         selected_before = {name for name, var in vars_by_name.items() if var.get()}
 
         if force:
-            status_cache.clear()
             first_image_cache.clear()
             thumbnail_cache.clear()
+            checkpoint_cache.clear()
 
         for widget in card_widgets:
             widget.destroy()
         card_widgets.clear()
         vars_by_name.clear()
+        run_state_by_name.clear()
+        card_frame_by_name.clear()
 
         scanned_names = scan_training_folders(runtime_config.training_dir)
-        if not dataset_order:
-            dataset_order = list(scanned_names)
-        else:
-            existing = [name for name in dataset_order if name in scanned_names]
-            new_names = [name for name in scanned_names if name not in existing]
-            dataset_order = existing + new_names
+        existing = [name for name in dataset_order if name in scanned_names]
+        new_names = [name for name in scanned_names if name not in existing]
+        normalized_order = new_names + existing
+        if normalized_order != dataset_order:
+            dataset_order = normalized_order
+            persist_dataset_order()
 
         names = dataset_order
-        stale_names = [name for name in list(status_cache.keys()) if name not in names]
+        stale_names = [name for name in list(first_image_cache.keys()) if name not in names]
         for stale_name in stale_names:
-            status_cache.pop(stale_name, None)
             first_image_cache.pop(stale_name, None)
+            checkpoint_cache.pop(stale_name, None)
 
         if not names:
             empty_label = ttk.Label(inner, text="No folders found.")
             empty_label.grid(row=0, column=0, sticky="w")
             card_widgets.append(empty_label)
+            update_start_button_state()
             return
-
-        if active_dataset_name not in names:
-            active_dataset_name = names[0]
 
         canvas_width = canvas.winfo_width()
         if canvas_width <= 1:
-            canvas_width = 620
+            canvas_width = max(1, list_container.winfo_width() - 12)
+        if canvas_width <= 1:
+            return
 
-        gap = 8
-        min_card = 138
-        max_card = 192
-        columns = max(2, min(4, canvas_width // (min_card + gap)))
-        card_width = max(min_card, min(max_card, (canvas_width - gap * (columns + 1)) // columns))
-        thumb_px = max(92, min(160, card_width - 20))
-        card_height = thumb_px + 84
+        gap = ui_config["card_gap"]
+        card_width = ui_config["card_width"]
+        thumb_px = ui_config["thumbnail_size"]
+        card_height = ui_config["card_height"]
+        columns = max(1, (canvas_width - gap) // (card_width + gap))
 
+        for col in range(max(1, len(names))):
+            inner.columnconfigure(col, minsize=0, weight=0)
         for col in range(columns):
             inner.columnconfigure(col, minsize=card_width + gap, weight=0)
 
         for idx, name in enumerate(names):
-            var = tk.BooleanVar(value=name in selected_before)
+            checkpoint_info = checkpoint_cache.get(name)
+            if checkpoint_info is None:
+                checkpoint_info = latest_checkpoint_for_dataset(runtime_config.training_dir, name)
+                checkpoint_cache[name] = checkpoint_info
+            checkpoint_path, checkpoint_step = checkpoint_info
+            train_state = "done" if checkpoint_step >= STEPS else ("in_progress" if checkpoint_step > 0 else "pending")
+            run_state_by_name[name] = train_state
+
+            var = tk.BooleanVar(value=(name in selected_before) and train_state != "done")
             vars_by_name[name] = var
 
-            status = status_cache.get(name)
-            if status is None:
-                status = dataset_status(runtime_config.training_dir, name)
-                status_cache[name] = status
-
-            card_style = "ActiveCard.TFrame" if name == active_dataset_name else "Card.TFrame"
+            card_style = "DoneCard.TFrame" if train_state == "done" else ("SelectedCard.TFrame" if var.get() else "Card.TFrame")
             card = ttk.Frame(inner, padding=6, style=card_style, width=card_width, height=card_height)
             grid_row = idx // columns
             grid_col = idx % columns
             card.grid(row=grid_row, column=grid_col, sticky="nw", padx=4, pady=4)
             card.grid_propagate(False)
+            card.columnconfigure(0, weight=1)
+            card_frame_by_name[name] = card
 
             image_path = first_image_path(name)
-            thumb = make_thumbnail(image_path, status["ready_to_train"], thumb_px)
+            thumb = make_thumbnail(image_path, train_state, thumb_px)
 
-            image_label = ttk.Label(card, image=thumb, style="CardTitle.TLabel")
-            image_label.grid(row=0, column=0, sticky="nsew")
-            title_label = ttk.Label(card, text=name, style="CardTitle.TLabel")
-            title_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
-            status_text = (
-                f"S1 {'OK' if status['step1'] else '--'}  "
-                f"S2 {'OK' if status['step2'] else '--'}  "
-                f"S3 {'OK' if status['step3'] else '--'}"
-            )
-            status_label = ttk.Label(card, text=status_text, style="CardMeta.TLabel")
-            status_label.grid(row=2, column=0, sticky="w", pady=(2, 0))
-            check = ttk.Checkbutton(
-                card,
-                text="Selected",
-                variable=var,
-                style="Card.TCheckbutton",
-                command=lambda n=name: set_active_dataset(n),
-            )
-            check.grid(row=3, column=0, sticky="w")
+            title_style = "DoneCardTitle.TLabel" if train_state == "done" else "CardTitle.TLabel"
+            meta_style = "DoneCardMeta.TLabel" if train_state == "done" else "CardMeta.TLabel"
+
+            image_label = ttk.Label(card, image=thumb, style=title_style, anchor="center")
+            image_label.grid(row=0, column=0, sticky="n")
+            title_label = ttk.Label(card, text=name, style=title_style, anchor="center")
+            title_label.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+            status_text = ""
+            if train_state == "done":
+                status_text = "COMPLETED"
+            elif train_state == "in_progress" and checkpoint_path is not None:
+                status_text = f"RESUME {checkpoint_step}/{STEPS}"
+            else:
+                status_text = "START"
+            status_label = ttk.Label(card, text=status_text, style=meta_style, anchor="center")
+            status_label.grid(row=2, column=0, sticky="ew", pady=(2, 8))
 
             for clickable in (card, image_label, title_label, status_label):
-                clickable.bind("<Button-1>", lambda _e, n=name: on_card_click(n))
+                clickable.bind("<ButtonPress-1>", lambda _e, n=name: on_card_press(n))
+                clickable.bind("<B1-Motion>", lambda _e: on_card_motion())
+                clickable.bind("<ButtonRelease-1>", lambda _e, n=name: on_card_release(n))
 
             card_widgets.append(card)
+
+        update_start_button_state()
 
     def request_relayout(canvas_width: int | None = None) -> None:
         nonlocal resize_after_id, last_canvas_width
@@ -1084,7 +1303,7 @@ def launch_ui() -> int:
 
         if resize_after_id is not None:
             root.after_cancel(resize_after_id)
-        resize_after_id = root.after(120, rebuild_folder_list)
+        resize_after_id = root.after(ui_config["relayout_debounce_ms"], rebuild_folder_list)
 
     def on_mousewheel(event: tk.Event) -> str:
         delta = int(-event.delta / 120)
@@ -1114,60 +1333,70 @@ def launch_ui() -> int:
     def selected_names() -> list[str]:
         return [name for name, var in vars_by_name.items() if var.get()]
 
+    def update_start_button_state() -> None:
+        if run_in_progress:
+            run_button.configure(style="StartDisabled.TButton")
+            run_button.state(["disabled"])
+            return
+
+        has_selection = bool(selected_names())
+        if has_selection:
+            run_button.configure(style="StartEnabled.TButton")
+            run_button.state(["!disabled"])
+        else:
+            run_button.configure(style="StartDisabled.TButton")
+            run_button.state(["disabled"])
+
     def select_all() -> None:
-        for var in vars_by_name.values():
-            var.set(True)
+        for name, var in vars_by_name.items():
+            var.set(run_state_by_name.get(name) != "done")
+        update_start_button_state()
 
     def clear_selection() -> None:
         for var in vars_by_name.values():
             var.set(False)
+        update_start_button_state()
 
     def run_selected() -> None:
+        nonlocal run_in_progress
         names = selected_names()
         if not names:
             messagebox.showinfo("Nothing selected", "Select at least one folder.")
             return
 
-        if not (
-            do_prep_dataset_var.get()
-            or do_cache_latents_var.get()
-            or do_cache_text_var.get()
-            or do_train_var.get()
-        ):
-            messagebox.showinfo("No steps selected", "Select at least one step.")
-            return
-
-        run_button.state(["disabled"])
+        run_in_progress = True
+        update_start_button_state()
         try:
             log("")
             train_models(
                 runtime_config,
                 names,
                 logger=log,
-                do_prep_dataset=do_prep_dataset_var.get(),
-                do_cache_latents=do_cache_latents_var.get(),
-                do_cache_text=do_cache_text_var.get(),
-                do_train=do_train_var.get(),
+                do_prep_dataset=True,
+                do_cache_latents=True,
+                do_cache_text=True,
+                do_train=True,
             )
             rebuild_folder_list(force=True)
         finally:
-            run_button.state(["!disabled"])
+            run_in_progress = False
+            update_start_button_state()
 
     refresh_button = ttk.Button(controls, text="Refresh", command=lambda: rebuild_folder_list(force=True))
     select_all_button = ttk.Button(controls, text="Select All", command=select_all)
     clear_button = ttk.Button(controls, text="Clear", command=clear_selection)
-    move_up_button = ttk.Button(controls, text="Move Up", command=lambda: move_active_dataset(-1))
-    move_down_button = ttk.Button(controls, text="Move Down", command=lambda: move_active_dataset(1))
-    run_button = ttk.Button(controls, text="Run Selected", command=run_selected)
+    run_button = ttk.Button(start_bar, text="START", command=run_selected, style="StartDisabled.TButton")
 
     refresh_button.grid(row=0, column=0, padx=(0, 8), sticky="w")
     select_all_button.grid(row=0, column=1, padx=(0, 8), sticky="w")
     clear_button.grid(row=0, column=2, padx=(0, 8), sticky="w")
-    move_up_button.grid(row=0, column=3, padx=(0, 8), sticky="w")
-    move_down_button.grid(row=0, column=4, padx=(0, 8), sticky="w")
-    run_button.grid(row=0, column=5, padx=(0, 8), sticky="w")
+    run_button.grid(row=0, column=0, sticky="ew")
 
-    canvas.bind("<Configure>", lambda e: request_relayout(e.width))
+    def on_canvas_configure(event: tk.Event) -> None:
+        request_relayout(event.width)
+        update_scrollbar_visibility()
+
+    canvas.bind("<Configure>", on_canvas_configure)
     list_container.bind("<Enter>", bind_dataset_wheel)
     list_container.bind("<Leave>", unbind_dataset_wheel)
     canvas.bind("<Enter>", bind_dataset_wheel)
@@ -1176,6 +1405,8 @@ def launch_ui() -> int:
     inner.bind("<Leave>", unbind_dataset_wheel)
 
     rebuild_folder_list(force=True)
+    update_start_button_state()
+    update_scrollbar_visibility()
     root.mainloop()
     return 0
 
