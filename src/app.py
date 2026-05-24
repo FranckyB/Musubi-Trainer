@@ -3,6 +3,7 @@ import sys
 import argparse
 import re
 import configparser
+import ctypes
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -433,6 +434,18 @@ def launch_ui() -> int:
     ui_config = load_ui_config(Path(__file__).resolve().parent / "app.config")
     default_models_dir = workspace_dir / "Models"
 
+    def set_dark_title_bar(window: tk.Misc) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            window.update_idletasks()
+            hwnd = window.winfo_id()
+            value = ctypes.c_int(1)
+            # DWMWA_USE_IMMERSIVE_DARK_MODE = 20 (Win10 1809+)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(value), ctypes.sizeof(value))
+        except Exception:
+            return
+
     def center_window(window: tk.Misc) -> None:
         window.update_idletasks()
         width = max(window.winfo_width(), window.winfo_reqwidth())
@@ -448,6 +461,7 @@ def launch_ui() -> int:
     root.geometry(f"{ui_config['window_width']}x{ui_config['window_height']}")
     root.minsize(ui_config["min_window_width"], ui_config["min_window_height"])
     root.configure(bg=bg_root)
+    set_dark_title_bar(root)
 
     settings_state = load_settings()
     window_position_applied = False
@@ -548,6 +562,19 @@ def launch_ui() -> int:
         fieldbackground=[("readonly", "#1f1f1f"), ("disabled", "#2a2a2a")],
         foreground=[("disabled", fg_muted)],
     )
+    style.configure(
+        "Flat.TEntry",
+        fieldbackground="#1f1f1f",
+        foreground=fg_text,
+        borderwidth=0,
+        relief="flat",
+    )
+    style.map(
+        "Flat.TEntry",
+        fieldbackground=[("readonly", "#1f1f1f"), ("disabled", "#2a2a2a")],
+        foreground=[("disabled", fg_muted)],
+    )
+    style.configure("PathDisplay.TLabel", background="#1f1f1f", foreground=fg_text)
     style.configure("TCheckbutton", background=bg_panel, foreground=fg_text)
     style.map("TCheckbutton", background=[("active", bg_panel)], foreground=[("disabled", fg_muted)])
     style.configure(
@@ -684,6 +711,7 @@ def launch_ui() -> int:
         dialog.grab_set()
         dialog.resizable(False, False)
         dialog.configure(bg=bg_panel)
+        set_dark_title_bar(dialog)
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(0, weight=1)
 
@@ -723,51 +751,51 @@ def launch_ui() -> int:
 
         ttk.Label(musubi_section, text="Musubi-Tuner folder:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         musubi_display = ttk.Label(
-            musubi_section, textvariable=musubi_display_var, anchor="w", relief="sunken", padding=(6, 4)
+            musubi_section, textvariable=musubi_display_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
         )
         musubi_display.grid(row=0, column=1, sticky="ew")
 
         ttk.Label(klein_section, text="Model version:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        klein_model_version_entry = ttk.Entry(klein_section, textvariable=klein_model_version_var)
+        klein_model_version_entry = ttk.Entry(klein_section, textvariable=klein_model_version_var, style="Flat.TEntry")
         klein_model_version_entry.grid(row=0, column=1, sticky="ew")
 
         ttk.Label(klein_section, text="Model:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         klein_dit_display = ttk.Label(
-            klein_section, textvariable=klein_dit_var, anchor="w", relief="sunken", padding=(6, 4)
+            klein_section, textvariable=klein_dit_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
         )
         klein_dit_display.grid(row=1, column=1, sticky="ew", pady=(8, 0))
 
         ttk.Label(klein_section, text="VAE:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         klein_vae_display = ttk.Label(
-            klein_section, textvariable=klein_vae_var, anchor="w", relief="sunken", padding=(6, 4)
+            klein_section, textvariable=klein_vae_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
         )
         klein_vae_display.grid(row=2, column=1, sticky="ew", pady=(8, 0))
 
         ttk.Label(klein_section, text="Text Encoder:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         klein_text_encoder_display = ttk.Label(
-            klein_section, textvariable=klein_text_encoder_var, anchor="w", relief="sunken", padding=(6, 4)
+            klein_section, textvariable=klein_text_encoder_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
         )
         klein_text_encoder_display.grid(row=3, column=1, sticky="ew", pady=(8, 0))
 
         ttk.Label(ltx_section, text="Model version:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ltx_model_version_entry = ttk.Entry(ltx_section, textvariable=ltx_model_version_var)
+        ltx_model_version_entry = ttk.Entry(ltx_section, textvariable=ltx_model_version_var, style="Flat.TEntry")
         ltx_model_version_entry.grid(row=0, column=1, sticky="ew")
 
         ttk.Label(ltx_section, text="Model:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         ltx_dit_display = ttk.Label(
-            ltx_section, textvariable=ltx_dit_var, anchor="w", relief="sunken", padding=(6, 4)
+            ltx_section, textvariable=ltx_dit_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
         )
         ltx_dit_display.grid(row=1, column=1, sticky="ew", pady=(8, 0))
 
         ttk.Label(ltx_section, text="VAE:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         ltx_vae_display = ttk.Label(
-            ltx_section, textvariable=ltx_vae_var, anchor="w", relief="sunken", padding=(6, 4)
+            ltx_section, textvariable=ltx_vae_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
         )
         ltx_vae_display.grid(row=2, column=1, sticky="ew", pady=(8, 0))
 
         ttk.Label(ltx_section, text="Text Encoder:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         ltx_text_encoder_display = ttk.Label(
-            ltx_section, textvariable=ltx_text_encoder_var, anchor="w", relief="sunken", padding=(6, 4)
+            ltx_section, textvariable=ltx_text_encoder_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
         )
         ltx_text_encoder_display.grid(row=3, column=1, sticky="ew", pady=(8, 0))
 
@@ -938,7 +966,7 @@ def launch_ui() -> int:
         win_h = max(520, content_h)
         dialog.geometry(f"{win_w}x{win_h}")
         center_window(dialog)
-        klein_model_version_entry.focus_set()
+        dialog.focus_set()
         root.wait_window(dialog)
 
         if required and result is None:
@@ -972,6 +1000,7 @@ def launch_ui() -> int:
 
     controls = ttk.Frame(root, padding=(8, 0, 8, 8))
     controls.grid(row=1, column=0, sticky="ew")
+    controls.columnconfigure(3, weight=1)
 
     def apply_settings_from_dialog(required: bool = False) -> bool:
         nonlocal runtime_config, dataset_order
@@ -984,12 +1013,6 @@ def launch_ui() -> int:
         dataset_order = load_dataset_order(settings_state)
         rebuild_folder_list(force=True)
         return True
-
-    menubar = tk.Menu(root)
-    settings_menu = tk.Menu(menubar, tearoff=False)
-    settings_menu.add_command(label="Settings", command=apply_settings_from_dialog)
-    menubar.add_cascade(label="Settings", menu=settings_menu)
-    root.config(menu=menubar)
 
     list_container = ttk.LabelFrame(root, text="Datasets (click thumbnail/title to toggle)", padding=8)
     list_container.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 0))
@@ -1305,30 +1328,47 @@ def launch_ui() -> int:
             root.after_cancel(resize_after_id)
         resize_after_id = root.after(ui_config["relayout_debounce_ms"], rebuild_folder_list)
 
-    def on_mousewheel(event: tk.Event) -> str:
+    def is_widget_in_dataset_panel(widget: tk.Misc | None) -> bool:
+        current: tk.Misc | None = widget
+        while current is not None:
+            if current == list_container:
+                return True
+            parent_name = current.winfo_parent()
+            if not parent_name:
+                break
+            try:
+                current = current.nametowidget(parent_name)
+            except Exception:
+                break
+        return False
+
+    def on_mousewheel(event: tk.Event) -> str | None:
+        hovered = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
+        if not is_widget_in_dataset_panel(hovered):
+            return None
         delta = int(-event.delta / 120)
         if delta == 0:
             delta = -1 if event.delta > 0 else 1
         canvas.yview_scroll(delta, "units")
         return "break"
 
-    def on_mousewheel_linux_up(_event: tk.Event) -> str:
+    def on_mousewheel_linux_up(_event: tk.Event) -> str | None:
+        hovered = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
+        if not is_widget_in_dataset_panel(hovered):
+            return None
         canvas.yview_scroll(-1, "units")
         return "break"
 
-    def on_mousewheel_linux_down(_event: tk.Event) -> str:
+    def on_mousewheel_linux_down(_event: tk.Event) -> str | None:
+        hovered = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
+        if not is_widget_in_dataset_panel(hovered):
+            return None
         canvas.yview_scroll(1, "units")
         return "break"
 
-    def bind_dataset_wheel(_event: tk.Event) -> None:
-        root.bind_all("<MouseWheel>", on_mousewheel)
-        root.bind_all("<Button-4>", on_mousewheel_linux_up)
-        root.bind_all("<Button-5>", on_mousewheel_linux_down)
-
-    def unbind_dataset_wheel(_event: tk.Event) -> None:
-        root.unbind_all("<MouseWheel>")
-        root.unbind_all("<Button-4>")
-        root.unbind_all("<Button-5>")
+    root.bind_all("<MouseWheel>", on_mousewheel)
+    root.bind_all("<Button-4>", on_mousewheel_linux_up)
+    root.bind_all("<Button-5>", on_mousewheel_linux_down)
 
     def selected_names() -> list[str]:
         return [name for name, var in vars_by_name.items() if var.get()]
@@ -1385,11 +1425,13 @@ def launch_ui() -> int:
     refresh_button = ttk.Button(controls, text="Refresh", command=lambda: rebuild_folder_list(force=True))
     select_all_button = ttk.Button(controls, text="Select All", command=select_all)
     clear_button = ttk.Button(controls, text="Clear", command=clear_selection)
+    settings_button = ttk.Button(controls, text="Settings", command=apply_settings_from_dialog)
     run_button = ttk.Button(start_bar, text="START", command=run_selected, style="StartDisabled.TButton")
 
     refresh_button.grid(row=0, column=0, padx=(0, 8), sticky="w")
     select_all_button.grid(row=0, column=1, padx=(0, 8), sticky="w")
     clear_button.grid(row=0, column=2, padx=(0, 8), sticky="w")
+    settings_button.grid(row=0, column=4, sticky="e")
     run_button.grid(row=0, column=0, sticky="ew")
 
     def on_canvas_configure(event: tk.Event) -> None:
@@ -1397,12 +1439,6 @@ def launch_ui() -> int:
         update_scrollbar_visibility()
 
     canvas.bind("<Configure>", on_canvas_configure)
-    list_container.bind("<Enter>", bind_dataset_wheel)
-    list_container.bind("<Leave>", unbind_dataset_wheel)
-    canvas.bind("<Enter>", bind_dataset_wheel)
-    canvas.bind("<Leave>", unbind_dataset_wheel)
-    inner.bind("<Enter>", bind_dataset_wheel)
-    inner.bind("<Leave>", unbind_dataset_wheel)
 
     rebuild_folder_list(force=True)
     update_start_button_state()
