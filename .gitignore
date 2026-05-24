@@ -1,6 +1,8 @@
 # Large local assets
-Models/
-Training/
+Models/*
+!Models/.gitkeep
+Training/*
+!Training/.gitkeep
 
 # Python bytecode and caches
 __pycache__/
@@ -34,3 +36,4 @@ Thumbs.db
 .vscode/
 .history/
 Musubi-Trainer-Workspace.code-workspace
+settings.json
