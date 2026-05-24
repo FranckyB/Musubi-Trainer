@@ -1,14 +1,22 @@
-import subprocess
 import sys
 import argparse
+import os
 import re
 import configparser
 import ctypes
 import math
+import shutil
+import subprocess
+import threading
 from pathlib import Path
-from typing import Callable, Iterable
 
 from .app_settings import (
+    DEFAULT_CAPTION_KEYWORD_KEY,
+    ENABLE_CUDA_ALLOW_TF32_KEY,
+    ENABLE_CUDA_CUDNN_BENCHMARK_KEY,
+    ENABLE_COMPILE_OPTIMIZATIONS_KEY,
+    ENABLE_FP8_DIT_KEY,
+    ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY,
     KLEIN_DIT_KEY,
     KLEIN_MODEL_VERSION_KEY,
     KLEIN_TEXT_ENCODER_KEY,
@@ -18,6 +26,7 @@ from .app_settings import (
     LTX_TEXT_ENCODER_KEY,
     LTX_VAE_KEY,
     MUSUBI_DIR_KEY,
+    MUSUBI_PYTHON_KEY,
     SETTINGS_FILE,
     WINDOW_HEIGHT_KEY,
     WINDOW_WIDTH_KEY,
@@ -28,14 +37,10 @@ from .app_settings import (
     load_window_position,
     save_settings,
 )
-from .runtime_config import RuntimeConfig, runtime_config_from_settings
+from .klein_runtime_config import KleinRuntimeConfig, klein_runtime_config_from_settings, resolve_musubi_python
+from .klein_train import train_models
 
 
-# Training settings
-RESOLUTION = 1024
-NETWORK_DIM = 32
-NETWORK_ALPHA = 32
-LR = "1e-4"
 STEPS = 3000
 
 # Model files
@@ -43,6 +48,7 @@ VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 LATENT_SUFFIX = "f2k9b"
 DATASET_ORDER_KEY = "dataset_order"
 DRAG_START_THRESHOLD_PX = 20
+DATASET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def load_ui_config(config_path: Path) -> dict[str, int]:
@@ -175,247 +181,11 @@ def dataset_status(training_dir: Path, dataset_name: str) -> dict[str, bool]:
     }
 
 
-def prep_dataset_minimal(training_dir: Path, dataset_name: str) -> dict[str, int | bool]:
-    dataset_dir = training_dir / dataset_name
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    dataset_toml = dataset_dir / "dataset.toml"
-
-    had_dataset_toml = dataset_toml.exists()
-    if not had_dataset_toml:
-        dataset_toml.write_text(
-            "\n".join(
-                [
-                    "[general]",
-                    "shuffle_caption = false",
-                    'caption_extension = ".txt"',
-                    "keep_tokens = 0",
-                    "",
-                    "[[datasets]]",
-                    f"resolution = {RESOLUTION}",
-                    "batch_size = 1",
-                    "enable_bucket = true",
-                    "bucket_no_upscale = false",
-                    "",
-                    "  [[datasets.subsets]]",
-                    '  image_dir = "images"',
-                    '  caption_extension = ".txt"',
-                    "  num_repeats = 1",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
-        )
-
-    created = 0
-    for image_path in dataset_image_files(training_dir, dataset_name):
-        caption_path = image_path.with_suffix(".txt")
-        if caption_path.exists():
-            continue
-        caption_path.write_text(image_path.stem, encoding="utf-8")
-        created += 1
-
-    return {"had_dataset_toml": had_dataset_toml, "created": created}
-
-
-def run_command(args: Iterable[str], cwd: Path) -> None:
-    result = subprocess.run(list(args), cwd=str(cwd), check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"Command failed with exit code {result.returncode}: {' '.join(args)}")
-
-
-def run_steps_for_model(
-    runtime_config: RuntimeConfig,
-    model_name: str,
-    do_prep_dataset: bool,
-    do_cache_latents: bool,
-    do_cache_text: bool,
-    do_train: bool,
-    resume_checkpoint: Path | None,
-    train_steps_override: int | None,
-    logger: Callable[[str], None],
-) -> None:
-    def require_model_file(path_value: Path | None, label: str) -> Path:
-        if path_value is None:
-            raise RuntimeError(f"{label} is not configured. Open Settings and select a file for {label}.")
-        if not path_value.is_file():
-            raise RuntimeError(f"{label} file does not exist: {path_value}")
-        return path_value
-
-    dataset_config = runtime_config.training_dir / model_name / "dataset.toml"
-    output_dir = runtime_config.training_dir / model_name / "output"
-    output_name = f"{model_name}_Klein"
-
-    logger("=" * 58)
-    logger(f"MODEL_NAME: {model_name}")
-    logger(f"dataset_config: {dataset_config}")
-    logger(f"output_dir:     {output_dir}")
-
-    if do_prep_dataset:
-        prep_result = prep_dataset_minimal(runtime_config.training_dir, model_name)
-        toml_status = "existed" if bool(prep_result["had_dataset_toml"]) else "created"
-        logger(f"  prep: dataset.toml {toml_status}, captions created {prep_result['created']}")
-
-    if do_cache_latents:
-        vae_path = require_model_file(runtime_config.vae, "Klein VAE")
-        run_command(
-            [
-                sys.executable,
-                "flux_2_cache_latents.py",
-                "--dataset_config",
-                str(dataset_config),
-                "--vae",
-                str(vae_path),
-                "--batch_size",
-                "16",
-                "--model_version",
-                runtime_config.model_version,
-            ],
-            cwd=runtime_config.musubi_dir,
-        )
-
-    if do_cache_text:
-        text_encoder_path = require_model_file(runtime_config.text_encoder, "Klein Text Encoder")
-        run_command(
-            [
-                sys.executable,
-                "flux_2_cache_text_encoder_outputs.py",
-                "--dataset_config",
-                str(dataset_config),
-                "--text_encoder",
-                str(text_encoder_path),
-                "--batch_size",
-                "16",
-                "--model_version",
-                runtime_config.model_version,
-            ],
-            cwd=runtime_config.musubi_dir,
-        )
-
-    if do_train:
-        dit_path = require_model_file(runtime_config.dit, "Klein Model")
-        vae_path = require_model_file(runtime_config.vae, "Klein VAE")
-        text_encoder_path = require_model_file(runtime_config.text_encoder, "Klein Text Encoder")
-        train_steps = train_steps_override if train_steps_override is not None else STEPS
-        run_command(
-            [
-                sys.executable,
-                "flux_2_train_network.py",
-                "--dit", str(dit_path),
-                "--vae", str(vae_path),
-                "--vae_dtype", "bf16",
-                "--text_encoder", str(text_encoder_path),
-                "--model_version", runtime_config.model_version,
-                "--optimizer_type", "adamw8bit",
-                "--timestep_sampling", "flux2_shift",
-                "--dataset_config", str(dataset_config),
-                "--output_dir", str(output_dir),
-                "--output_name", output_name,
-                "--network_module", "networks.lora_flux_2",
-                "--network_dim", str(NETWORK_DIM),
-                "--network_alpha", str(NETWORK_ALPHA),
-                "--learning_rate", LR,
-                "--max_train_steps", str(train_steps),
-                "--mixed_precision", "bf16",
-                "--sdpa",
-                "--gradient_checkpointing",
-                "--persistent_data_loader_workers",
-                "--max_data_loader_n_workers", "2",
-                "--save_every_n_steps", "250",
-                "--seed", "42",
-                *( ["--resume", str(resume_checkpoint)] if resume_checkpoint is not None else [] ),
-            ],
-            cwd=runtime_config.musubi_dir,
-        )
-
-
-def train_models(
-    runtime_config: RuntimeConfig,
-    model_names: list[str],
-    logger: Callable[[str], None],
-    do_prep_dataset: bool,
-    do_cache_latents: bool,
-    do_cache_text: bool,
-    do_train: bool,
-) -> int:
-    if not model_names:
-        logger("No valid model names entered. Exiting.")
-        return 1
-
-    if not (do_prep_dataset or do_cache_latents or do_cache_text or do_train):
-        logger("No steps selected. Select at least one step.")
-        return 1
-
-    selected_steps: list[str] = []
-    if do_prep_dataset:
-        selected_steps.append("prep_dataset")
-    if do_cache_latents:
-        selected_steps.append("cache_latents")
-    if do_cache_text:
-        selected_steps.append("cache_text")
-    if do_train:
-        selected_steps.append("train")
-
-    logger(f"Queued models: {', '.join(model_names)}")
-    logger(f"Selected steps: {', '.join(selected_steps)}")
-
-    all_steps_selected = do_prep_dataset and do_cache_latents and do_cache_text and do_train
-
-    for index, model_name in enumerate(model_names, start=1):
-        logger("")
-        logger(f"[{index}/{len(model_names)}] Starting training for: {model_name}")
-
-        effective_do_prep_dataset = do_prep_dataset
-        effective_do_cache_latents = do_cache_latents
-        effective_do_cache_text = do_cache_text
-        effective_do_train = do_train
-        resume_checkpoint, resume_step = latest_checkpoint_for_dataset(runtime_config.training_dir, model_name)
-        train_steps_override: int | None = None
-
-        if resume_step >= STEPS:
-            logger(f"  checkpoint already complete at step {resume_step}: skipping")
-            continue
-
-        if resume_checkpoint is not None and resume_step > 0:
-            train_steps_override = max(1, STEPS - resume_step)
-            logger(f"  resuming from {resume_checkpoint.name} (step {resume_step}), remaining steps {train_steps_override}")
-
-        if all_steps_selected:
-            status = dataset_status(runtime_config.training_dir, model_name)
-            if status["ready_to_train"]:
-                effective_do_prep_dataset = False
-                effective_do_cache_latents = False
-                effective_do_cache_text = False
-                effective_do_train = True
-                logger("  dataset is already green (S1/S2/S3 ready): skipping prep/cache and running train only")
-
-        try:
-            run_steps_for_model(
-                runtime_config,
-                model_name,
-                do_prep_dataset=effective_do_prep_dataset,
-                do_cache_latents=effective_do_cache_latents,
-                do_cache_text=effective_do_cache_text,
-                do_train=effective_do_train,
-                resume_checkpoint=resume_checkpoint if train_steps_override is not None else None,
-                train_steps_override=train_steps_override,
-                logger=logger,
-            )
-            logger(f"[{index}/{len(model_names)}] Completed: {model_name}")
-        except Exception as exc:
-            logger(f"Training failed for '{model_name}': {exc}")
-            return 1
-
-    logger("")
-    logger("All model runs completed.")
-    return 0
-
-
 def launch_ui() -> int:
     try:
         import tkinter as tk
-        from tkinter import filedialog, messagebox
+        from tkinter import filedialog, messagebox, simpledialog
         from tkinter import ttk
-        from tkinter.scrolledtext import ScrolledText
         from PIL import Image, ImageDraw, ImageTk
     except ImportError:
         print("Tkinter and Pillow are required for the visual launcher.")
@@ -432,6 +202,7 @@ def launch_ui() -> int:
     color_start_enabled = "#35c46a"
     color_start_enabled_active = "#4dd97f"
     color_start_disabled = "#3b3b3b"
+    color_start_in_progress = "#ff8c00"
     workspace_dir = Path(__file__).resolve().parent.parent
     ui_config = load_ui_config(Path(__file__).resolve().parent / "app.config")
     default_models_dir = workspace_dir / "Models"
@@ -674,6 +445,40 @@ def launch_ui() -> int:
         arrowcolor=[("active", "#b0b0b0")],
     )
     style.configure(
+        "Dark.Vertical.TScrollbar",
+        background="#3a3a3a",
+        troughcolor="#2a2a2a",
+        bordercolor="#323232",
+        lightcolor="#323232",
+        darkcolor="#323232",
+        arrowcolor="#8c8c8c",
+        relief="flat",
+        arrowsize=12,
+        width=12,
+    )
+    style.map(
+        "Dark.Vertical.TScrollbar",
+        background=[("active", "#454545")],
+        arrowcolor=[("active", "#b0b0b0")],
+    )
+    style.configure(
+        "Dark.Horizontal.TScrollbar",
+        background="#3a3a3a",
+        troughcolor="#2a2a2a",
+        bordercolor="#323232",
+        lightcolor="#323232",
+        darkcolor="#323232",
+        arrowcolor="#8c8c8c",
+        relief="flat",
+        arrowsize=12,
+        width=12,
+    )
+    style.map(
+        "Dark.Horizontal.TScrollbar",
+        background=[("active", "#454545")],
+        arrowcolor=[("active", "#b0b0b0")],
+    )
+    style.configure(
         "StartDisabled.TButton",
         background=color_start_disabled,
         foreground="#c6c6c6",
@@ -707,6 +512,23 @@ def launch_ui() -> int:
         background=[("active", color_start_enabled_active), ("disabled", color_start_disabled)],
         foreground=[("active", "#ffffff"), ("disabled", "#c6c6c6")],
     )
+    style.configure(
+        "StartInProgress.TButton",
+        background=color_start_in_progress,
+        foreground="#ffffff",
+        padding=(10, 8),
+        borderwidth=2,
+        bordercolor="#cc7000",
+        lightcolor="#ffb347",
+        darkcolor="#a85b00",
+        relief="raised",
+        font=("Segoe UI", 10, "bold"),
+    )
+    style.map(
+        "StartInProgress.TButton",
+        background=[("active", color_start_in_progress), ("disabled", color_start_in_progress)],
+        foreground=[("active", "#ffffff"), ("disabled", "#ffffff")],
+    )
 
     vars_by_name: dict[str, tk.BooleanVar] = {}
     card_widgets: list[tk.Widget] = []
@@ -719,6 +541,7 @@ def launch_ui() -> int:
     resize_after_id: str | None = None
     last_canvas_width = 0
     run_in_progress = False
+    run_cancel_event: threading.Event | None = None
     drag_dataset_name: str | None = None
     drag_hover_dataset_name: str | None = None
     drag_preview: tk.Toplevel | None = None
@@ -726,17 +549,18 @@ def launch_ui() -> int:
     drag_moved = False
     drag_start_x: int | None = None
     drag_start_y: int | None = None
-    runtime_config = runtime_config_from_settings(settings_state)
+    runtime_config = klein_runtime_config_from_settings(settings_state)
 
     def persist_dataset_order() -> None:
         nonlocal settings_state
         save_dataset_order(settings_state, dataset_order)
         save_settings(settings_state)
 
-    def open_settings_dialog(required: bool) -> RuntimeConfig | None:
+    def open_settings_dialog(required: bool) -> KleinRuntimeConfig | None:
         current_dir = ""
         if runtime_config is not None:
             current_dir = str(runtime_config.musubi_dir)
+        current_musubi_python = settings_state.get(MUSUBI_PYTHON_KEY, "").strip()
         current_klein_model_version = settings_state.get(KLEIN_MODEL_VERSION_KEY, "").strip() or "klein-base-9b"
         current_klein_dit = settings_state.get(KLEIN_DIT_KEY, "").strip()
         current_klein_vae = settings_state.get(KLEIN_VAE_KEY, "").strip()
@@ -745,8 +569,42 @@ def launch_ui() -> int:
         current_ltx_dit = settings_state.get(LTX_DIT_KEY, "").strip()
         current_ltx_vae = settings_state.get(LTX_VAE_KEY, "").strip()
         current_ltx_text_encoder = settings_state.get(LTX_TEXT_ENCODER_KEY, "").strip()
+        current_default_caption_keyword = settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, "")
+        current_compile_optimizations = settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        current_cuda_allow_tf32 = settings_state.get(ENABLE_CUDA_ALLOW_TF32_KEY, "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        current_cuda_cudnn_benchmark = settings_state.get(ENABLE_CUDA_CUDNN_BENCHMARK_KEY, "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        current_fp8_dit = settings_state.get(ENABLE_FP8_DIT_KEY, "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        current_gc_cpu_offload = settings_state.get(
+            ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY,
+            "0",
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
-        result: RuntimeConfig | None = None
+        result: KleinRuntimeConfig | None = None
         dialog = tk.Toplevel(root)
         dialog.title("Settings")
         dialog.transient(root)
@@ -773,7 +631,16 @@ def launch_ui() -> int:
         ltx_section.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         ltx_section.columnconfigure(1, weight=1)
 
+        captions_section = ttk.LabelFrame(frame, text="Captions", padding=8)
+        captions_section.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        captions_section.columnconfigure(1, weight=1)
+
+        advanced_section = ttk.LabelFrame(frame, text="Advanced", padding=8)
+        advanced_section.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        advanced_section.columnconfigure(0, weight=1)
+
         selected_musubi_path = current_dir
+        selected_musubi_python = current_musubi_python
         selected_klein_dit = current_klein_dit
         selected_klein_vae = current_klein_vae
         selected_klein_text_encoder = current_klein_text_encoder
@@ -782,6 +649,7 @@ def launch_ui() -> int:
         selected_ltx_text_encoder = current_ltx_text_encoder
 
         musubi_display_var = tk.StringVar(value=current_dir if current_dir else "(none)")
+        musubi_python_display_var = tk.StringVar(value=current_musubi_python if current_musubi_python else "(auto)")
         klein_model_version_var = tk.StringVar(value=current_klein_model_version)
         klein_dit_var = tk.StringVar(value=current_klein_dit if current_klein_dit else "(none)")
         klein_vae_var = tk.StringVar(value=current_klein_vae if current_klein_vae else "(none)")
@@ -790,12 +658,73 @@ def launch_ui() -> int:
         ltx_dit_var = tk.StringVar(value=current_ltx_dit if current_ltx_dit else "(none)")
         ltx_vae_var = tk.StringVar(value=current_ltx_vae if current_ltx_vae else "(none)")
         ltx_text_encoder_var = tk.StringVar(value=current_ltx_text_encoder if current_ltx_text_encoder else "(none)")
+        default_caption_keyword_var = tk.StringVar(value=current_default_caption_keyword)
+        compile_optimizations_var = tk.BooleanVar(value=current_compile_optimizations)
+        cuda_allow_tf32_var = tk.BooleanVar(value=current_cuda_allow_tf32)
+        cuda_cudnn_benchmark_var = tk.BooleanVar(value=current_cuda_cudnn_benchmark)
+        fp8_dit_var = tk.BooleanVar(value=current_fp8_dit)
+        gc_cpu_offload_var = tk.BooleanVar(value=current_gc_cpu_offload)
 
         ttk.Label(musubi_section, text="Musubi-Tuner folder:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         musubi_display = ttk.Label(
             musubi_section, textvariable=musubi_display_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
         )
         musubi_display.grid(row=0, column=1, sticky="ew")
+        ttk.Label(musubi_section, text="Python (venv):").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        musubi_python_display = ttk.Label(
+            musubi_section,
+            textvariable=musubi_python_display_var,
+            anchor="w",
+            style="PathDisplay.TLabel",
+            padding=(6, 4),
+        )
+        musubi_python_display.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+
+        ttk.Label(captions_section, text="Default caption keyword:").grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=(0, 8),
+        )
+        default_caption_keyword_entry = ttk.Entry(
+            captions_section,
+            textvariable=default_caption_keyword_var,
+            style="Flat.TEntry",
+        )
+        default_caption_keyword_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Label(captions_section, text="Leave blank to create empty .txt captions.").grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(6, 0),
+        )
+
+        ttk.Checkbutton(
+            advanced_section,
+            text="Enable Torch Compile (Turn off if you have issues)",
+            variable=compile_optimizations_var,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            advanced_section,
+            text="Enable Allow TF32 (For newer GPU, improves performance)",
+            variable=cuda_allow_tf32_var,
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            advanced_section,
+            text="Enable cuDNN Benchmark (May improve performance)",
+            variable=cuda_cudnn_benchmark_var,
+        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            advanced_section,
+            text="Enable FP8 (Low Vram)",
+            variable=fp8_dit_var,
+        ).grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            advanced_section,
+            text="Enable CPU Gradient Checkpointing (Low Ram)",
+            variable=gc_cpu_offload_var,
+        ).grid(row=4, column=0, sticky="w", pady=(6, 0))
 
         ttk.Label(klein_section, text="Model version:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         klein_model_version_entry = ttk.Entry(klein_section, textvariable=klein_model_version_var, style="Flat.TEntry")
@@ -842,7 +771,7 @@ def launch_ui() -> int:
         ltx_text_encoder_display.grid(row=3, column=1, sticky="ew", pady=(8, 0))
 
         def browse_musubi() -> None:
-            nonlocal selected_musubi_path
+            nonlocal selected_musubi_path, selected_musubi_python
             picked = filedialog.askdirectory(
                 parent=dialog,
                 title="Select Musubi-Tuner folder",
@@ -851,6 +780,36 @@ def launch_ui() -> int:
             if picked:
                 selected_musubi_path = picked
                 musubi_display_var.set(picked)
+                detected_python = resolve_musubi_python(Path(picked).expanduser())
+                if detected_python is not None:
+                    selected_musubi_python = str(detected_python)
+                    musubi_python_display_var.set(selected_musubi_python)
+                else:
+                    selected_musubi_python = ""
+                    musubi_python_display_var.set("(not found - set manually)")
+                    messagebox.showwarning(
+                        "Python venv not found",
+                        "Could not find .venv/venv Python in this Musubi-Tuner folder.\n"
+                        "Set Python (venv) manually.",
+                        parent=dialog,
+                    )
+
+        def browse_musubi_python() -> None:
+            nonlocal selected_musubi_python
+            initial_dir = selected_musubi_path or str(Path.home())
+            if selected_musubi_python:
+                initial_dir = str(Path(selected_musubi_python).expanduser().parent)
+
+            filetypes = [("Python executable", "python.exe"), ("All files", "*.*")] if sys.platform == "win32" else [("All files", "*.*")]
+            picked = filedialog.askopenfilename(
+                parent=dialog,
+                title="Select Musubi-Tuner Python executable",
+                initialdir=initial_dir,
+                filetypes=filetypes,
+            )
+            if picked:
+                selected_musubi_python = picked
+                musubi_python_display_var.set(picked)
 
         def browse_file(current_path: str, initial_dir_hint: str, title: str) -> str | None:
             initial_dir = initial_dir_hint
@@ -918,7 +877,7 @@ def launch_ui() -> int:
                 ltx_text_encoder_var.set(picked)
 
         def save_and_close() -> None:
-            nonlocal result, settings_state
+            nonlocal result, settings_state, selected_musubi_python
             if not selected_musubi_path:
                 messagebox.showerror("Missing folder", "Musubi-Tuner folder is not set.", parent=dialog)
                 return
@@ -927,6 +886,25 @@ def launch_ui() -> int:
             if not musubi_path.exists() or not musubi_path.is_dir():
                 messagebox.showerror("Invalid folder", "Choose a valid Musubi-Tuner folder.", parent=dialog)
                 return
+
+            musubi_python_path: Path | None = None
+            if selected_musubi_python:
+                musubi_python_path = Path(selected_musubi_python).expanduser()
+                if not musubi_python_path.exists() or not musubi_python_path.is_file():
+                    messagebox.showerror("Invalid file", "Choose a valid Python (venv) executable.", parent=dialog)
+                    return
+            else:
+                detected = resolve_musubi_python(musubi_path)
+                if detected is not None:
+                    musubi_python_path = detected
+                    selected_musubi_python = str(detected)
+                else:
+                    messagebox.showwarning(
+                        "Python venv not found",
+                        "Could not auto-detect Musubi-Tuner venv (.venv/venv).\n"
+                        "Set Python (venv) manually in Settings before running jobs.",
+                        parent=dialog,
+                    )
 
             klein_model_version = klein_model_version_var.get().strip()
             if not klein_model_version:
@@ -958,6 +936,7 @@ def launch_ui() -> int:
                     return
 
             settings_state[MUSUBI_DIR_KEY] = str(musubi_path)
+            settings_state[MUSUBI_PYTHON_KEY] = str(musubi_python_path) if musubi_python_path is not None else ""
             settings_state[KLEIN_MODEL_VERSION_KEY] = klein_model_version
             settings_state[KLEIN_DIT_KEY] = str(Path(selected_klein_dit).expanduser()) if selected_klein_dit else ""
             settings_state[KLEIN_VAE_KEY] = str(Path(selected_klein_vae).expanduser()) if selected_klein_vae else ""
@@ -970,8 +949,14 @@ def launch_ui() -> int:
             settings_state[LTX_TEXT_ENCODER_KEY] = (
                 str(Path(selected_ltx_text_encoder).expanduser()) if selected_ltx_text_encoder else ""
             )
+            settings_state[DEFAULT_CAPTION_KEYWORD_KEY] = default_caption_keyword_var.get().strip()
+            settings_state[ENABLE_COMPILE_OPTIMIZATIONS_KEY] = "1" if compile_optimizations_var.get() else "0"
+            settings_state[ENABLE_CUDA_ALLOW_TF32_KEY] = "1" if cuda_allow_tf32_var.get() else "0"
+            settings_state[ENABLE_CUDA_CUDNN_BENCHMARK_KEY] = "1" if cuda_cudnn_benchmark_var.get() else "0"
+            settings_state[ENABLE_FP8_DIT_KEY] = "1" if fp8_dit_var.get() else "0"
+            settings_state[ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY] = "1" if gc_cpu_offload_var.get() else "0"
             save_settings(settings_state)
-            result = runtime_config_from_settings(settings_state)
+            result = klein_runtime_config_from_settings(settings_state)
             dialog.destroy()
 
         def cancel_and_close() -> None:
@@ -1001,6 +986,9 @@ def launch_ui() -> int:
             root.after_idle(root.destroy)
 
         ttk.Button(musubi_section, text="Browse Folder", command=browse_musubi).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(musubi_section, text="Browse File", command=browse_musubi_python).grid(
+            row=1, column=2, padx=(8, 0), pady=(8, 0)
+        )
         ttk.Button(klein_section, text="Browse File", command=browse_klein_dit).grid(row=1, column=2, padx=(8, 0), pady=(8, 0))
         ttk.Button(klein_section, text="Browse File", command=browse_klein_vae).grid(row=2, column=2, padx=(8, 0), pady=(8, 0))
         ttk.Button(klein_section, text="Browse File", command=browse_klein_text_encoder).grid(
@@ -1014,11 +1002,11 @@ def launch_ui() -> int:
         )
 
         ttk.Label(frame, text="LTX path is saved for future support.").grid(
-            row=3, column=0, sticky="w", pady=(10, 8)
+            row=5, column=0, sticky="w", pady=(10, 8)
         )
 
         button_row = ttk.Frame(frame)
-        button_row.grid(row=4, column=0, sticky="ew")
+        button_row.grid(row=6, column=0, sticky="ew")
         button_row.columnconfigure(0, weight=1)
         ttk.Button(button_row, text="Reset Settings", command=reset_settings).grid(row=0, column=0, sticky="w")
         ttk.Button(button_row, text="Cancel", command=cancel_and_close).grid(row=0, column=1, padx=(0, 8))
@@ -1081,6 +1069,802 @@ def launch_ui() -> int:
         rebuild_folder_list(force=True)
         return True
 
+    def create_dataset() -> None:
+        def is_valid_dataset_name(name: str) -> bool:
+            return DATASET_NAME_PATTERN.fullmatch(name) is not None
+
+        dataset_name = simpledialog.askstring("Create Dataset", "Enter dataset name:", parent=root)
+        if dataset_name is None:
+            return
+
+        dataset_name = dataset_name.strip()
+        if not dataset_name:
+            messagebox.showerror("Invalid name", "Dataset name cannot be empty.", parent=root)
+            return
+
+        if not is_valid_dataset_name(dataset_name):
+            messagebox.showerror(
+                "Invalid name",
+                "Use only letters, numbers, '_' or '-'.",
+                parent=root,
+            )
+            return
+
+        dataset_dir = runtime_config.training_dir / dataset_name
+        if dataset_dir.exists():
+            messagebox.showerror("Name unavailable", f"Dataset '{dataset_name}' already exists.", parent=root)
+            return
+
+        images_dir = dataset_dir / "images"
+        cache_dir = dataset_dir / "cache"
+        output_dir = dataset_dir / "output"
+
+        try:
+            images_dir.mkdir(parents=True, exist_ok=False)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("Create failed", f"Could not create dataset structure:\n{exc}", parent=root)
+            return
+
+        selected_files = filedialog.askopenfilenames(
+            parent=root,
+            title="Select images and optional captions",
+            filetypes=[
+                ("Images and captions", "*.png *.jpg *.jpeg *.txt"),
+                ("Images", "*.png *.jpg *.jpeg"),
+                ("Text files", "*.txt"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        copied_count = 0
+        for raw_path in selected_files:
+            source = Path(raw_path)
+            if not source.exists() or not source.is_file():
+                continue
+
+            suffix = source.suffix.lower()
+            if suffix not in VALID_IMAGE_EXTENSIONS and suffix != ".txt":
+                continue
+
+            destination = images_dir / source.name
+            if destination.exists():
+                stem = source.stem
+                candidate_index = 1
+                while destination.exists():
+                    destination = images_dir / f"{stem}_{candidate_index}{source.suffix}"
+                    candidate_index += 1
+
+            try:
+                shutil.copy2(source, destination)
+                copied_count += 1
+            except OSError:
+                continue
+
+        rebuild_folder_list(force=True)
+        if copied_count:
+            messagebox.showinfo(
+                "Dataset created",
+                f"Created dataset '{dataset_name}' and imported {copied_count} file(s).",
+                parent=root,
+            )
+        else:
+            messagebox.showinfo(
+                "Dataset created",
+                f"Created dataset '{dataset_name}' with an empty images folder.",
+                parent=root,
+            )
+
+    def open_dataset_in_file_manager(dataset_name: str) -> None:
+        dataset_dir = runtime_config.training_dir / dataset_name
+        if not dataset_dir.exists() or not dataset_dir.is_dir():
+            messagebox.showerror("Open failed", f"Dataset folder not found:\n{dataset_dir}", parent=root)
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(dataset_dir))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(dataset_dir)])
+            else:
+                subprocess.Popen(["xdg-open", str(dataset_dir)])
+        except OSError as exc:
+            messagebox.showerror("Open failed", f"Could not open folder:\n{exc}", parent=root)
+
+    def add_images_to_dataset(dataset_name: str) -> None:
+        dataset_dir = runtime_config.training_dir / dataset_name
+        images_dir = dataset_dir / "images"
+        allowed_import_suffixes = VALID_IMAGE_EXTENSIONS | {".txt"}
+        if not images_dir.exists():
+            try:
+                images_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror("Add images failed", f"Could not create images folder:\n{exc}", parent=root)
+                return
+
+        selected_files = filedialog.askopenfilenames(
+            parent=root,
+            title=f"Add images/captions to {dataset_name}",
+            filetypes=[
+                ("Images and captions", "*.png *.jpg *.jpeg *.txt"),
+                ("Images", "*.png *.jpg *.jpeg"),
+                ("Text files", "*.txt"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not selected_files:
+            return
+
+        collisions = 0
+        for raw_path in selected_files:
+            source = Path(raw_path)
+            if source.is_file() and source.suffix.lower() in allowed_import_suffixes:
+                if (images_dir / source.name).exists():
+                    collisions += 1
+
+        overwrite_existing = False
+        if collisions:
+            choice = messagebox.askyesnocancel(
+                "File name conflicts",
+                (
+                    f"{collisions} selected file(s) already exist in this dataset.\n\n"
+                    "Yes = Replace all existing files\n"
+                    "No = Skip existing files\n"
+                    "Cancel = Abort"
+                ),
+                parent=root,
+            )
+            if choice is None:
+                return
+            overwrite_existing = bool(choice)
+
+        skipped_errors = 0
+
+        for raw_path in selected_files:
+            source = Path(raw_path)
+            if not source.exists() or not source.is_file() or source.suffix.lower() not in allowed_import_suffixes:
+                continue
+
+            destination = images_dir / source.name
+            if destination.exists() and not overwrite_existing:
+                continue
+
+            try:
+                shutil.copy2(source, destination)
+            except OSError:
+                skipped_errors += 1
+
+        rebuild_folder_list(force=True)
+        if skipped_errors:
+            messagebox.showwarning(
+                "Add files warning",
+                f"Finished with {skipped_errors} copy error(s).",
+                parent=root,
+            )
+
+    def dataset_output_safetensors(dataset_name: str) -> list[Path]:
+        output_dir = runtime_config.training_dir / dataset_name / "output"
+        if not output_dir.exists() or not output_dir.is_dir():
+            return []
+        return sorted([p for p in output_dir.iterdir() if p.is_file() and p.suffix.lower() == ".safetensors"])
+
+    def compact_merge_selection_token(selected_files: list[str]) -> str:
+        step_values: list[int] = []
+        for raw_path in selected_files:
+            match = re.search(r"step0*(\d+)", Path(raw_path).name, re.IGNORECASE)
+            if match:
+                step_values.append(int(match.group(1)))
+
+        if not step_values:
+            return f"n{len(selected_files)}"
+
+        unique_steps = sorted(set(step_values))
+        if len(unique_steps) <= 4:
+            return "s" + "-".join(str(step) for step in unique_steps)
+
+        return f"s{unique_steps[0]}-{unique_steps[-1]}x{len(unique_steps)}"
+
+    def next_merged_output_path(
+        dataset_name: str,
+        output_dir: Path,
+        merge_mode_label: str,
+        selected_files: list[str],
+    ) -> Path:
+        # Keep method name in the filename to make comparisons between merge modes easy.
+        method_token = re.sub(r"[^A-Za-z0-9]+", "_", merge_mode_label.strip().lower()).strip("_")
+        selection_token = compact_merge_selection_token(selected_files)
+        if method_token:
+            base_name = f"{dataset_name}_merged_{method_token}_{selection_token}"
+        else:
+            base_name = f"{dataset_name}_merged_{selection_token}"
+        candidate = output_dir / f"{base_name}.safetensors"
+        if not candidate.exists():
+            return candidate
+
+        index = 2
+        while True:
+            candidate = output_dir / f"{base_name}_{index}.safetensors"
+            if not candidate.exists():
+                return candidate
+            index += 1
+
+    def ask_lora_merge_options(
+        dataset_name: str,
+        available_loras: list[Path],
+    ) -> tuple[list[str], str, list[str]] | None:
+        dialog = tk.Toplevel(root)
+        dialog.title("LoRA Merge")
+        dialog.transient(root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.configure(bg=bg_panel)
+        set_dark_title_bar(dialog)
+        dialog.minsize(380, 280)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+
+        frame = ttk.Frame(dialog, padding=12)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        ttk.Label(frame, text=f"LoRAs in output for {dataset_name}:").grid(row=0, column=0, sticky="w")
+
+        selected_box_frame = ttk.Frame(frame)
+        selected_box_frame.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        selected_box_frame.columnconfigure(0, weight=1)
+        selected_box_frame.rowconfigure(0, weight=1)
+
+        selected_list = tk.Listbox(
+            selected_box_frame,
+            selectmode="multiple",
+            exportselection=False,
+            activestyle="none",
+            width=1,
+            bg="#1f1f1f",
+            fg=fg_text,
+            highlightthickness=1,
+            highlightbackground=border_dark,
+            selectbackground="#2f4f66",
+            selectforeground="#ffffff",
+            relief="flat",
+            height=8,
+        )
+        selected_list.grid(row=0, column=0, sticky="nsew")
+        selected_scroll = ttk.Scrollbar(
+            selected_box_frame,
+            orient="vertical",
+            command=selected_list.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        selected_scroll.grid(row=0, column=1, sticky="ns")
+        selected_list.configure(yscrollcommand=selected_scroll.set)
+
+        for lora_path in available_loras:
+            selected_list.insert("end", lora_path.name)
+
+        ttk.Label(frame, text="Select merge mode:").grid(row=2, column=0, sticky="ew", pady=(10, 0))
+
+        mode_var = tk.StringVar(value="beta")
+        ttk.Radiobutton(frame, text="BETA (Default)", variable=mode_var, value="beta").grid(
+            row=3, column=0, sticky="ew", pady=(8, 0)
+        )
+        ttk.Radiobutton(frame, text="BETA + BETA2 (Interpolated)", variable=mode_var, value="beta2").grid(
+            row=4, column=0, sticky="ew", pady=(6, 0)
+        )
+        ttk.Radiobutton(frame, text="SIGMA_REL", variable=mode_var, value="sigma_rel").grid(
+            row=5, column=0, sticky="ew", pady=(6, 0)
+        )
+
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=6, column=0, sticky="ew", pady=(12, 0))
+        button_row.columnconfigure(0, weight=1)
+
+        choice: tuple[list[str], str, list[str]] | None = None
+
+        def choose_and_close() -> None:
+            nonlocal choice
+            picked_indices = selected_list.curselection()
+            selected_file_paths = [str(available_loras[i]) for i in picked_indices]
+            if len(selected_file_paths) < 2:
+                messagebox.showerror(
+                    "Merge unavailable",
+                    "Select at least 2 .safetensors files for Post-Hoc EMA merge.",
+                    parent=dialog,
+                )
+                return
+
+            selected_mode = mode_var.get()
+            if selected_mode == "beta2":
+                choice = (selected_file_paths, "BETA2", ["--beta", "0.90", "--beta2", "0.95"])
+            elif selected_mode == "sigma_rel":
+                choice = (selected_file_paths, "SIGMA_REL", ["--sigma_rel", "0.2"])
+            else:
+                choice = (selected_file_paths, "BETA", ["--beta", "0.9"])
+            dialog.destroy()
+
+        def cancel_and_close() -> None:
+            dialog.destroy()
+
+        go_button = ttk.Button(button_row, text="Go", command=choose_and_close)
+        go_button.grid(row=0, column=0)
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel_and_close)
+        dialog.bind("<Escape>", lambda _e: cancel_and_close())
+        dialog.bind("<Return>", lambda _e: choose_and_close())
+
+        dialog.update_idletasks()
+        requested_width = max(390, dialog.winfo_reqwidth())
+        requested_height = max(360, dialog.winfo_reqheight())
+        dialog.geometry(f"{requested_width}x{requested_height}")
+        center_window(dialog)
+        dialog.focus_set()
+        selected_list.focus_set()
+        root.wait_window(dialog)
+        return choice
+
+    def lora_post_hoc_ema_merge(dataset_name: str) -> None:
+        output_dir = runtime_config.training_dir / dataset_name / "output"
+        available = dataset_output_safetensors(dataset_name)
+        if not available:
+            messagebox.showerror(
+                "Merge unavailable",
+                "No .safetensors files were found in this dataset output folder.",
+                parent=root,
+            )
+            return
+
+        module_script = runtime_config.musubi_dir / "src" / "musubi_tuner" / "lora_post_hoc_ema.py"
+        root_script = runtime_config.musubi_dir / "lora_post_hoc_ema.py"
+        if not module_script.exists() and not root_script.exists():
+            messagebox.showerror(
+                "Merge unavailable",
+                "Could not find lora_post_hoc_ema.py in Musubi-Tuner.",
+                parent=root,
+            )
+            return
+
+        merge_options = ask_lora_merge_options(dataset_name, available)
+        if merge_options is None:
+            return
+        selected_files, merge_mode_label, merge_mode_args = merge_options
+
+        musubi_python = runtime_config.musubi_python
+        if musubi_python is None or not musubi_python.is_file():
+            messagebox.showerror(
+                "Merge unavailable",
+                (
+                    "Musubi-Tuner Python was not found in its venv.\n"
+                    "Expected: .venv/Scripts/python.exe inside your Musubi-Tuner folder."
+                ),
+                parent=root,
+            )
+            return
+
+        output_path = next_merged_output_path(dataset_name, output_dir, merge_mode_label, selected_files)
+        command: list[str]
+        if module_script.exists():
+            command = [
+                str(musubi_python),
+                "-m",
+                "musubi_tuner.lora_post_hoc_ema",
+                *selected_files,
+                "--output_file",
+                str(output_path),
+                *merge_mode_args,
+            ]
+        else:
+            command = [
+                str(musubi_python),
+                str(root_script),
+                *selected_files,
+                "--output_file",
+                str(output_path),
+                *merge_mode_args,
+            ]
+
+        run_env = os.environ.copy()
+        musubi_src = str(runtime_config.musubi_dir / "src")
+        existing_pythonpath = run_env.get("PYTHONPATH", "")
+        run_env["PYTHONPATH"] = musubi_src if not existing_pythonpath else f"{musubi_src}{os.pathsep}{existing_pythonpath}"
+
+        log("")
+        log(
+            f"[Post-Hoc EMA] Merging {len(selected_files)} checkpoint(s) for '{dataset_name}' "
+            f"using {merge_mode_label}..."
+        )
+        result = subprocess.run(
+            command,
+            cwd=str(runtime_config.musubi_dir),
+            env=run_env,
+            capture_output=True,
+            text=True,
+        )
+
+        stdout_text = result.stdout.strip()
+        stderr_text = result.stderr.strip()
+        if stdout_text:
+            log(stdout_text)
+
+        if result.returncode != 0:
+            message = stderr_text if stderr_text else "lora_post_hoc_ema.py failed with no error output."
+            log(f"[Post-Hoc EMA] Failed ({result.returncode}).")
+            if stderr_text:
+                log(stderr_text)
+            messagebox.showerror("Post-Hoc EMA merge failed", message, parent=root)
+            return
+
+        log(f"[Post-Hoc EMA] Created: {output_path}")
+        if stderr_text:
+            log(stderr_text)
+
+        checkpoint_cache.pop(dataset_name, None)
+        rebuild_folder_list(force=True)
+
+    def open_lora_merge_tool_dialog() -> None:
+        musubi_python = runtime_config.musubi_python
+        if musubi_python is None or not musubi_python.is_file():
+            messagebox.showerror(
+                "Merge unavailable",
+                "Musubi-Tuner Python was not found. Open Settings and set Python (venv).",
+                parent=root,
+            )
+            return
+
+        module_script = runtime_config.musubi_dir / "src" / "musubi_tuner" / "lora_post_hoc_ema.py"
+        root_script = runtime_config.musubi_dir / "lora_post_hoc_ema.py"
+        if not module_script.exists() and not root_script.exists():
+            messagebox.showerror(
+                "Merge unavailable",
+                "Could not find lora_post_hoc_ema.py in Musubi-Tuner.",
+                parent=root,
+            )
+            return
+
+        dialog = tk.Toplevel(root)
+        dialog.title("LoRA Merge Tool")
+        dialog.transient(root)
+        dialog.grab_set()
+        dialog.configure(bg=bg_panel)
+        dialog.resizable(False, False)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+        set_dark_title_bar(dialog)
+
+        candidate_loras: list[Path] = []
+        merge_loras: list[Path] = []
+
+        frame = ttk.Frame(dialog, padding=10)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        candidate_section = ttk.LabelFrame(frame, text="LoRAs", padding=8)
+        candidate_section.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        candidate_section.columnconfigure(0, weight=1)
+        candidate_section.rowconfigure(0, weight=1)
+
+        candidate_list = tk.Listbox(
+            candidate_section,
+            selectmode="extended",
+            exportselection=False,
+            height=10,
+            activestyle="none",
+            bg="#1f1f1f",
+            fg=fg_text,
+            highlightthickness=1,
+            highlightbackground=border_dark,
+            selectbackground="#2f4f66",
+            selectforeground="#ffffff",
+            relief="flat",
+        )
+        candidate_list.grid(row=0, column=0, sticky="nsew")
+        candidate_scroll = ttk.Scrollbar(
+            candidate_section,
+            orient="vertical",
+            command=candidate_list.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        candidate_scroll.grid(row=0, column=1, sticky="ns")
+        candidate_list.configure(yscrollcommand=candidate_scroll.set)
+
+        merge_section = ttk.LabelFrame(frame, text="Merge order", padding=8)
+        merge_section.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        merge_section.columnconfigure(0, weight=1)
+        merge_section.rowconfigure(0, weight=1)
+
+        merge_list = tk.Listbox(
+            merge_section,
+            selectmode="extended",
+            exportselection=False,
+            height=10,
+            activestyle="none",
+            bg="#1f1f1f",
+            fg=fg_text,
+            highlightthickness=1,
+            highlightbackground=border_dark,
+            selectbackground="#2f4f66",
+            selectforeground="#ffffff",
+            relief="flat",
+        )
+        merge_list.grid(row=0, column=0, sticky="nsew")
+        merge_scroll = ttk.Scrollbar(
+            merge_section,
+            orient="vertical",
+            command=merge_list.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        merge_scroll.grid(row=0, column=1, sticky="ns")
+        merge_list.configure(yscrollcommand=merge_scroll.set)
+
+        mode_section = ttk.LabelFrame(frame, text="Merge options", padding=8)
+        mode_section.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        mode_section.columnconfigure(1, weight=1)
+
+        mode_var = tk.StringVar(value="beta")
+        ttk.Label(mode_section, text="Mode:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Radiobutton(mode_section, text="BETA (Default)", variable=mode_var, value="beta").grid(row=0, column=1, sticky="w")
+        ttk.Radiobutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_var, value="beta2").grid(row=1, column=1, sticky="w")
+        ttk.Radiobutton(mode_section, text="SIGMA_REL", variable=mode_var, value="sigma_rel").grid(row=2, column=1, sticky="w")
+
+        output_name_var = tk.StringVar(value="merged_lora")
+        output_dir_var = tk.StringVar(value="")
+
+        ttk.Label(mode_section, text="Output name:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Entry(mode_section, textvariable=output_name_var, style="Flat.TEntry").grid(row=3, column=1, sticky="ew", pady=(8, 0))
+
+        ttk.Label(mode_section, text="Output folder:").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(mode_section, textvariable=output_dir_var, style="PathDisplay.TLabel", anchor="w", padding=(6, 4)).grid(
+            row=4,
+            column=1,
+            sticky="ew",
+            pady=(8, 0),
+        )
+
+        actions = ttk.Frame(frame)
+        actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        actions.columnconfigure(0, weight=1)
+
+        def refresh_candidate_list() -> None:
+            candidate_list.delete(0, "end")
+            for path in candidate_loras:
+                candidate_list.insert("end", path.name)
+
+        def refresh_merge_list() -> None:
+            merge_list.delete(0, "end")
+            for path in merge_loras:
+                merge_list.insert("end", path.name)
+
+        def add_loras_to_pool() -> None:
+            initial_dir = str(runtime_config.training_dir)
+            if candidate_loras:
+                initial_dir = str(candidate_loras[-1].parent)
+            picked = filedialog.askopenfilenames(
+                parent=dialog,
+                title="Select LoRA files",
+                initialdir=initial_dir,
+                filetypes=[("Safetensors", "*.safetensors"), ("All files", "*.*")],
+            )
+            if not picked:
+                return
+
+            existing = {str(path.resolve()) for path in candidate_loras}
+            for raw_path in picked:
+                path = Path(raw_path).expanduser()
+                if not path.exists() or not path.is_file() or path.suffix.lower() != ".safetensors":
+                    continue
+                key = str(path.resolve())
+                if key in existing:
+                    continue
+                candidate_loras.append(path)
+                existing.add(key)
+
+            candidate_loras.sort(key=lambda p: p.name.lower())
+            refresh_candidate_list()
+
+        def add_to_merge_list() -> None:
+            selected_indices = list(candidate_list.curselection())
+            if not selected_indices:
+                return
+            existing = {str(path.resolve()) for path in merge_loras}
+            for index in selected_indices:
+                path = candidate_loras[index]
+                key = str(path.resolve())
+                if key not in existing:
+                    merge_loras.append(path)
+                    existing.add(key)
+            if merge_loras and not output_dir_var.get().strip():
+                output_dir_var.set(str(merge_loras[0].parent))
+            refresh_merge_list()
+
+        def remove_from_merge_list() -> None:
+            selected_indices = list(merge_list.curselection())
+            if not selected_indices:
+                return
+            for index in reversed(selected_indices):
+                merge_loras.pop(index)
+            refresh_merge_list()
+
+        def move_merge_up() -> None:
+            selected_indices = list(merge_list.curselection())
+            if not selected_indices or selected_indices[0] == 0:
+                return
+            for index in selected_indices:
+                merge_loras[index - 1], merge_loras[index] = merge_loras[index], merge_loras[index - 1]
+            refresh_merge_list()
+            for index in [i - 1 for i in selected_indices]:
+                merge_list.selection_set(index)
+
+        def move_merge_down() -> None:
+            selected_indices = list(merge_list.curselection())
+            if not selected_indices or selected_indices[-1] >= len(merge_loras) - 1:
+                return
+            for index in reversed(selected_indices):
+                merge_loras[index + 1], merge_loras[index] = merge_loras[index], merge_loras[index + 1]
+            refresh_merge_list()
+            for index in [i + 1 for i in selected_indices]:
+                merge_list.selection_set(index)
+
+        def clear_merge_list() -> None:
+            merge_loras.clear()
+            refresh_merge_list()
+
+        def browse_output_folder() -> None:
+            picked = filedialog.askdirectory(parent=dialog, title="Select output folder")
+            if picked:
+                output_dir_var.set(picked)
+
+        def resolve_output_path() -> Path | None:
+            output_name = output_name_var.get().strip()
+            if not output_name:
+                messagebox.showerror("Missing value", "Output name is required.", parent=dialog)
+                return None
+
+            output_folder_raw = output_dir_var.get().strip()
+            if not output_folder_raw:
+                messagebox.showerror("Missing value", "Output folder is required.", parent=dialog)
+                return None
+
+            output_folder = Path(output_folder_raw).expanduser()
+            try:
+                output_folder.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror("Invalid folder", f"Could not use output folder:\n{exc}", parent=dialog)
+                return None
+
+            output_name = output_name[:-12] if output_name.lower().endswith(".safetensors") else output_name
+            candidate = output_folder / f"{output_name}.safetensors"
+            if candidate.exists():
+                messagebox.showerror(
+                    "Name already exists",
+                    f"A file with this name already exists:\n{candidate}\n\nChoose a different output name.",
+                    parent=dialog,
+                )
+                return None
+            return candidate
+
+        def run_merge() -> None:
+            if len(merge_loras) < 2:
+                messagebox.showerror("Merge unavailable", "Add at least 2 LoRAs to merge list.", parent=dialog)
+                return
+
+            selected_mode = mode_var.get()
+            if selected_mode == "beta2":
+                merge_mode_label = "BETA2"
+                merge_mode_args = ["--beta", "0.90", "--beta2", "0.95"]
+            elif selected_mode == "sigma_rel":
+                merge_mode_label = "SIGMA_REL"
+                merge_mode_args = ["--sigma_rel", "0.2"]
+            else:
+                merge_mode_label = "BETA"
+                merge_mode_args = ["--beta", "0.9"]
+
+            output_path = resolve_output_path()
+            if output_path is None:
+                return
+
+            selected_files = [str(path) for path in merge_loras]
+            command: list[str]
+            if module_script.exists():
+                command = [
+                    str(musubi_python),
+                    "-m",
+                    "musubi_tuner.lora_post_hoc_ema",
+                    *selected_files,
+                    "--output_file",
+                    str(output_path),
+                    "--no_sort",
+                    *merge_mode_args,
+                ]
+            else:
+                command = [
+                    str(musubi_python),
+                    str(root_script),
+                    *selected_files,
+                    "--output_file",
+                    str(output_path),
+                    "--no_sort",
+                    *merge_mode_args,
+                ]
+
+            run_env = os.environ.copy()
+            musubi_src = str(runtime_config.musubi_dir / "src")
+            existing_pythonpath = run_env.get("PYTHONPATH", "")
+            run_env["PYTHONPATH"] = musubi_src if not existing_pythonpath else f"{musubi_src}{os.pathsep}{existing_pythonpath}"
+
+            log("")
+            log(f"[LoRA Merge Tool] Merging {len(selected_files)} LoRA(s) using {merge_mode_label}...")
+            log(f"[LoRA Merge Tool] Output: {output_path}")
+
+            result = subprocess.run(
+                command,
+                cwd=str(runtime_config.musubi_dir),
+                env=run_env,
+                capture_output=True,
+                text=True,
+            )
+
+            if result.stdout.strip():
+                log(result.stdout.strip())
+
+            if result.returncode != 0:
+                log(f"[LoRA Merge Tool] Failed ({result.returncode}).")
+                if result.stderr.strip():
+                    log(result.stderr.strip())
+                messagebox.showerror(
+                    "Merge failed",
+                    result.stderr.strip() or "lora_post_hoc_ema.py failed with no error output.",
+                    parent=dialog,
+                )
+                return
+
+            if result.stderr.strip():
+                log(result.stderr.strip())
+            log(f"[LoRA Merge Tool] Created: {output_path}")
+            messagebox.showinfo("Merge complete", f"Created:\n{output_path}", parent=dialog)
+
+        candidate_list.bind("<Double-Button-1>", lambda _e: add_to_merge_list())
+
+        candidate_actions = ttk.Frame(candidate_section)
+        candidate_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(candidate_actions, text="Add LoRA", command=add_loras_to_pool).grid(row=0, column=0, padx=(0, 8), sticky="w")
+        ttk.Button(candidate_actions, text="Add to Merge List >>", command=add_to_merge_list).grid(row=0, column=1, sticky="w")
+
+        merge_actions = ttk.Frame(merge_section)
+        merge_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(merge_actions, text="Remove", command=remove_from_merge_list).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(merge_actions, text="Up", command=move_merge_up).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(merge_actions, text="Down", command=move_merge_down).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(merge_actions, text="Clear", command=clear_merge_list).grid(row=0, column=3)
+
+        ttk.Button(mode_section, text="Browse", command=browse_output_folder).grid(row=4, column=2, padx=(8, 0), pady=(8, 0))
+
+        ttk.Button(actions, text="Close", command=dialog.destroy).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(actions, text="Go", command=run_merge).grid(row=0, column=2)
+
+        dialog.update_idletasks()
+        dialog.geometry("820x620")
+        center_window(dialog)
+        root.wait_window(dialog)
+
+    def show_thumbnail_context_menu(event: tk.Event, dataset_name: str) -> str:
+        menu = tk.Menu(root, tearoff=0)
+        menu.add_command(label="Open Dataset", command=lambda: open_dataset_in_file_manager(dataset_name))
+        menu.add_command(label="Add Images", command=lambda: add_images_to_dataset(dataset_name))
+        menu.add_separator()
+        has_output_loras = bool(dataset_output_safetensors(dataset_name))
+        menu.add_command(
+            label="LoRA Merge",
+            state=("normal" if has_output_loras else "disabled"),
+            command=lambda: lora_post_hoc_ema_merge(dataset_name),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
     list_container = ttk.LabelFrame(root, text="Datasets (click thumbnail to toggle, drag to reorder)", padding=8)
     list_container.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 0))
     list_container.columnconfigure(0, weight=1)
@@ -1116,14 +1900,42 @@ def launch_ui() -> int:
     start_bar.grid(row=3, column=0, sticky="ew")
     start_bar.columnconfigure(0, weight=1)
 
-    log_box = ScrolledText(root, height=10, wrap="word")
-    log_box.grid(row=4, column=0, sticky="nsew", padx=8, pady=(0, 8))
+    log_container = ttk.Frame(root)
+    log_container.grid(row=4, column=0, sticky="nsew", padx=8, pady=(0, 8))
+    log_container.columnconfigure(0, weight=1)
+    log_container.rowconfigure(0, weight=1)
+
+    log_box = tk.Text(log_container, height=10, wrap="none")
+    log_box.grid(row=0, column=0, sticky="nsew")
+    log_scroll_y = ttk.Scrollbar(
+        log_container,
+        orient="vertical",
+        command=log_box.yview,
+        style="Dark.Vertical.TScrollbar",
+    )
+    log_scroll_y.grid(row=0, column=1, sticky="ns")
+    log_scroll_x = ttk.Scrollbar(
+        log_container,
+        orient="horizontal",
+        command=log_box.xview,
+        style="Dark.Horizontal.TScrollbar",
+    )
+    log_scroll_x.grid(row=1, column=0, sticky="ew")
+    log_box.configure(yscrollcommand=log_scroll_y.set, xscrollcommand=log_scroll_x.set)
     log_box.configure(bg="#0e1319", fg=fg_text, insertbackground=fg_text, relief="flat", borderwidth=0)
 
     def log(message: str) -> None:
-        log_box.insert("end", message + "\n")
-        log_box.see("end")
-        root.update_idletasks()
+        def append_line() -> None:
+            if not root.winfo_exists():
+                return
+            log_box.insert("end", message + "\n")
+            log_box.see("end")
+            root.update_idletasks()
+
+        if threading.current_thread() is threading.main_thread():
+            append_line()
+        else:
+            root.after(0, append_line)
 
     def first_image_path(dataset_name: str) -> Path | None:
         cached = first_image_cache.get(dataset_name)
@@ -1482,6 +2294,8 @@ def launch_ui() -> int:
                 clickable.bind("<B1-Motion>", lambda _e: on_card_motion())
                 clickable.bind("<ButtonRelease-1>", lambda _e, n=name: on_card_release(n))
 
+            image_label.bind("<Button-3>", lambda e, n=name: show_thumbnail_context_menu(e, n))
+
             card_widgets.append(card)
 
         update_start_button_state()
@@ -1546,10 +2360,15 @@ def launch_ui() -> int:
 
     def update_start_button_state() -> None:
         if run_in_progress:
-            run_button.configure(style="StartDisabled.TButton")
-            run_button.state(["disabled"])
+            if run_cancel_event is not None and run_cancel_event.is_set():
+                run_button.configure(text="Cancelling...", style="StartDisabled.TButton")
+                run_button.state(["disabled"])
+            else:
+                run_button.configure(text="In Progress (Press to Cancel)", style="StartInProgress.TButton")
+                run_button.state(["!disabled"])
             return
 
+        run_button.configure(text="START")
         has_selection = bool(selected_names())
         if has_selection:
             run_button.configure(style="StartEnabled.TButton")
@@ -1571,40 +2390,91 @@ def launch_ui() -> int:
         update_start_button_state()
 
     def run_selected() -> None:
-        nonlocal run_in_progress
+        nonlocal run_in_progress, run_cancel_event
+        if run_in_progress:
+            if run_cancel_event is not None and not run_cancel_event.is_set():
+                should_cancel = messagebox.askyesno(
+                    "Cancel Training",
+                    "Stop current training and cancel all remaining models?",
+                )
+                if should_cancel:
+                    run_cancel_event.set()
+                    log("Cancellation requested. Stopping all remaining models...")
+                    update_start_button_state()
+            return
+
         names = selected_names()
         if not names:
             messagebox.showinfo("Nothing selected", "Select at least one folder.")
             return
 
+        run_cancel_event = threading.Event()
         run_in_progress = True
         update_start_button_state()
-        try:
-            log("")
-            train_models(
-                runtime_config,
-                names,
-                logger=log,
-                do_prep_dataset=True,
-                do_cache_latents=True,
-                do_cache_text=True,
-                do_train=True,
-            )
-            rebuild_folder_list(force=True)
-        finally:
-            run_in_progress = False
-            update_start_button_state()
+
+        def background_train() -> None:
+            try:
+                log("")
+                log("Training is in progress...")
+                train_models(
+                    runtime_config,
+                    names,
+                    default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+                    enable_compile_optimizations=(
+                        settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0").strip().lower()
+                        in {"1", "true", "yes", "on"}
+                    ),
+                    enable_cuda_allow_tf32=(
+                        settings_state.get(ENABLE_CUDA_ALLOW_TF32_KEY, "1").strip().lower() in {"1", "true", "yes", "on"}
+                    ),
+                    enable_cuda_cudnn_benchmark=(
+                        settings_state.get(ENABLE_CUDA_CUDNN_BENCHMARK_KEY, "1").strip().lower()
+                        in {"1", "true", "yes", "on"}
+                    ),
+                    enable_fp8_dit=(
+                        settings_state.get(ENABLE_FP8_DIT_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
+                    ),
+                    enable_gradient_checkpointing_cpu_offload=(
+                        settings_state.get(ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY, "0").strip().lower()
+                        in {"1", "true", "yes", "on"}
+                    ),
+                    logger=log,
+                    do_prep_dataset=True,
+                    do_cache_latents=True,
+                    do_cache_text=True,
+                    do_train=True,
+                    cancel_requested=(lambda: run_cancel_event is not None and run_cancel_event.is_set()),
+                )
+            except Exception as exc:
+                log(f"Training failed unexpectedly: {exc}")
+            finally:
+                def finish_ui() -> None:
+                    nonlocal run_in_progress, run_cancel_event
+                    if not root.winfo_exists():
+                        return
+                    rebuild_folder_list(force=True)
+                    run_in_progress = False
+                    run_cancel_event = None
+                    update_start_button_state()
+
+                root.after(0, finish_ui)
+
+        threading.Thread(target=background_train, daemon=True).start()
 
     refresh_button = ttk.Button(controls, text="Refresh", command=lambda: rebuild_folder_list(force=True))
     select_all_button = ttk.Button(controls, text="Select All", command=select_all)
     clear_button = ttk.Button(controls, text="Clear", command=clear_selection)
+    create_dataset_button = ttk.Button(controls, text="Create Dataset", command=create_dataset)
+    lora_merge_tool_button = ttk.Button(controls, text="LoRA Merge Tool", command=open_lora_merge_tool_dialog)
     settings_button = ttk.Button(controls, text="Settings", command=apply_settings_from_dialog)
     run_button = ttk.Button(start_bar, text="START", command=run_selected, style="StartDisabled.TButton")
 
     refresh_button.grid(row=0, column=0, padx=(0, 8), sticky="w")
     select_all_button.grid(row=0, column=1, padx=(0, 8), sticky="w")
     clear_button.grid(row=0, column=2, padx=(0, 8), sticky="w")
-    settings_button.grid(row=0, column=4, sticky="e")
+    create_dataset_button.grid(row=0, column=4, padx=(0, 8), sticky="e")
+    lora_merge_tool_button.grid(row=0, column=5, padx=(0, 8), sticky="e")
+    settings_button.grid(row=0, column=6, sticky="e")
     run_button.grid(row=0, column=0, sticky="ew")
 
     def on_canvas_configure(event: tk.Event) -> None:
@@ -1630,7 +2500,8 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.names:
-        runtime_config = runtime_config_from_settings(load_settings())
+        settings = load_settings()
+        runtime_config = klein_runtime_config_from_settings(settings)
         if runtime_config is None:
             print(f"Missing settings file: {SETTINGS_FILE}")
             print("Run without CLI args once to set Musubi-Tuner location.")
@@ -1646,6 +2517,23 @@ def main() -> int:
         return train_models(
             runtime_config,
             model_names,
+            default_caption_keyword=settings.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+            enable_compile_optimizations=(
+                settings.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
+            ),
+            enable_cuda_allow_tf32=(
+                settings.get(ENABLE_CUDA_ALLOW_TF32_KEY, "1").strip().lower() in {"1", "true", "yes", "on"}
+            ),
+            enable_cuda_cudnn_benchmark=(
+                settings.get(ENABLE_CUDA_CUDNN_BENCHMARK_KEY, "1").strip().lower() in {"1", "true", "yes", "on"}
+            ),
+            enable_fp8_dit=(
+                settings.get(ENABLE_FP8_DIT_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
+            ),
+            enable_gradient_checkpointing_cpu_offload=(
+                settings.get(ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY, "0").strip().lower()
+                in {"1", "true", "yes", "on"}
+            ),
             logger=print,
             do_prep_dataset=do_prep_dataset,
             do_cache_latents=do_cache_latents,

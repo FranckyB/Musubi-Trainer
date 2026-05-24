@@ -7,6 +7,7 @@ WINDOW_Y_KEY = "window_y"
 WINDOW_WIDTH_KEY = "window_width"
 WINDOW_HEIGHT_KEY = "window_height"
 MUSUBI_DIR_KEY = "musubi_dir"
+MUSUBI_PYTHON_KEY = "musubi_python"
 
 KLEIN_MODEL_VERSION_KEY = "klein_model_version"
 KLEIN_DIT_KEY = "klein_dit"
@@ -17,6 +18,13 @@ LTX_MODEL_VERSION_KEY = "ltx_model_version"
 LTX_DIT_KEY = "ltx_dit"
 LTX_VAE_KEY = "ltx_vae"
 LTX_TEXT_ENCODER_KEY = "ltx_text_encoder"
+DEFAULT_CAPTION_KEYWORD_KEY = "default_caption_keyword"
+ENABLE_COMPILE_OPTIMIZATIONS_KEY = "enable_compile_optimizations"
+ENABLE_COMPILE_CACHE_SIZE_LIMIT_KEY = "enable_compile_cache_size_limit"
+ENABLE_CUDA_ALLOW_TF32_KEY = "enable_cuda_allow_tf32"
+ENABLE_CUDA_CUDNN_BENCHMARK_KEY = "enable_cuda_cudnn_benchmark"
+ENABLE_FP8_DIT_KEY = "enable_fp8_dit"
+ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY = "enable_gradient_checkpointing_cpu_offload"
 
 
 def load_settings() -> dict[str, str]:
