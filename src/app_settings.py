@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-SETTINGS_FILE = Path(__file__).resolve().parent.parent / "settings.json"
+SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
 WINDOW_X_KEY = "window_x"
 WINDOW_Y_KEY = "window_y"
 WINDOW_WIDTH_KEY = "window_width"

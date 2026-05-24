@@ -37,3 +37,4 @@ Thumbs.db
 .history/
 Musubi-Trainer-Workspace.code-workspace
 settings.json
+src/settings.json

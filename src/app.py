@@ -4,6 +4,7 @@ import argparse
 import re
 import configparser
 import ctypes
+import math
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -41,6 +42,7 @@ STEPS = 3000
 VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 LATENT_SUFFIX = "f2k9b"
 DATASET_ORDER_KEY = "dataset_order"
+DRAG_START_THRESHOLD_PX = 20
 
 
 def load_ui_config(config_path: Path) -> dict[str, int]:
@@ -433,6 +435,13 @@ def launch_ui() -> int:
     workspace_dir = Path(__file__).resolve().parent.parent
     ui_config = load_ui_config(Path(__file__).resolve().parent / "app.config")
     default_models_dir = workspace_dir / "Models"
+    app_user_model_id = "MusubiTrainer.Launcher"
+
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_user_model_id)
+        except Exception:
+            pass
 
     def set_dark_title_bar(window: tk.Misc) -> None:
         if sys.platform != "win32":
@@ -461,10 +470,18 @@ def launch_ui() -> int:
     root.geometry(f"{ui_config['window_width']}x{ui_config['window_height']}")
     root.minsize(ui_config["min_window_width"], ui_config["min_window_height"])
     root.configure(bg=bg_root)
+    ico_path = Path(__file__).resolve().parent / "logo.ico"
+    if sys.platform == "win32" and ico_path.exists():
+        try:
+            root.iconbitmap(default=str(ico_path))
+        except Exception:
+            pass
     set_dark_title_bar(root)
 
     settings_state = load_settings()
+    dataset_order: list[str] = load_dataset_order(settings_state)
     window_position_applied = False
+    settings_reset_requested = False
 
     def apply_initial_main_window_position() -> None:
         nonlocal window_position_applied
@@ -502,6 +519,8 @@ def launch_ui() -> int:
 
     def save_main_window_position_now() -> None:
         nonlocal settings_state
+        if settings_reset_requested:
+            return
         settings_state[WINDOW_X_KEY] = str(root.winfo_x())
         settings_state[WINDOW_Y_KEY] = str(root.winfo_y())
         settings_state[WINDOW_WIDTH_KEY] = str(root.winfo_width())
@@ -516,7 +535,7 @@ def launch_ui() -> int:
         save_main_window_position_now()
 
     def on_root_close() -> None:
-        if window_position_applied and root.winfo_exists():
+        if (not settings_reset_requested) and window_position_applied and root.winfo_exists():
             save_main_window_position_now()
         root.destroy()
 
@@ -613,6 +632,24 @@ def launch_ui() -> int:
         lightcolor="#3e5a47",
         darkcolor="#3e5a47",
     )
+    style.configure(
+        "DragSourceCard.TFrame",
+        background=bg_card,
+        relief="solid",
+        borderwidth=2,
+        bordercolor="#e3b45c",
+        lightcolor="#e3b45c",
+        darkcolor="#e3b45c",
+    )
+    style.configure(
+        "DropTargetCard.TFrame",
+        background=bg_card,
+        relief="solid",
+        borderwidth=2,
+        bordercolor="#7ec4ff",
+        lightcolor="#7ec4ff",
+        darkcolor="#7ec4ff",
+    )
     style.configure("CardTitle.TLabel", background=bg_card, foreground=fg_text)
     style.configure("CardMeta.TLabel", background=bg_card, foreground=fg_muted)
     style.configure("DoneCardTitle.TLabel", background="#262626", foreground=fg_text)
@@ -678,12 +715,17 @@ def launch_ui() -> int:
     checkpoint_cache: dict[str, tuple[Path | None, int]] = {}
     run_state_by_name: dict[str, str] = {}
     card_frame_by_name: dict[str, ttk.Frame] = {}
+    card_thumb_by_name: dict[str, ImageTk.PhotoImage] = {}
     resize_after_id: str | None = None
     last_canvas_width = 0
     run_in_progress = False
-    dataset_order: list[str] = load_dataset_order(settings_state)
     drag_dataset_name: str | None = None
+    drag_hover_dataset_name: str | None = None
+    drag_preview: tk.Toplevel | None = None
+    drag_preview_photo: ImageTk.PhotoImage | None = None
     drag_moved = False
+    drag_start_x: int | None = None
+    drag_start_y: int | None = None
     runtime_config = runtime_config_from_settings(settings_state)
 
     def persist_dataset_order() -> None:
@@ -935,6 +977,29 @@ def launch_ui() -> int:
         def cancel_and_close() -> None:
             dialog.destroy()
 
+        def reset_settings() -> None:
+            nonlocal result, settings_state, settings_reset_requested
+            confirmed = messagebox.askyesno(
+                "Reset settings",
+                "Delete settings.json and reset all saved settings?",
+                parent=dialog,
+            )
+            if not confirmed:
+                return
+
+            try:
+                if SETTINGS_FILE.exists():
+                    SETTINGS_FILE.unlink()
+            except OSError as exc:
+                messagebox.showerror("Reset failed", f"Could not delete settings file:\n{exc}", parent=dialog)
+                return
+
+            settings_reset_requested = True
+            settings_state = {}
+            result = None
+            dialog.destroy()
+            root.after_idle(root.destroy)
+
         ttk.Button(musubi_section, text="Browse Folder", command=browse_musubi).grid(row=0, column=2, padx=(8, 0))
         ttk.Button(klein_section, text="Browse File", command=browse_klein_dit).grid(row=1, column=2, padx=(8, 0), pady=(8, 0))
         ttk.Button(klein_section, text="Browse File", command=browse_klein_vae).grid(row=2, column=2, padx=(8, 0), pady=(8, 0))
@@ -953,9 +1018,11 @@ def launch_ui() -> int:
         )
 
         button_row = ttk.Frame(frame)
-        button_row.grid(row=4, column=0, sticky="e")
-        ttk.Button(button_row, text="Cancel", command=cancel_and_close).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(button_row, text="Save", command=save_and_close).grid(row=0, column=1)
+        button_row.grid(row=4, column=0, sticky="ew")
+        button_row.columnconfigure(0, weight=1)
+        ttk.Button(button_row, text="Reset Settings", command=reset_settings).grid(row=0, column=0, sticky="w")
+        ttk.Button(button_row, text="Cancel", command=cancel_and_close).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(button_row, text="Save", command=save_and_close).grid(row=0, column=2)
 
         dialog.protocol("WM_DELETE_WINDOW", cancel_and_close)
         dialog.update_idletasks()
@@ -1014,7 +1081,7 @@ def launch_ui() -> int:
         rebuild_folder_list(force=True)
         return True
 
-    list_container = ttk.LabelFrame(root, text="Datasets (click thumbnail/title to toggle)", padding=8)
+    list_container = ttk.LabelFrame(root, text="Datasets (click thumbnail to toggle, drag to reorder)", padding=8)
     list_container.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 0))
     list_container.columnconfigure(0, weight=1)
     list_container.columnconfigure(1, weight=0, minsize=12)
@@ -1170,6 +1237,12 @@ def launch_ui() -> int:
         card = card_frame_by_name.get(name)
         if card is None:
             return
+        if drag_dataset_name == name:
+            card.configure(style="DragSourceCard.TFrame")
+            return
+        if drag_hover_dataset_name == name:
+            card.configure(style="DropTargetCard.TFrame")
+            return
         run_state = run_state_by_name.get(name, "pending")
         if run_state == "done":
             card.configure(style="DoneCard.TFrame")
@@ -1178,29 +1251,82 @@ def launch_ui() -> int:
         card.configure(style=("SelectedCard.TFrame" if selected else "Card.TFrame"))
 
     def on_card_press(name: str) -> None:
-        nonlocal drag_dataset_name, drag_moved
+        nonlocal drag_dataset_name, drag_hover_dataset_name, drag_moved, drag_start_x, drag_start_y
         drag_dataset_name = name
+        drag_hover_dataset_name = None
         drag_moved = False
+        drag_start_x = root.winfo_pointerx()
+        drag_start_y = root.winfo_pointery()
 
     def on_card_motion() -> None:
-        nonlocal drag_moved
+        nonlocal drag_moved, drag_hover_dataset_name
         if drag_dataset_name is not None:
-            drag_moved = True
+            if not drag_moved:
+                current_x = root.winfo_pointerx()
+                current_y = root.winfo_pointery()
+                start_x = current_x if drag_start_x is None else drag_start_x
+                start_y = current_y if drag_start_y is None else drag_start_y
+                distance = math.hypot(current_x - start_x, current_y - start_y)
+                if distance < DRAG_START_THRESHOLD_PX:
+                    return
+
+                drag_moved = True
+                show_drag_preview(drag_dataset_name)
+                apply_card_style(drag_dataset_name)
+
+            move_drag_preview()
+
+            hovered_widget = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
+            hover_name = dataset_name_from_widget(hovered_widget)
+            if hover_name == drag_dataset_name:
+                hover_name = None
+            if hover_name != drag_hover_dataset_name:
+                previous_hover = drag_hover_dataset_name
+                drag_hover_dataset_name = hover_name
+                if previous_hover is not None:
+                    apply_card_style(previous_hover)
+                if drag_hover_dataset_name is not None:
+                    apply_card_style(drag_hover_dataset_name)
+
+    def dataset_name_from_widget(widget: tk.Misc | None) -> str | None:
+        current: tk.Misc | None = widget
+        while current is not None:
+            for dataset_name, card_widget in card_frame_by_name.items():
+                if current == card_widget:
+                    return dataset_name
+            parent_name = current.winfo_parent()
+            if not parent_name:
+                break
+            try:
+                current = current.nametowidget(parent_name)
+            except Exception:
+                break
+        return None
 
     def on_card_release(target_name: str) -> str:
-        nonlocal drag_dataset_name, drag_moved, dataset_order
+        nonlocal drag_dataset_name, drag_hover_dataset_name, drag_moved, drag_start_x, drag_start_y, dataset_order
         if drag_dataset_name is None:
             return "break"
 
         source_name = drag_dataset_name
+        hovered_name = drag_hover_dataset_name
         moved = drag_moved
         drag_dataset_name = None
+        drag_hover_dataset_name = None
         drag_moved = False
+        drag_start_x = None
+        drag_start_y = None
+        hide_drag_preview()
+        apply_card_style(source_name)
+        if hovered_name is not None:
+            apply_card_style(hovered_name)
 
         if moved:
-            if source_name != target_name and source_name in dataset_order and target_name in dataset_order:
+            hovered_widget = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
+            drop_target = dataset_name_from_widget(hovered_widget) or target_name
+            if source_name != drop_target and source_name in dataset_order and drop_target in dataset_order:
                 source_idx = dataset_order.index(source_name)
-                target_idx = dataset_order.index(target_name)
+                target_idx = dataset_order.index(drop_target)
                 dataset_order.insert(target_idx, dataset_order.pop(source_idx))
                 persist_dataset_order()
                 rebuild_folder_list(force=True)
@@ -1210,6 +1336,49 @@ def launch_ui() -> int:
         apply_card_style(source_name)
         update_start_button_state()
         return "break"
+
+    def show_drag_preview(name: str) -> None:
+        nonlocal drag_preview, drag_preview_photo
+        hide_drag_preview()
+
+        thumb = card_thumb_by_name.get(name)
+        if thumb is None:
+            return
+
+        drag_preview = tk.Toplevel(root)
+        drag_preview.overrideredirect(True)
+        try:
+            drag_preview.attributes("-topmost", True)
+            drag_preview.attributes("-alpha", 0.85)
+        except Exception:
+            pass
+        drag_preview.configure(bg="#1d1d1d")
+
+        drag_preview_photo = thumb
+        preview_frame = tk.Frame(drag_preview, bg="#2a2a2a", bd=1, relief="solid")
+        preview_frame.pack(padx=0, pady=0)
+        preview_image = tk.Label(preview_frame, image=drag_preview_photo, bg="#2a2a2a", bd=0)
+        preview_image.pack(padx=4, pady=(4, 2))
+        preview_text = tk.Label(preview_frame, text=name, fg="#e6e6e6", bg="#2a2a2a")
+        preview_text.pack(padx=4, pady=(0, 4))
+        move_drag_preview()
+
+    def move_drag_preview() -> None:
+        if drag_preview is None:
+            return
+        x = root.winfo_pointerx() + 14
+        y = root.winfo_pointery() + 14
+        drag_preview.geometry(f"+{x}+{y}")
+
+    def hide_drag_preview() -> None:
+        nonlocal drag_preview, drag_preview_photo
+        if drag_preview is not None:
+            try:
+                drag_preview.destroy()
+            except Exception:
+                pass
+        drag_preview = None
+        drag_preview_photo = None
 
     def rebuild_folder_list(force: bool = False) -> None:
         nonlocal dataset_order
@@ -1226,6 +1395,7 @@ def launch_ui() -> int:
         vars_by_name.clear()
         run_state_by_name.clear()
         card_frame_by_name.clear()
+        card_thumb_by_name.clear()
 
         scanned_names = scan_training_folders(runtime_config.training_dir)
         existing = [name for name in dataset_order if name in scanned_names]
@@ -1288,6 +1458,7 @@ def launch_ui() -> int:
 
             image_path = first_image_path(name)
             thumb = make_thumbnail(image_path, train_state, thumb_px)
+            card_thumb_by_name[name] = thumb
 
             title_style = "DoneCardTitle.TLabel" if train_state == "done" else "CardTitle.TLabel"
             meta_style = "DoneCardMeta.TLabel" if train_state == "done" else "CardMeta.TLabel"
@@ -1390,11 +1561,13 @@ def launch_ui() -> int:
     def select_all() -> None:
         for name, var in vars_by_name.items():
             var.set(run_state_by_name.get(name) != "done")
+            apply_card_style(name)
         update_start_button_state()
 
     def clear_selection() -> None:
-        for var in vars_by_name.values():
+        for name, var in vars_by_name.items():
             var.set(False)
+            apply_card_style(name)
         update_start_button_state()
 
     def run_selected() -> None:
