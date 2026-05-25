@@ -1,6 +1,10 @@
 import subprocess
 import re
 import time
+import tempfile
+import os
+import shutil
+from collections import deque
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -39,6 +43,27 @@ def latest_checkpoint_for_dataset(training_dir: Path, dataset_name: str) -> tupl
             latest_path = checkpoint_path
 
     return latest_path, latest_step
+
+
+def latest_resume_state_for_dataset(training_dir: Path, dataset_name: str, checkpoint_step: int) -> tuple[Path | None, int]:
+    output_dir = training_dir / dataset_name / "output"
+    if not output_dir.exists():
+        return None, 0
+
+    output_name = f"{dataset_name}_Klein"
+
+    # Preferred: step-aligned state dir for the latest known checkpoint step.
+    if checkpoint_step > 0:
+        step_state_dir = output_dir / f"{output_name}-step{checkpoint_step:08d}-state"
+        if step_state_dir.is_dir() and (step_state_dir / "scheduler.bin").exists():
+            return step_state_dir, checkpoint_step
+
+    # Fallback: final train-end state dir (no step in folder name).
+    last_state_dir = output_dir / f"{output_name}-state"
+    if last_state_dir.is_dir() and (last_state_dir / "scheduler.bin").exists():
+        return last_state_dir, checkpoint_step
+
+    return None, 0
 
 
 def dataset_image_files(training_dir: Path, dataset_name: str) -> list[Path]:
@@ -178,24 +203,142 @@ def count_text_cache_ready(training_dir: Path, dataset_name: str) -> tuple[int, 
     return ready, len(image_files)
 
 
-def run_command(args: Iterable[str], cwd: Path, cancel_requested: Callable[[], bool] | None = None) -> None:
-    process = subprocess.Popen(list(args), cwd=str(cwd))
-    while True:
-        if cancel_requested is not None and cancel_requested():
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-            raise TrainingCancelledError("Cancelled by user.")
+def backup_existing_step_checkpoints(output_dir: Path, output_name: str) -> tuple[Path | None, int]:
+    if not output_dir.exists() or not output_dir.is_dir():
+        return None, 0
 
-        return_code = process.poll()
-        if return_code is not None:
-            if return_code != 0:
-                raise RuntimeError(f"Command failed with exit code {return_code}: {' '.join(args)}")
+    pattern = re.compile(rf"^{re.escape(output_name)}-step\d{{8}}\.safetensors$", re.IGNORECASE)
+    step_files = sorted([p for p in output_dir.glob("*.safetensors") if pattern.match(p.name)])
+    if not step_files:
+        return None, 0
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup_dir = output_dir / "backup" / f"resume-pre-{stamp}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    copied = 0
+    for source in step_files:
+        shutil.copy2(source, backup_dir / source.name)
+        copied += 1
+
+    return backup_dir, copied
+
+
+def run_command(
+    args: Iterable[str],
+    cwd: Path,
+    cancel_requested: Callable[[], bool] | None = None,
+    logger: Callable[[str], None] | None = None,
+    stream_to_logger: bool = False,
+) -> None:
+    if not stream_to_logger:
+        process = subprocess.Popen(list(args), cwd=str(cwd), env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
+        while True:
+            if cancel_requested is not None and cancel_requested():
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                raise TrainingCancelledError("Cancelled by user.")
+
+            return_code = process.poll()
+            if return_code is not None:
+                if return_code != 0:
+                    raise RuntimeError(f"Command failed with exit code {return_code}: {' '.join(args)}")
+                return
+            time.sleep(0.2)
+
+    process: subprocess.Popen | None = None
+    log_path: Path | None = None
+    read_offset = 0
+    partial_line = ""
+    recent_lines: deque[str] = deque(maxlen=40)
+
+    def flush_new_output() -> None:
+        nonlocal read_offset, partial_line
+        if logger is None or log_path is None or not log_path.exists():
             return
-        time.sleep(0.2)
+        try:
+            with log_path.open("r", encoding="utf-8", errors="replace") as reader:
+                reader.seek(read_offset)
+                chunk = reader.read()
+                read_offset = reader.tell()
+        except OSError:
+            return
+
+        if not chunk:
+            return
+
+        chunk = partial_line + chunk
+        lines = chunk.splitlines()
+        if chunk and not chunk.endswith(("\n", "\r")):
+            partial_line = lines.pop() if lines else chunk
+        else:
+            partial_line = ""
+
+        for line in lines:
+            cleaned = line.rstrip("\r\n")
+            recent_lines.append(cleaned)
+            logger(cleaned)
+
+    def flush_partial_line() -> None:
+        nonlocal partial_line
+        if logger is None:
+            return
+        if not partial_line:
+            return
+        cleaned = partial_line.rstrip("\r\n")
+        recent_lines.append(cleaned)
+        logger(cleaned)
+        partial_line = ""
+
+    try:
+        env = os.environ.copy()
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", errors="replace", delete=False, suffix=".log") as log_file:
+            log_path = Path(log_file.name)
+            process = subprocess.Popen(list(args), cwd=str(cwd), stdout=log_file, stderr=subprocess.STDOUT, env=env)
+            while True:
+                flush_new_output()
+                if cancel_requested is not None and cancel_requested():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                    raise TrainingCancelledError("Cancelled by user.")
+
+                return_code = process.poll()
+                if return_code is not None:
+                    flush_new_output()
+                    flush_partial_line()
+                    if return_code != 0:
+                        output_tail = "\n".join(recent_lines)
+                        if not output_tail and log_path.exists():
+                            try:
+                                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                                if lines:
+                                    output_tail = "\n".join(lines[-40:])
+                            except OSError:
+                                output_tail = ""
+                        if output_tail:
+                            raise RuntimeError(
+                                f"Command failed with exit code {return_code}: {' '.join(args)}\n"
+                                f"--- command output (tail) ---\n{output_tail}"
+                            )
+                        raise RuntimeError(f"Command failed with exit code {return_code}: {' '.join(args)}")
+                    return
+                time.sleep(0.2)
+    finally:
+        if log_path is not None and log_path.exists():
+            try:
+                log_path.unlink()
+            except OSError:
+                pass
 
 
 def format_command_for_log(args: Iterable[str]) -> str:
@@ -220,7 +363,8 @@ def run_steps_for_model(
     do_cache_latents: bool,
     do_cache_text: bool,
     do_train: bool,
-    resume_checkpoint: Path | None,
+    resume_state_dir: Path | None,
+    warmstart_checkpoint: Path | None,
     train_steps_override: int | None,
     logger: Callable[[str], None],
     cancel_requested: Callable[[], bool] | None = None,
@@ -309,6 +453,8 @@ def run_steps_for_model(
                 ],
                 cwd=runtime_config.musubi_dir,
                 cancel_requested=cancel_requested,
+                logger=logger,
+                stream_to_logger=False,
             )
             after_ready, after_total = count_latent_cache_ready(runtime_config.training_dir, model_name)
             generated = max(0, after_ready - before_ready)
@@ -340,6 +486,8 @@ def run_steps_for_model(
                 ],
                 cwd=runtime_config.musubi_dir,
                 cancel_requested=cancel_requested,
+                logger=logger,
+                stream_to_logger=False,
             )
             after_ready, after_total = count_text_cache_ready(runtime_config.training_dir, model_name)
             generated = max(0, after_ready - before_ready)
@@ -356,6 +504,13 @@ def run_steps_for_model(
         dit_path = dit_path.resolve()
         vae_path = vae_path.resolve()
         text_encoder_path = text_encoder_path.resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        if resume_state_dir is not None:
+            backup_dir, copied = backup_existing_step_checkpoints(output_dir, output_name)
+            if copied > 0 and backup_dir is not None:
+                logger(f"  resume safety: backed up {copied} step checkpoint(s) to {backup_dir}")
+
         train_steps_for_run = train_steps_override if train_steps_override is not None else train_steps
         compile_flags: list[str] = []
         if enable_compile_optimizations:
@@ -393,16 +548,21 @@ def run_steps_for_model(
             "--persistent_data_loader_workers",
             "--max_data_loader_n_workers", "2",
             "--save_every_n_steps", "250",
+            "--save_state",
+            "--save_state_on_train_end",
             "--seed", "42",
             *fp8_flags,
             *compile_flags,
-            *( ["--resume", str(resume_checkpoint)] if resume_checkpoint is not None else []),
+            *(["--network_weights", str(warmstart_checkpoint)] if warmstart_checkpoint is not None else []),
+            *(["--resume", str(resume_state_dir)] if resume_state_dir is not None else []),
         ]
         logger(f"  train_command: {format_command_for_log(train_args)}")
         run_command(
             train_args,
             cwd=runtime_config.musubi_dir,
             cancel_requested=cancel_requested,
+            logger=logger,
+            stream_to_logger=False,
         )
         logger("")
 
@@ -451,15 +611,39 @@ def train_models(
         effective_do_cache_text = do_cache_text
         effective_do_train = do_train
         resume_checkpoint, resume_step = latest_checkpoint_for_dataset(runtime_config.training_dir, model_name)
+        resume_state_dir, resume_state_step = latest_resume_state_for_dataset(
+            runtime_config.training_dir,
+            model_name,
+            resume_step,
+        )
+        progress_step = max(resume_step, resume_state_step)
+        effective_resume_state: Path | None = None
+        effective_warmstart_checkpoint: Path | None = None
         train_steps_override: int | None = None
 
-        if resume_step >= train_steps:
-            logger(f"  checkpoint already complete at step {resume_step}: skipping")
+        if progress_step >= train_steps:
+            logger(f"  checkpoint already complete at step {progress_step}: skipping")
             continue
 
-        if resume_checkpoint is not None and resume_step > 0:
+        if resume_state_dir is not None and resume_state_step >= resume_step:
+            effective_resume_state = resume_state_dir
+            known_progress_step = max(resume_step, resume_state_step)
+            if known_progress_step > 0:
+                train_steps_override = max(1, train_steps - known_progress_step)
+            if resume_state_step > 0:
+                logger(
+                    f"  resuming optimizer state from {resume_state_dir.name} (step {resume_state_step}), "
+                    f"remaining steps {train_steps_override if train_steps_override is not None else train_steps}"
+                )
+            else:
+                logger(f"  resuming optimizer state from {resume_state_dir.name}")
+        elif resume_checkpoint is not None and resume_step > 0:
+            effective_warmstart_checkpoint = resume_checkpoint
             train_steps_override = max(1, train_steps - resume_step)
-            logger(f"  resuming from {resume_checkpoint.name} (step {resume_step}), remaining steps {train_steps_override}")
+            logger(
+                f"  warm-starting from {resume_checkpoint.name} (step {resume_step}) via --network_weights, "
+                f"remaining steps {train_steps_override}"
+            )
 
         try:
             run_steps_for_model(
@@ -480,7 +664,8 @@ def train_models(
                 do_cache_latents=effective_do_cache_latents,
                 do_cache_text=effective_do_cache_text,
                 do_train=effective_do_train,
-                resume_checkpoint=resume_checkpoint if train_steps_override is not None else None,
+                resume_state_dir=effective_resume_state,
+                warmstart_checkpoint=effective_warmstart_checkpoint,
                 train_steps_override=train_steps_override,
                 logger=logger,
                 cancel_requested=cancel_requested,

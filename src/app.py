@@ -564,8 +564,7 @@ def launch_ui() -> int:
 
     vars_by_name: dict[str, tk.BooleanVar] = {}
     card_widgets: list[tk.Widget] = []
-    thumbnail_cache: dict[tuple[str, bool, int, int], ImageTk.PhotoImage] = {}
-    badge_icon_cache: dict[tuple[str, int], object | None] = {}
+    thumbnail_cache: dict[tuple[str, str, int, int, bool], ImageTk.PhotoImage] = {}
     first_image_cache: dict[str, Path | None] = {}
     checkpoint_cache: dict[str, tuple[Path | None, int]] = {}
     dataset_train_settings_cache: dict[str, dict[str, str]] = {}
@@ -584,26 +583,6 @@ def launch_ui() -> int:
     drag_start_x: int | None = None
     drag_start_y: int | None = None
     runtime_config = klein_runtime_config_from_settings(settings_state)
-
-    def load_badge_icon(icon_name: str, size_px: int) -> object | None:
-        key = (icon_name, size_px)
-        if key in badge_icon_cache:
-            return badge_icon_cache[key]
-
-        png_path = Path(__file__).resolve().parent / "icons" / f"{icon_name}.png"
-        if png_path.exists() and png_path.is_file():
-            try:
-                rendered = Image.open(png_path).convert("RGBA")
-                if rendered.size != (size_px, size_px):
-                    rendered = rendered.resize((size_px, size_px), Image.Resampling.LANCZOS)
-                icon_image = ImageTk.PhotoImage(rendered)
-                badge_icon_cache[key] = icon_image
-                return icon_image
-            except Exception:
-                pass
-
-        badge_icon_cache[key] = None
-        return None
 
     def persist_dataset_order() -> None:
         nonlocal settings_state
@@ -2432,7 +2411,7 @@ def launch_ui() -> int:
             draw.rectangle((1, 1, thumb_px - 2, thumb_px - 2), outline="#f5b301", width=2)
 
         # Composite badge icons directly onto the image so alpha works correctly.
-        badge_size = max(14, thumb_px // 10)
+        badge_size = max(18, thumb_px // 8)
         badge_margin = 6
         icons_dir = Path(__file__).resolve().parent / "icons"
 
