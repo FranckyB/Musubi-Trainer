@@ -1666,11 +1666,11 @@ def launch_ui() -> int:
     def next_merged_output_path(
         dataset_name: str,
         output_dir: Path,
-        merge_mode_label: str,
+        merge_mode_suffix: str,
         selected_files: list[str],
     ) -> Path:
         # Keep method name in the filename to make comparisons between merge modes easy.
-        method_token = re.sub(r"[^A-Za-z0-9]+", "_", merge_mode_label.strip().lower()).strip("_")
+        method_token = re.sub(r"[^A-Za-z0-9]+", "_", merge_mode_suffix.strip()).strip("_")
         selection_token = compact_merge_selection_token(selected_files)
         if method_token:
             base_name = f"{dataset_name}_merged_{method_token}_{selection_token}"
@@ -1690,9 +1690,9 @@ def launch_ui() -> int:
     def ask_lora_merge_options(
         dataset_name: str,
         available_loras: list[Path],
-    ) -> tuple[list[str], str, list[str]] | None:
+    ) -> tuple[list[str], list[tuple[str, str, list[str]]]] | None:
         dialog = tk.Toplevel(root)
-        dialog.title("LoRA Merge")
+        dialog.title("LoRA Post-Hoc EMA Merge")
         dialog.transient(root)
         dialog.grab_set()
         dialog.resizable(False, False)
@@ -1742,24 +1742,32 @@ def launch_ui() -> int:
         for lora_path in available_loras:
             selected_list.insert("end", lora_path.name)
 
-        ttk.Label(frame, text="Select merge mode:").grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(
+            frame,
+            text="Post-Hoc EMA smooths checkpoints from the same run into one more stable LoRA.",
+        ).grid(row=2, column=0, sticky="ew", pady=(10, 0))
 
-        mode_var = tk.StringVar(value="beta")
-        ttk.Radiobutton(frame, text="BETA (Default)", variable=mode_var, value="beta").grid(
-            row=3, column=0, sticky="ew", pady=(8, 0)
+        ttk.Label(frame, text="Select merge mode(s):").grid(row=3, column=0, sticky="ew", pady=(10, 0))
+
+        mode_beta_var = tk.BooleanVar(value=True)
+        mode_beta2_var = tk.BooleanVar(value=False)
+        mode_sigma_var = tk.BooleanVar(value=False)
+
+        ttk.Checkbutton(frame, text="BETA (Default)", variable=mode_beta_var).grid(
+            row=4, column=0, sticky="ew", pady=(8, 0)
         )
-        ttk.Radiobutton(frame, text="BETA + BETA2 (Interpolated)", variable=mode_var, value="beta2").grid(
-            row=4, column=0, sticky="ew", pady=(6, 0)
-        )
-        ttk.Radiobutton(frame, text="SIGMA_REL", variable=mode_var, value="sigma_rel").grid(
+        ttk.Checkbutton(frame, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(
             row=5, column=0, sticky="ew", pady=(6, 0)
+        )
+        ttk.Checkbutton(frame, text="SIGMA_REL", variable=mode_sigma_var).grid(
+            row=6, column=0, sticky="ew", pady=(6, 0)
         )
 
         button_row = ttk.Frame(frame)
-        button_row.grid(row=6, column=0, sticky="ew", pady=(12, 0))
+        button_row.grid(row=7, column=0, sticky="ew", pady=(12, 0))
         button_row.columnconfigure(0, weight=1)
 
-        choice: tuple[list[str], str, list[str]] | None = None
+        choice: tuple[list[str], list[tuple[str, str, list[str]]]] | None = None
 
         def choose_and_close() -> None:
             nonlocal choice
@@ -1773,13 +1781,23 @@ def launch_ui() -> int:
                 )
                 return
 
-            selected_mode = mode_var.get()
-            if selected_mode == "beta2":
-                choice = (selected_file_paths, "BETA2", ["--beta", "0.90", "--beta2", "0.95"])
-            elif selected_mode == "sigma_rel":
-                choice = (selected_file_paths, "SIGMA_REL", ["--sigma_rel", "0.2"])
-            else:
-                choice = (selected_file_paths, "BETA", ["--beta", "0.9"])
+            selected_modes: list[tuple[str, str, list[str]]] = []
+            if mode_beta_var.get():
+                selected_modes.append(("BETA", "Beta", ["--beta", "0.9"]))
+            if mode_beta2_var.get():
+                selected_modes.append(("BETA2", "Beta2", ["--beta", "0.90", "--beta2", "0.95"]))
+            if mode_sigma_var.get():
+                selected_modes.append(("SIGMA_REL", "Sigma", ["--sigma_rel", "0.2"]))
+
+            if not selected_modes:
+                messagebox.showerror(
+                    "Merge unavailable",
+                    "Select at least one merge mode.",
+                    parent=dialog,
+                )
+                return
+
+            choice = (selected_file_paths, selected_modes)
             dialog.destroy()
 
         def cancel_and_close() -> None:
@@ -1812,7 +1830,6 @@ def launch_ui() -> int:
                 parent=root,
             )
             return
-
         module_script = runtime_config.musubi_dir / "src" / "musubi_tuner" / "lora_post_hoc_ema.py"
         root_script = runtime_config.musubi_dir / "lora_post_hoc_ema.py"
         if not module_script.exists() and not root_script.exists():
@@ -1826,7 +1843,7 @@ def launch_ui() -> int:
         merge_options = ask_lora_merge_options(dataset_name, available)
         if merge_options is None:
             return
-        selected_files, merge_mode_label, merge_mode_args = merge_options
+        selected_files, selected_modes = merge_options
 
         musubi_python = runtime_config.musubi_python
         if musubi_python is None or not musubi_python.is_file():
@@ -1840,62 +1857,69 @@ def launch_ui() -> int:
             )
             return
 
-        output_path = next_merged_output_path(dataset_name, output_dir, merge_mode_label, selected_files)
-        command: list[str]
-        if module_script.exists():
-            command = [
-                str(musubi_python),
-                "-m",
-                "musubi_tuner.lora_post_hoc_ema",
-                *selected_files,
-                "--output_file",
-                str(output_path),
-                *merge_mode_args,
-            ]
-        else:
-            command = [
-                str(musubi_python),
-                str(root_script),
-                *selected_files,
-                "--output_file",
-                str(output_path),
-                *merge_mode_args,
-            ]
-
         run_env = os.environ.copy()
         musubi_src = str(runtime_config.musubi_dir / "src")
         existing_pythonpath = run_env.get("PYTHONPATH", "")
         run_env["PYTHONPATH"] = musubi_src if not existing_pythonpath else f"{musubi_src}{os.pathsep}{existing_pythonpath}"
 
         log("")
-        log(
-            f"[Post-Hoc EMA] Merging {len(selected_files)} checkpoint(s) for '{dataset_name}' "
-            f"using {merge_mode_label}..."
-        )
-        result = subprocess.run(
-            command,
-            cwd=str(runtime_config.musubi_dir),
-            env=run_env,
-            capture_output=True,
-            text=True,
-        )
+        created_paths: list[Path] = []
+        for merge_mode_label, merge_mode_suffix, merge_mode_args in selected_modes:
+            output_path = next_merged_output_path(dataset_name, output_dir, merge_mode_suffix, selected_files)
+            command: list[str]
+            if module_script.exists():
+                command = [
+                    str(musubi_python),
+                    "-m",
+                    "musubi_tuner.lora_post_hoc_ema",
+                    *selected_files,
+                    "--output_file",
+                    str(output_path),
+                    *merge_mode_args,
+                ]
+            else:
+                command = [
+                    str(musubi_python),
+                    str(root_script),
+                    *selected_files,
+                    "--output_file",
+                    str(output_path),
+                    *merge_mode_args,
+                ]
 
-        stdout_text = result.stdout.strip()
-        stderr_text = result.stderr.strip()
-        if stdout_text:
-            log(stdout_text)
+            log(
+                f"[Post-Hoc EMA] Merging {len(selected_files)} checkpoint(s) for '{dataset_name}' "
+                f"using {merge_mode_label}..."
+            )
+            result = subprocess.run(
+                command,
+                cwd=str(runtime_config.musubi_dir),
+                env=run_env,
+                capture_output=True,
+                text=True,
+            )
 
-        if result.returncode != 0:
-            message = stderr_text if stderr_text else "lora_post_hoc_ema.py failed with no error output."
-            log(f"[Post-Hoc EMA] Failed ({result.returncode}).")
+            stdout_text = result.stdout.strip()
+            stderr_text = result.stderr.strip()
+            if stdout_text:
+                log(stdout_text)
+
+            if result.returncode != 0:
+                message = stderr_text if stderr_text else "lora_post_hoc_ema.py failed with no error output."
+                log(f"[Post-Hoc EMA] Failed ({result.returncode}) while running {merge_mode_label}.")
+                if stderr_text:
+                    log(stderr_text)
+                messagebox.showerror("Post-Hoc EMA merge failed", message, parent=root)
+                return
+
+            log(f"[Post-Hoc EMA] Created ({merge_mode_suffix}): {output_path}")
             if stderr_text:
                 log(stderr_text)
-            messagebox.showerror("Post-Hoc EMA merge failed", message, parent=root)
-            return
+            created_paths.append(output_path)
 
-        log(f"[Post-Hoc EMA] Created: {output_path}")
-        if stderr_text:
-            log(stderr_text)
+        if created_paths:
+            created_text = "\n".join(str(path) for path in created_paths)
+            messagebox.showinfo("Post-Hoc EMA merge complete", f"Created:\n{created_text}", parent=root)
 
         checkpoint_cache.pop(dataset_name, None)
         rebuild_folder_list(force=True)
@@ -1921,7 +1945,7 @@ def launch_ui() -> int:
             return
 
         dialog = tk.Toplevel(root)
-        dialog.title("LoRA Merge Tool")
+        dialog.title("LoRA Post-Hoc EMA Merge")
         dialog.transient(root)
         dialog.grab_set()
         dialog.configure(bg=bg_panel)
@@ -2001,21 +2025,28 @@ def launch_ui() -> int:
         mode_section.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         mode_section.columnconfigure(1, weight=1)
 
-        mode_var = tk.StringVar(value="beta")
-        ttk.Label(mode_section, text="Mode:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Radiobutton(mode_section, text="BETA (Default)", variable=mode_var, value="beta").grid(row=0, column=1, sticky="w")
-        ttk.Radiobutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_var, value="beta2").grid(row=1, column=1, sticky="w")
-        ttk.Radiobutton(mode_section, text="SIGMA_REL", variable=mode_var, value="sigma_rel").grid(row=2, column=1, sticky="w")
+        ttk.Label(
+            mode_section,
+            text="Post-Hoc EMA smooths checkpoints from the same run into one more stable LoRA.",
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        mode_beta_var = tk.BooleanVar(value=True)
+        mode_beta2_var = tk.BooleanVar(value=False)
+        mode_sigma_var = tk.BooleanVar(value=False)
+        ttk.Label(mode_section, text="Mode(s):").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Checkbutton(mode_section, text="BETA (Default)", variable=mode_beta_var).grid(row=1, column=1, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=2, column=1, sticky="w")
+        ttk.Checkbutton(mode_section, text="SIGMA_REL", variable=mode_sigma_var).grid(row=3, column=1, sticky="w")
 
         output_name_var = tk.StringVar(value="merged_lora")
         output_dir_var = tk.StringVar(value="")
 
-        ttk.Label(mode_section, text="Output name:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Entry(mode_section, textvariable=output_name_var, style="Flat.TEntry").grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(mode_section, text="Output name:").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Entry(mode_section, textvariable=output_name_var, style="Flat.TEntry").grid(row=4, column=1, sticky="ew", pady=(8, 0))
 
-        ttk.Label(mode_section, text="Output folder:").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(mode_section, text="Output folder:").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         ttk.Label(mode_section, textvariable=output_dir_var, style="PathDisplay.TLabel", anchor="w", padding=(6, 4)).grid(
-            row=4,
+            row=5,
             column=1,
             sticky="ew",
             pady=(8, 0),
@@ -2114,7 +2145,7 @@ def launch_ui() -> int:
             if picked:
                 output_dir_var.set(picked)
 
-        def resolve_output_path() -> Path | None:
+        def resolve_output_base() -> tuple[Path, str] | None:
             output_name = output_name_var.get().strip()
             if not output_name:
                 messagebox.showerror("Missing value", "Output name is required.", parent=dialog)
@@ -2133,59 +2164,47 @@ def launch_ui() -> int:
                 return None
 
             output_name = output_name[:-12] if output_name.lower().endswith(".safetensors") else output_name
-            candidate = output_folder / f"{output_name}.safetensors"
-            if candidate.exists():
-                messagebox.showerror(
-                    "Name already exists",
-                    f"A file with this name already exists:\n{candidate}\n\nChoose a different output name.",
-                    parent=dialog,
-                )
-                return None
-            return candidate
+            return output_folder, output_name
+
+        def build_output_path(output_folder: Path, output_name: str, mode_suffix: str) -> Path:
+            return output_folder / f"{output_name}_{mode_suffix}.safetensors"
 
         def run_merge() -> None:
             if len(merge_loras) < 2:
                 messagebox.showerror("Merge unavailable", "Add at least 2 LoRAs to merge list.", parent=dialog)
                 return
 
-            selected_mode = mode_var.get()
-            if selected_mode == "beta2":
-                merge_mode_label = "BETA2"
-                merge_mode_args = ["--beta", "0.90", "--beta2", "0.95"]
-            elif selected_mode == "sigma_rel":
-                merge_mode_label = "SIGMA_REL"
-                merge_mode_args = ["--sigma_rel", "0.2"]
-            else:
-                merge_mode_label = "BETA"
-                merge_mode_args = ["--beta", "0.9"]
+            selected_modes: list[tuple[str, str, list[str]]] = []
+            if mode_beta_var.get():
+                selected_modes.append(("BETA", "Beta", ["--beta", "0.9"]))
+            if mode_beta2_var.get():
+                selected_modes.append(("BETA2", "Beta2", ["--beta", "0.90", "--beta2", "0.95"]))
+            if mode_sigma_var.get():
+                selected_modes.append(("SIGMA_REL", "Sigma", ["--sigma_rel", "0.2"]))
+            if not selected_modes:
+                messagebox.showerror("Merge unavailable", "Select at least one merge mode.", parent=dialog)
+                return
 
-            output_path = resolve_output_path()
-            if output_path is None:
+            output_base = resolve_output_base()
+            if output_base is None:
+                return
+            output_folder, output_name = output_base
+
+            existing_outputs: list[Path] = []
+            for _merge_mode_label, merge_mode_suffix, _merge_mode_args in selected_modes:
+                candidate = build_output_path(output_folder, output_name, merge_mode_suffix)
+                if candidate.exists():
+                    existing_outputs.append(candidate)
+            if existing_outputs:
+                existing_text = "\n".join(str(path) for path in existing_outputs)
+                messagebox.showerror(
+                    "Name already exists",
+                    f"One or more output files already exist:\n{existing_text}\n\nChoose a different output name.",
+                    parent=dialog,
+                )
                 return
 
             selected_files = [str(path) for path in merge_loras]
-            command: list[str]
-            if module_script.exists():
-                command = [
-                    str(musubi_python),
-                    "-m",
-                    "musubi_tuner.lora_post_hoc_ema",
-                    *selected_files,
-                    "--output_file",
-                    str(output_path),
-                    "--no_sort",
-                    *merge_mode_args,
-                ]
-            else:
-                command = [
-                    str(musubi_python),
-                    str(root_script),
-                    *selected_files,
-                    "--output_file",
-                    str(output_path),
-                    "--no_sort",
-                    *merge_mode_args,
-                ]
 
             run_env = os.environ.copy()
             musubi_src = str(runtime_config.musubi_dir / "src")
@@ -2193,35 +2212,64 @@ def launch_ui() -> int:
             run_env["PYTHONPATH"] = musubi_src if not existing_pythonpath else f"{musubi_src}{os.pathsep}{existing_pythonpath}"
 
             log("")
-            log(f"[LoRA Merge Tool] Merging {len(selected_files)} LoRA(s) using {merge_mode_label}...")
-            log(f"[LoRA Merge Tool] Output: {output_path}")
+            created_paths: list[Path] = []
+            for merge_mode_label, merge_mode_suffix, merge_mode_args in selected_modes:
+                output_path = build_output_path(output_folder, output_name, merge_mode_suffix)
+                command: list[str]
+                if module_script.exists():
+                    command = [
+                        str(musubi_python),
+                        "-m",
+                        "musubi_tuner.lora_post_hoc_ema",
+                        *selected_files,
+                        "--output_file",
+                        str(output_path),
+                        "--no_sort",
+                        *merge_mode_args,
+                    ]
+                else:
+                    command = [
+                        str(musubi_python),
+                        str(root_script),
+                        *selected_files,
+                        "--output_file",
+                        str(output_path),
+                        "--no_sort",
+                        *merge_mode_args,
+                    ]
 
-            result = subprocess.run(
-                command,
-                cwd=str(runtime_config.musubi_dir),
-                env=run_env,
-                capture_output=True,
-                text=True,
-            )
+                log(f"[LoRA Post-Hoc EMA Merge] Merging {len(selected_files)} LoRA(s) using {merge_mode_label}...")
+                log(f"[LoRA Post-Hoc EMA Merge] Output: {output_path}")
 
-            if result.stdout.strip():
-                log(result.stdout.strip())
+                result = subprocess.run(
+                    command,
+                    cwd=str(runtime_config.musubi_dir),
+                    env=run_env,
+                    capture_output=True,
+                    text=True,
+                )
 
-            if result.returncode != 0:
-                log(f"[LoRA Merge Tool] Failed ({result.returncode}).")
+                if result.stdout.strip():
+                    log(result.stdout.strip())
+
+                if result.returncode != 0:
+                    log(f"[LoRA Post-Hoc EMA Merge] Failed ({result.returncode}) while running {merge_mode_label}.")
+                    if result.stderr.strip():
+                        log(result.stderr.strip())
+                    messagebox.showerror(
+                        "Merge failed",
+                        result.stderr.strip() or "lora_post_hoc_ema.py failed with no error output.",
+                        parent=dialog,
+                    )
+                    return
+
                 if result.stderr.strip():
                     log(result.stderr.strip())
-                messagebox.showerror(
-                    "Merge failed",
-                    result.stderr.strip() or "lora_post_hoc_ema.py failed with no error output.",
-                    parent=dialog,
-                )
-                return
+                log(f"[LoRA Post-Hoc EMA Merge] Created ({merge_mode_suffix}): {output_path}")
+                created_paths.append(output_path)
 
-            if result.stderr.strip():
-                log(result.stderr.strip())
-            log(f"[LoRA Merge Tool] Created: {output_path}")
-            messagebox.showinfo("Merge complete", f"Created:\n{output_path}", parent=dialog)
+            created_text = "\n".join(str(path) for path in created_paths)
+            messagebox.showinfo("Merge complete", f"Created:\n{created_text}", parent=dialog)
 
         candidate_list.bind("<Double-Button-1>", lambda _e: add_to_merge_list())
 
@@ -2237,7 +2285,7 @@ def launch_ui() -> int:
         ttk.Button(merge_actions, text="Down", command=move_merge_down).grid(row=0, column=2, padx=(0, 6))
         ttk.Button(merge_actions, text="Clear", command=clear_merge_list).grid(row=0, column=3)
 
-        ttk.Button(mode_section, text="Browse", command=browse_output_folder).grid(row=4, column=2, padx=(8, 0), pady=(8, 0))
+        ttk.Button(mode_section, text="Browse", command=browse_output_folder).grid(row=5, column=2, padx=(8, 0), pady=(8, 0))
 
         ttk.Button(actions, text="Close", command=dialog.destroy).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(actions, text="Go", command=run_merge).grid(row=0, column=2)
@@ -2256,7 +2304,7 @@ def launch_ui() -> int:
         menu.add_separator()
         has_output_loras = bool(dataset_output_safetensors(dataset_name))
         menu.add_command(
-            label="LoRA Merge",
+            label="LoRA Post-Hoc EMA Merge",
             state=("normal" if has_output_loras else "disabled"),
             command=lambda: lora_post_hoc_ema_merge(dataset_name),
         )
@@ -2951,7 +2999,7 @@ def launch_ui() -> int:
     select_all_button = ttk.Button(controls, text="Select All", command=select_all)
     clear_button = ttk.Button(controls, text="Clear", command=clear_selection)
     create_dataset_button = ttk.Button(controls, text="Create Dataset", command=create_dataset)
-    lora_merge_tool_button = ttk.Button(controls, text="LoRA Merge Tool", command=open_lora_merge_tool_dialog)
+    lora_merge_tool_button = ttk.Button(controls, text="LoRA Post-Hoc EMA Merge", command=open_lora_merge_tool_dialog)
     settings_button = ttk.Button(controls, text="Settings", command=apply_settings_from_dialog)
     run_button = ttk.Button(start_bar, text="START", command=run_selected, style="StartDisabled.TButton")
 

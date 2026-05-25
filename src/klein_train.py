@@ -136,6 +136,7 @@ def prep_dataset_minimal(
     dataset_dir.mkdir(parents=True, exist_ok=True)
     dataset_toml = dataset_dir / "dataset.toml"
     image_dir_abs = (dataset_dir / "images").resolve().as_posix()
+    cache_dir_abs = (dataset_dir / "cache").resolve().as_posix()
 
     had_dataset_toml = dataset_toml.exists()
     if not had_dataset_toml:
@@ -143,20 +144,16 @@ def prep_dataset_minimal(
             "\n".join(
                 [
                     "[general]",
-                    "shuffle_caption = false",
-                    'caption_extension = ".txt"',
-                    "keep_tokens = 0",
-                    "",
-                    "[[datasets]]",
                     f"resolution = [{resolution}, {resolution}]",
+                    'caption_extension = ".txt"',
                     "batch_size = 1",
                     "enable_bucket = true",
                     "bucket_no_upscale = false",
                     "",
-                    "  [[datasets.subsets]]",
-                    f'  image_dir = "{image_dir_abs}"',
-                    '  caption_extension = ".txt"',
-                    "  num_repeats = 1",
+                    "[[datasets]]",
+                    f'image_directory = "{image_dir_abs}"',
+                    f'cache_directory = "{cache_dir_abs}"',
+                    "num_repeats = 1",
                     "",
                 ]
             ),
