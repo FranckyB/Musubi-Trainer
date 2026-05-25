@@ -6,11 +6,11 @@ from typing import Callable, Iterable
 
 from .klein_runtime_config import KleinRuntimeConfig
 
-RESOLUTION = 1024
-NETWORK_DIM = 32
-NETWORK_ALPHA = 32
-LR = "1e-4"
-STEPS = 3000
+DEFAULT_RESOLUTION = 1024
+DEFAULT_NETWORK_DIM = 32
+DEFAULT_NETWORK_ALPHA = 32
+DEFAULT_LEARNING_RATE = "1e-4"
+DEFAULT_TRAIN_STEPS = 3000
 
 VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 LATENT_SUFFIX = "f2k9b"
@@ -101,7 +101,12 @@ def dataset_status(training_dir: Path, dataset_name: str) -> dict[str, bool]:
     }
 
 
-def prep_dataset_minimal(training_dir: Path, dataset_name: str, default_caption_keyword: str) -> dict[str, int | bool]:
+def prep_dataset_minimal(
+    training_dir: Path,
+    dataset_name: str,
+    default_caption_keyword: str,
+    resolution: int,
+) -> dict[str, int | bool]:
     dataset_dir = training_dir / dataset_name
     dataset_dir.mkdir(parents=True, exist_ok=True)
     dataset_toml = dataset_dir / "dataset.toml"
@@ -118,7 +123,7 @@ def prep_dataset_minimal(training_dir: Path, dataset_name: str, default_caption_
                     "keep_tokens = 0",
                     "",
                     "[[datasets]]",
-                    f"resolution = {RESOLUTION}",
+                    f"resolution = [{resolution}, {resolution}]",
                     "batch_size = 1",
                     "enable_bucket = true",
                     "bucket_no_upscale = false",
@@ -201,6 +206,11 @@ def run_steps_for_model(
     runtime_config: KleinRuntimeConfig,
     model_name: str,
     default_caption_keyword: str,
+    resolution: int,
+    network_dim: int,
+    network_alpha: int,
+    learning_rate: str,
+    train_steps: int,
     enable_compile_optimizations: bool,
     enable_cuda_allow_tf32: bool,
     enable_cuda_cudnn_benchmark: bool,
@@ -264,7 +274,12 @@ def run_steps_for_model(
         if is_step1_ready(runtime_config.training_dir, model_name):
             logger("  prep: already ready, skipped")
         else:
-            prep_result = prep_dataset_minimal(runtime_config.training_dir, model_name, default_caption_keyword)
+            prep_result = prep_dataset_minimal(
+                runtime_config.training_dir,
+                model_name,
+                default_caption_keyword,
+                resolution,
+            )
             toml_status = "existed" if bool(prep_result["had_dataset_toml"]) else "created"
             logger(f"  prep: dataset.toml {toml_status}, captions created {prep_result['created']}")
         logger("")
@@ -341,7 +356,7 @@ def run_steps_for_model(
         dit_path = dit_path.resolve()
         vae_path = vae_path.resolve()
         text_encoder_path = text_encoder_path.resolve()
-        train_steps = train_steps_override if train_steps_override is not None else STEPS
+        train_steps_for_run = train_steps_override if train_steps_override is not None else train_steps
         compile_flags: list[str] = []
         if enable_compile_optimizations:
             compile_flags.extend(["--compile"])
@@ -367,10 +382,10 @@ def run_steps_for_model(
             "--output_dir", str(output_dir),
             "--output_name", output_name,
             "--network_module", "networks.lora_flux_2",
-            "--network_dim", str(NETWORK_DIM),
-            "--network_alpha", str(NETWORK_ALPHA),
-            "--learning_rate", LR,
-            "--max_train_steps", str(train_steps),
+            "--network_dim", str(network_dim),
+            "--network_alpha", str(network_alpha),
+            "--learning_rate", learning_rate,
+            "--max_train_steps", str(train_steps_for_run),
             "--mixed_precision", "bf16",
             "--sdpa",
             "--gradient_checkpointing",
@@ -396,6 +411,11 @@ def train_models(
     runtime_config: KleinRuntimeConfig,
     model_names: list[str],
     default_caption_keyword: str,
+    resolution: int,
+    network_dim: int,
+    network_alpha: int,
+    learning_rate: str,
+    train_steps: int,
     enable_compile_optimizations: bool,
     enable_cuda_allow_tf32: bool,
     enable_cuda_cudnn_benchmark: bool,
@@ -433,12 +453,12 @@ def train_models(
         resume_checkpoint, resume_step = latest_checkpoint_for_dataset(runtime_config.training_dir, model_name)
         train_steps_override: int | None = None
 
-        if resume_step >= STEPS:
+        if resume_step >= train_steps:
             logger(f"  checkpoint already complete at step {resume_step}: skipping")
             continue
 
         if resume_checkpoint is not None and resume_step > 0:
-            train_steps_override = max(1, STEPS - resume_step)
+            train_steps_override = max(1, train_steps - resume_step)
             logger(f"  resuming from {resume_checkpoint.name} (step {resume_step}), remaining steps {train_steps_override}")
 
         try:
@@ -446,6 +466,11 @@ def train_models(
                 runtime_config,
                 model_name,
                 default_caption_keyword=default_caption_keyword,
+                resolution=resolution,
+                network_dim=network_dim,
+                network_alpha=network_alpha,
+                learning_rate=learning_rate,
+                train_steps=train_steps,
                 enable_compile_optimizations=enable_compile_optimizations,
                 enable_cuda_allow_tf32=enable_cuda_allow_tf32,
                 enable_cuda_cudnn_benchmark=enable_cuda_cudnn_benchmark,

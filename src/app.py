@@ -2,6 +2,7 @@ import sys
 import argparse
 import os
 import re
+import json
 import configparser
 import ctypes
 import math
@@ -28,20 +29,31 @@ from .app_settings import (
     MUSUBI_DIR_KEY,
     MUSUBI_PYTHON_KEY,
     SETTINGS_FILE,
+    TRAIN_LEARNING_RATE_KEY,
+    TRAIN_NETWORK_ALPHA_KEY,
+    TRAIN_NETWORK_DIM_KEY,
+    TRAIN_RESOLUTION_KEY,
+    TRAIN_STEPS_KEY,
     WINDOW_HEIGHT_KEY,
     WINDOW_WIDTH_KEY,
     WINDOW_X_KEY,
     WINDOW_Y_KEY,
     load_settings,
+    parse_int_setting,
     load_window_size,
     load_window_position,
     save_settings,
 )
 from .klein_runtime_config import KleinRuntimeConfig, klein_runtime_config_from_settings, resolve_musubi_python
-from .klein_train import train_models
+from .klein_train import (
+    DEFAULT_LEARNING_RATE,
+    DEFAULT_NETWORK_ALPHA,
+    DEFAULT_NETWORK_DIM,
+    DEFAULT_RESOLUTION,
+    DEFAULT_TRAIN_STEPS,
+    train_models,
+)
 
-
-STEPS = 3000
 
 # Model files
 VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
@@ -49,6 +61,26 @@ LATENT_SUFFIX = "f2k9b"
 DATASET_ORDER_KEY = "dataset_order"
 DRAG_START_THRESHOLD_PX = 20
 DATASET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+DATASET_SETTINGS_FILE_NAME = "settings.json"
+DATASET_USE_GLOBAL_TRAIN_KEY = "use_global_train_settings"
+
+
+def get_positive_int_setting(settings: dict[str, str], key: str, fallback: int, minimum: int = 1) -> int:
+    value = parse_int_setting(settings, key)
+    if value is None or value < minimum:
+        return fallback
+    return value
+
+
+def get_learning_rate_setting(settings: dict[str, str]) -> str:
+    value = settings.get(TRAIN_LEARNING_RATE_KEY, "").strip()
+    return value if value else DEFAULT_LEARNING_RATE
+
+
+def is_truthy(raw_value: str | None, default: bool = False) -> bool:
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_ui_config(config_path: Path) -> dict[str, int]:
@@ -241,7 +273,7 @@ def launch_ui() -> int:
     root.geometry(f"{ui_config['window_width']}x{ui_config['window_height']}")
     root.minsize(ui_config["min_window_width"], ui_config["min_window_height"])
     root.configure(bg=bg_root)
-    ico_path = Path(__file__).resolve().parent / "logo.ico"
+    ico_path = Path(__file__).resolve().parent / "icons" / "logo.ico"
     if sys.platform == "win32" and ico_path.exists():
         try:
             root.iconbitmap(default=str(ico_path))
@@ -533,8 +565,10 @@ def launch_ui() -> int:
     vars_by_name: dict[str, tk.BooleanVar] = {}
     card_widgets: list[tk.Widget] = []
     thumbnail_cache: dict[tuple[str, bool, int, int], ImageTk.PhotoImage] = {}
+    badge_icon_cache: dict[tuple[str, int], object | None] = {}
     first_image_cache: dict[str, Path | None] = {}
     checkpoint_cache: dict[str, tuple[Path | None, int]] = {}
+    dataset_train_settings_cache: dict[str, dict[str, str]] = {}
     run_state_by_name: dict[str, str] = {}
     card_frame_by_name: dict[str, ttk.Frame] = {}
     card_thumb_by_name: dict[str, ImageTk.PhotoImage] = {}
@@ -551,10 +585,107 @@ def launch_ui() -> int:
     drag_start_y: int | None = None
     runtime_config = klein_runtime_config_from_settings(settings_state)
 
+    def load_badge_icon(icon_name: str, size_px: int) -> object | None:
+        key = (icon_name, size_px)
+        if key in badge_icon_cache:
+            return badge_icon_cache[key]
+
+        png_path = Path(__file__).resolve().parent / "icons" / f"{icon_name}.png"
+        if png_path.exists() and png_path.is_file():
+            try:
+                rendered = Image.open(png_path).convert("RGBA")
+                if rendered.size != (size_px, size_px):
+                    rendered = rendered.resize((size_px, size_px), Image.Resampling.LANCZOS)
+                icon_image = ImageTk.PhotoImage(rendered)
+                badge_icon_cache[key] = icon_image
+                return icon_image
+            except Exception:
+                pass
+
+        badge_icon_cache[key] = None
+        return None
+
     def persist_dataset_order() -> None:
         nonlocal settings_state
         save_dataset_order(settings_state, dataset_order)
         save_settings(settings_state)
+
+    def global_train_settings() -> dict[str, str]:
+        return {
+            TRAIN_RESOLUTION_KEY: str(
+                get_positive_int_setting(settings_state, TRAIN_RESOLUTION_KEY, DEFAULT_RESOLUTION, minimum=64)
+            ),
+            TRAIN_NETWORK_DIM_KEY: str(get_positive_int_setting(settings_state, TRAIN_NETWORK_DIM_KEY, DEFAULT_NETWORK_DIM)),
+            TRAIN_NETWORK_ALPHA_KEY: str(
+                get_positive_int_setting(settings_state, TRAIN_NETWORK_ALPHA_KEY, DEFAULT_NETWORK_ALPHA)
+            ),
+            TRAIN_LEARNING_RATE_KEY: get_learning_rate_setting(settings_state),
+            TRAIN_STEPS_KEY: str(get_positive_int_setting(settings_state, TRAIN_STEPS_KEY, DEFAULT_TRAIN_STEPS)),
+        }
+
+    def dataset_settings_path(dataset_name: str) -> Path:
+        if runtime_config is None:
+            return Path(DATASET_SETTINGS_FILE_NAME)
+        return runtime_config.training_dir / dataset_name / DATASET_SETTINGS_FILE_NAME
+
+    def load_dataset_train_settings_raw(dataset_name: str, refresh: bool = False) -> dict[str, str]:
+        if not refresh and dataset_name in dataset_train_settings_cache:
+            return dict(dataset_train_settings_cache[dataset_name])
+
+        path = dataset_settings_path(dataset_name)
+        if not path.exists() or not path.is_file():
+            dataset_train_settings_cache[dataset_name] = {}
+            return {}
+
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            dataset_train_settings_cache[dataset_name] = {}
+            return {}
+
+        if not isinstance(loaded, dict):
+            dataset_train_settings_cache[dataset_name] = {}
+            return {}
+
+        normalized = {str(k): str(v) for k, v in loaded.items()}
+        dataset_train_settings_cache[dataset_name] = normalized
+        return dict(normalized)
+
+    def save_dataset_train_settings_raw(dataset_name: str, raw_settings: dict[str, str]) -> None:
+        path = dataset_settings_path(dataset_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(raw_settings, indent=2), encoding="utf-8")
+        dataset_train_settings_cache[dataset_name] = dict(raw_settings)
+
+    def effective_train_settings_for_dataset(dataset_name: str) -> dict[str, str]:
+        global_values = global_train_settings()
+        raw = load_dataset_train_settings_raw(dataset_name)
+        use_global = is_truthy(raw.get(DATASET_USE_GLOBAL_TRAIN_KEY), default=True)
+
+        if use_global:
+            return {
+                DATASET_USE_GLOBAL_TRAIN_KEY: "1",
+                **global_values,
+            }
+
+        return {
+            DATASET_USE_GLOBAL_TRAIN_KEY: "0",
+            TRAIN_RESOLUTION_KEY: str(
+                get_positive_int_setting(raw, TRAIN_RESOLUTION_KEY, int(global_values[TRAIN_RESOLUTION_KEY]), minimum=64)
+            ),
+            TRAIN_NETWORK_DIM_KEY: str(
+                get_positive_int_setting(raw, TRAIN_NETWORK_DIM_KEY, int(global_values[TRAIN_NETWORK_DIM_KEY]))
+            ),
+            TRAIN_NETWORK_ALPHA_KEY: str(
+                get_positive_int_setting(raw, TRAIN_NETWORK_ALPHA_KEY, int(global_values[TRAIN_NETWORK_ALPHA_KEY]))
+            ),
+            TRAIN_LEARNING_RATE_KEY: raw.get(TRAIN_LEARNING_RATE_KEY, "").strip() or global_values[TRAIN_LEARNING_RATE_KEY],
+            TRAIN_STEPS_KEY: str(get_positive_int_setting(raw, TRAIN_STEPS_KEY, int(global_values[TRAIN_STEPS_KEY]))),
+        }
+
+    def dataset_has_train_override(dataset_name: str) -> bool:
+        raw = load_dataset_train_settings_raw(dataset_name)
+        return not is_truthy(raw.get(DATASET_USE_GLOBAL_TRAIN_KEY), default=True)
 
     def open_settings_dialog(required: bool) -> KleinRuntimeConfig | None:
         current_dir = ""
@@ -594,6 +725,28 @@ def launch_ui() -> int:
             "yes",
             "on",
         }
+        current_train_resolution = get_positive_int_setting(
+            settings_state,
+            TRAIN_RESOLUTION_KEY,
+            DEFAULT_RESOLUTION,
+            minimum=64,
+        )
+        current_train_network_dim = get_positive_int_setting(
+            settings_state,
+            TRAIN_NETWORK_DIM_KEY,
+            DEFAULT_NETWORK_DIM,
+        )
+        current_train_network_alpha = get_positive_int_setting(
+            settings_state,
+            TRAIN_NETWORK_ALPHA_KEY,
+            DEFAULT_NETWORK_ALPHA,
+        )
+        current_train_learning_rate = get_learning_rate_setting(settings_state)
+        current_train_steps = get_positive_int_setting(
+            settings_state,
+            TRAIN_STEPS_KEY,
+            DEFAULT_TRAIN_STEPS,
+        )
         current_gc_cpu_offload = settings_state.get(
             ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY,
             "0",
@@ -637,7 +790,10 @@ def launch_ui() -> int:
 
         advanced_section = ttk.LabelFrame(frame, text="Advanced", padding=8)
         advanced_section.grid(row=4, column=0, sticky="ew", pady=(10, 0))
-        advanced_section.columnconfigure(0, weight=1)
+        advanced_section.columnconfigure(0, weight=0)
+        advanced_section.columnconfigure(1, weight=1)
+        advanced_section.columnconfigure(2, weight=0)
+        advanced_section.columnconfigure(3, weight=1)
 
         selected_musubi_path = current_dir
         selected_musubi_python = current_musubi_python
@@ -664,6 +820,11 @@ def launch_ui() -> int:
         cuda_cudnn_benchmark_var = tk.BooleanVar(value=current_cuda_cudnn_benchmark)
         fp8_dit_var = tk.BooleanVar(value=current_fp8_dit)
         gc_cpu_offload_var = tk.BooleanVar(value=current_gc_cpu_offload)
+        train_resolution_var = tk.StringVar(value=str(current_train_resolution))
+        train_network_dim_var = tk.StringVar(value=str(current_train_network_dim))
+        train_network_alpha_var = tk.StringVar(value=str(current_train_network_alpha))
+        train_learning_rate_var = tk.StringVar(value=current_train_learning_rate)
+        train_steps_var = tk.StringVar(value=str(current_train_steps))
 
         ttk.Label(musubi_section, text="Musubi-Tuner folder:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         musubi_display = ttk.Label(
@@ -700,31 +861,63 @@ def launch_ui() -> int:
             pady=(6, 0),
         )
 
+        ttk.Label(advanced_section, text="Training steps:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(advanced_section, textvariable=train_steps_var, style="Flat.TEntry").grid(row=0, column=1, sticky="ew")
+        ttk.Label(advanced_section, text="Learning rate:").grid(row=0, column=2, sticky="w", padx=(12, 8))
+        ttk.Entry(advanced_section, textvariable=train_learning_rate_var, style="Flat.TEntry").grid(
+            row=0,
+            column=3,
+            sticky="ew",
+        )
+
+        ttk.Label(advanced_section, text="LoRA network dim:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Entry(advanced_section, textvariable=train_network_dim_var, style="Flat.TEntry").grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            pady=(6, 0),
+        )
+        ttk.Label(advanced_section, text="LoRA network alpha:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        ttk.Entry(advanced_section, textvariable=train_network_alpha_var, style="Flat.TEntry").grid(
+            row=1,
+            column=3,
+            sticky="ew",
+            pady=(6, 0),
+        )
+
+        ttk.Label(advanced_section, text="Dataset resolution:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Entry(advanced_section, textvariable=train_resolution_var, style="Flat.TEntry").grid(
+            row=2,
+            column=1,
+            sticky="ew",
+            pady=(6, 0),
+        )
+
         ttk.Checkbutton(
             advanced_section,
             text="Enable Torch Compile (Turn off if you have issues)",
             variable=compile_optimizations_var,
-        ).grid(row=0, column=0, sticky="w")
+        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
         ttk.Checkbutton(
             advanced_section,
             text="Enable Allow TF32 (For newer GPU, improves performance)",
             variable=cuda_allow_tf32_var,
-        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Checkbutton(
             advanced_section,
             text="Enable cuDNN Benchmark (May improve performance)",
             variable=cuda_cudnn_benchmark_var,
-        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Checkbutton(
             advanced_section,
             text="Enable FP8 (Low Vram)",
             variable=fp8_dit_var,
-        ).grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Checkbutton(
             advanced_section,
             text="Enable CPU Gradient Checkpointing (Low Ram)",
             variable=gc_cpu_offload_var,
-        ).grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         ttk.Label(klein_section, text="Model version:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         klein_model_version_entry = ttk.Entry(klein_section, textvariable=klein_model_version_var, style="Flat.TEntry")
@@ -911,6 +1104,55 @@ def launch_ui() -> int:
                 messagebox.showerror("Missing value", "Klein model version is required.", parent=dialog)
                 return
 
+            try:
+                train_resolution = int(train_resolution_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Invalid value", "Dataset resolution must be an integer.", parent=dialog)
+                return
+            if train_resolution < 64:
+                messagebox.showerror("Invalid value", "Dataset resolution must be 64 or higher.", parent=dialog)
+                return
+
+            try:
+                train_network_dim = int(train_network_dim_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Invalid value", "LoRA network dim must be an integer.", parent=dialog)
+                return
+            if train_network_dim < 1:
+                messagebox.showerror("Invalid value", "LoRA network dim must be 1 or higher.", parent=dialog)
+                return
+
+            try:
+                train_network_alpha = int(train_network_alpha_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Invalid value", "LoRA network alpha must be an integer.", parent=dialog)
+                return
+            if train_network_alpha < 1:
+                messagebox.showerror("Invalid value", "LoRA network alpha must be 1 or higher.", parent=dialog)
+                return
+
+            train_learning_rate = train_learning_rate_var.get().strip()
+            if not train_learning_rate:
+                messagebox.showerror("Invalid value", "Learning rate is required.", parent=dialog)
+                return
+            try:
+                learning_rate_number = float(train_learning_rate)
+            except ValueError:
+                messagebox.showerror("Invalid value", "Learning rate must be numeric (example: 1e-4).", parent=dialog)
+                return
+            if learning_rate_number <= 0:
+                messagebox.showerror("Invalid value", "Learning rate must be greater than 0.", parent=dialog)
+                return
+
+            try:
+                train_steps = int(train_steps_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Invalid value", "Train steps must be an integer.", parent=dialog)
+                return
+            if train_steps < 1:
+                messagebox.showerror("Invalid value", "Train steps must be 1 or higher.", parent=dialog)
+                return
+
             for label, raw_path in (
                 ("Klein Model", selected_klein_dit),
                 ("Klein VAE", selected_klein_vae),
@@ -955,6 +1197,11 @@ def launch_ui() -> int:
             settings_state[ENABLE_CUDA_CUDNN_BENCHMARK_KEY] = "1" if cuda_cudnn_benchmark_var.get() else "0"
             settings_state[ENABLE_FP8_DIT_KEY] = "1" if fp8_dit_var.get() else "0"
             settings_state[ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY] = "1" if gc_cpu_offload_var.get() else "0"
+            settings_state[TRAIN_RESOLUTION_KEY] = str(train_resolution)
+            settings_state[TRAIN_NETWORK_DIM_KEY] = str(train_network_dim)
+            settings_state[TRAIN_NETWORK_ALPHA_KEY] = str(train_network_alpha)
+            settings_state[TRAIN_LEARNING_RATE_KEY] = train_learning_rate
+            settings_state[TRAIN_STEPS_KEY] = str(train_steps)
             save_settings(settings_state)
             result = klein_runtime_config_from_settings(settings_state)
             dialog.destroy()
@@ -1241,6 +1488,179 @@ def launch_ui() -> int:
                 f"Finished with {skipped_errors} copy error(s).",
                 parent=root,
             )
+
+    def open_dataset_config_dialog(dataset_name: str) -> None:
+        effective = effective_train_settings_for_dataset(dataset_name)
+        global_values = global_train_settings()
+        image_count = len(dataset_image_files(runtime_config.training_dir, dataset_name))
+
+        dialog = tk.Toplevel(root)
+        dialog.title(f"Dataset Configure - {dataset_name}")
+        dialog.transient(root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.configure(bg=bg_panel)
+        set_dark_title_bar(dialog)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+
+        frame = ttk.Frame(dialog, padding=10)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+
+        section = ttk.LabelFrame(frame, text=f"Train settings for {dataset_name}", padding=8)
+        section.grid(row=0, column=0, sticky="ew")
+        section.columnconfigure(0, weight=0)
+        section.columnconfigure(1, weight=1)
+        section.columnconfigure(2, weight=0)
+        section.columnconfigure(3, weight=1)
+
+        use_global_var = tk.BooleanVar(value=is_truthy(effective.get(DATASET_USE_GLOBAL_TRAIN_KEY), default=True))
+        train_steps_var = tk.StringVar(value=effective[TRAIN_STEPS_KEY])
+        train_learning_rate_var = tk.StringVar(value=effective[TRAIN_LEARNING_RATE_KEY])
+        train_network_dim_var = tk.StringVar(value=effective[TRAIN_NETWORK_DIM_KEY])
+        train_network_alpha_var = tk.StringVar(value=effective[TRAIN_NETWORK_ALPHA_KEY])
+        train_resolution_var = tk.StringVar(value=effective[TRAIN_RESOLUTION_KEY])
+
+        ttk.Checkbutton(
+            section,
+            text="Use global values",
+            variable=use_global_var,
+        ).grid(row=0, column=0, columnspan=4, sticky="w")
+
+        ttk.Label(section, text="Training steps:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        train_steps_entry = ttk.Entry(section, textvariable=train_steps_var, style="Flat.TEntry")
+        train_steps_entry.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(section, text="Learning rate:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(8, 0))
+        train_learning_rate_entry = ttk.Entry(section, textvariable=train_learning_rate_var, style="Flat.TEntry")
+        train_learning_rate_entry.grid(row=1, column=3, sticky="ew", pady=(8, 0))
+
+        ttk.Label(section, text="LoRA network dim:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        train_network_dim_entry = ttk.Entry(section, textvariable=train_network_dim_var, style="Flat.TEntry")
+        train_network_dim_entry.grid(row=2, column=1, sticky="ew", pady=(6, 0))
+        ttk.Label(section, text="LoRA network alpha:").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        train_network_alpha_entry = ttk.Entry(section, textvariable=train_network_alpha_var, style="Flat.TEntry")
+        train_network_alpha_entry.grid(row=2, column=3, sticky="ew", pady=(6, 0))
+
+        ttk.Label(section, text="Dataset resolution:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        train_resolution_entry = ttk.Entry(section, textvariable=train_resolution_var, style="Flat.TEntry")
+        train_resolution_entry.grid(row=3, column=1, sticky="ew", pady=(6, 0))
+
+        help_label = ttk.Label(
+            section,
+            text="When Use global values is on, this dataset follows Settings > Advanced values.",
+        )
+        help_label.grid(row=4, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Label(section, text=f"Images found: {image_count}").grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        def sync_entry_state() -> None:
+            state = "disabled" if use_global_var.get() else "normal"
+            for entry in (
+                train_steps_entry,
+                train_learning_rate_entry,
+                train_network_dim_entry,
+                train_network_alpha_entry,
+                train_resolution_entry,
+            ):
+                entry.configure(state=state)
+
+        def reset_to_global_defaults() -> None:
+            train_steps_var.set(global_values[TRAIN_STEPS_KEY])
+            train_learning_rate_var.set(global_values[TRAIN_LEARNING_RATE_KEY])
+            train_network_dim_var.set(global_values[TRAIN_NETWORK_DIM_KEY])
+            train_network_alpha_var.set(global_values[TRAIN_NETWORK_ALPHA_KEY])
+            train_resolution_var.set(global_values[TRAIN_RESOLUTION_KEY])
+            use_global_var.set(False)
+            sync_entry_state()
+
+        def save_and_close() -> None:
+            raw_to_save: dict[str, str] = {
+                DATASET_USE_GLOBAL_TRAIN_KEY: "1" if use_global_var.get() else "0",
+            }
+
+            if not use_global_var.get():
+                try:
+                    train_steps = int(train_steps_var.get().strip())
+                except ValueError:
+                    messagebox.showerror("Invalid value", "Training steps must be an integer.", parent=dialog)
+                    return
+                if train_steps < 1:
+                    messagebox.showerror("Invalid value", "Training steps must be 1 or higher.", parent=dialog)
+                    return
+
+                train_learning_rate = train_learning_rate_var.get().strip()
+                if not train_learning_rate:
+                    messagebox.showerror("Invalid value", "Learning rate is required.", parent=dialog)
+                    return
+                try:
+                    learning_rate_number = float(train_learning_rate)
+                except ValueError:
+                    messagebox.showerror("Invalid value", "Learning rate must be numeric (example: 1e-4).", parent=dialog)
+                    return
+                if learning_rate_number <= 0:
+                    messagebox.showerror("Invalid value", "Learning rate must be greater than 0.", parent=dialog)
+                    return
+
+                try:
+                    network_dim = int(train_network_dim_var.get().strip())
+                except ValueError:
+                    messagebox.showerror("Invalid value", "LoRA network dim must be an integer.", parent=dialog)
+                    return
+                if network_dim < 1:
+                    messagebox.showerror("Invalid value", "LoRA network dim must be 1 or higher.", parent=dialog)
+                    return
+
+                try:
+                    network_alpha = int(train_network_alpha_var.get().strip())
+                except ValueError:
+                    messagebox.showerror("Invalid value", "LoRA network alpha must be an integer.", parent=dialog)
+                    return
+                if network_alpha < 1:
+                    messagebox.showerror("Invalid value", "LoRA network alpha must be 1 or higher.", parent=dialog)
+                    return
+
+                try:
+                    resolution = int(train_resolution_var.get().strip())
+                except ValueError:
+                    messagebox.showerror("Invalid value", "Dataset resolution must be an integer.", parent=dialog)
+                    return
+                if resolution < 64:
+                    messagebox.showerror("Invalid value", "Dataset resolution must be 64 or higher.", parent=dialog)
+                    return
+
+                raw_to_save[TRAIN_STEPS_KEY] = str(train_steps)
+                raw_to_save[TRAIN_LEARNING_RATE_KEY] = train_learning_rate
+                raw_to_save[TRAIN_NETWORK_DIM_KEY] = str(network_dim)
+                raw_to_save[TRAIN_NETWORK_ALPHA_KEY] = str(network_alpha)
+                raw_to_save[TRAIN_RESOLUTION_KEY] = str(resolution)
+
+            try:
+                save_dataset_train_settings_raw(dataset_name, raw_to_save)
+            except OSError as exc:
+                messagebox.showerror("Save failed", f"Could not save dataset settings:\n{exc}", parent=dialog)
+                return
+
+            checkpoint_cache.pop(dataset_name, None)
+            rebuild_folder_list(force=True)
+            dialog.destroy()
+
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        button_row.columnconfigure(0, weight=1)
+
+        ttk.Button(button_row, text="Reset", command=reset_to_global_defaults).grid(row=0, column=0, sticky="w")
+        ttk.Button(button_row, text="Cancel", command=dialog.destroy).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(button_row, text="Save", command=save_and_close).grid(row=0, column=2)
+
+        use_global_var.trace_add("write", lambda *_args: sync_entry_state())
+        sync_entry_state()
+
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.update_idletasks()
+        dialog.geometry(f"{max(740, dialog.winfo_reqwidth())}x{dialog.winfo_reqheight()}")
+        center_window(dialog)
+        dialog.focus_set()
+        root.wait_window(dialog)
 
     def dataset_output_safetensors(dataset_name: str) -> list[Path]:
         output_dir = runtime_config.training_dir / dataset_name / "output"
@@ -1850,6 +2270,8 @@ def launch_ui() -> int:
 
     def show_thumbnail_context_menu(event: tk.Event, dataset_name: str) -> str:
         menu = tk.Menu(root, tearoff=0)
+        menu.add_command(label="Configure", command=lambda: open_dataset_config_dialog(dataset_name))
+        menu.add_separator()
         menu.add_command(label="Open Dataset", command=lambda: open_dataset_in_file_manager(dataset_name))
         menu.add_command(label="Add Images", command=lambda: add_images_to_dataset(dataset_name))
         menu.add_separator()
@@ -1954,7 +2376,7 @@ def launch_ui() -> int:
         first_image_cache[dataset_name] = chosen
         return chosen
 
-    def make_thumbnail(image_path: Path | None, run_state: str, thumb_px: int) -> ImageTk.PhotoImage:
+    def make_thumbnail(image_path: Path | None, run_state: str, thumb_px: int, has_override: bool = False) -> ImageTk.PhotoImage:
         thumb_size = (thumb_px, thumb_px)
         cache_path = "__none__"
         cache_mtime_ns = 0
@@ -1965,7 +2387,7 @@ def launch_ui() -> int:
             except OSError:
                 cache_mtime_ns = 0
 
-        cache_key = (cache_path, run_state, thumb_px, cache_mtime_ns)
+        cache_key = (cache_path, run_state, thumb_px, cache_mtime_ns, has_override)
         cached_thumb = thumbnail_cache.get(cache_key)
         if cached_thumb is not None:
             return cached_thumb
@@ -2006,34 +2428,40 @@ def launch_ui() -> int:
         image = Image.alpha_composite(image_rgba, border_overlay).convert("RGB")
 
         draw = ImageDraw.Draw(image)
-        badge_d = max(18, thumb_px // 5)
-        pad = 6
-        x1 = thumb_px - badge_d - pad
-        y1 = pad
-        x2 = x1 + badge_d
-        y2 = y1 + badge_d
+        if run_state == "in_progress":
+            draw.rectangle((1, 1, thumb_px - 2, thumb_px - 2), outline="#f5b301", width=2)
+
+        # Composite badge icons directly onto the image so alpha works correctly.
+        badge_size = max(14, thumb_px // 10)
+        badge_margin = 6
+        icons_dir = Path(__file__).resolve().parent / "icons"
+
+        def _load_badge_pil(icon_name: str) -> Image.Image | None:
+            p = icons_dir / f"{icon_name}.png"
+            if not p.exists():
+                return None
+            try:
+                img = Image.open(p).convert("RGBA")
+                if img.size != (badge_size, badge_size):
+                    img = img.resize((badge_size, badge_size), Image.Resampling.LANCZOS)
+                return img
+            except Exception:
+                return None
+
+        image = image.convert("RGBA")
+        if has_override:
+            badge = _load_badge_pil("settings")
+            if badge is not None:
+                image.paste(badge, (badge_margin, badge_margin), badge)
 
         if run_state == "done":
-            draw.ellipse((x1, y1, x2, y2), fill=color_green)
-            line_w = max(2, badge_d // 8)
-            draw.line(
-                (x1 + badge_d * 0.24, y1 + badge_d * 0.56, x1 + badge_d * 0.43, y1 + badge_d * 0.75),
-                fill="white",
-                width=line_w,
-            )
-            draw.line(
-                (x1 + badge_d * 0.43, y1 + badge_d * 0.75, x1 + badge_d * 0.78, y1 + badge_d * 0.30),
-                fill="white",
-                width=line_w,
-            )
+            badge = _load_badge_pil("ok")
+            if badge is not None:
+                image.paste(badge, (thumb_px - badge_margin - badge_size, badge_margin), badge)
         elif run_state == "in_progress":
-            draw.ellipse((x1, y1, x2, y2), fill="#d08a22")
-            line_w = max(2, badge_d // 7)
-            bar_pad_x = max(3, badge_d // 4)
-            bar_top = y1 + max(3, badge_d // 4)
-            bar_bottom = y2 - max(3, badge_d // 4)
-            draw.line((x1 + bar_pad_x, bar_top, x1 + bar_pad_x, bar_bottom), fill="white", width=line_w)
-            draw.line((x2 - bar_pad_x, bar_top, x2 - bar_pad_x, bar_bottom), fill="white", width=line_w)
+            badge = _load_badge_pil("pause")
+            if badge is not None:
+                image.paste(badge, (thumb_px - badge_margin - badge_size, badge_margin), badge)
 
         photo = ImageTk.PhotoImage(image)
         thumbnail_cache[cache_key] = photo
@@ -2200,6 +2628,7 @@ def launch_ui() -> int:
             first_image_cache.clear()
             thumbnail_cache.clear()
             checkpoint_cache.clear()
+            dataset_train_settings_cache.clear()
 
         for widget in card_widgets:
             widget.destroy()
@@ -2222,6 +2651,7 @@ def launch_ui() -> int:
         for stale_name in stale_names:
             first_image_cache.pop(stale_name, None)
             checkpoint_cache.pop(stale_name, None)
+            dataset_train_settings_cache.pop(stale_name, None)
 
         if not names:
             empty_label = ttk.Label(inner, text="No folders found.")
@@ -2253,7 +2683,16 @@ def launch_ui() -> int:
                 checkpoint_info = latest_checkpoint_for_dataset(runtime_config.training_dir, name)
                 checkpoint_cache[name] = checkpoint_info
             checkpoint_path, checkpoint_step = checkpoint_info
-            train_state = "done" if checkpoint_step >= STEPS else ("in_progress" if checkpoint_step > 0 else "pending")
+            effective_train = effective_train_settings_for_dataset(name)
+            has_train_override = dataset_has_train_override(name)
+            train_steps_target = get_positive_int_setting(
+                effective_train,
+                TRAIN_STEPS_KEY,
+                DEFAULT_TRAIN_STEPS,
+            )
+            train_state = (
+                "done" if checkpoint_step >= train_steps_target else ("in_progress" if checkpoint_step > 0 else "pending")
+            )
             run_state_by_name[name] = train_state
 
             var = tk.BooleanVar(value=(name in selected_before) and train_state != "done")
@@ -2269,7 +2708,7 @@ def launch_ui() -> int:
             card_frame_by_name[name] = card
 
             image_path = first_image_path(name)
-            thumb = make_thumbnail(image_path, train_state, thumb_px)
+            thumb = make_thumbnail(image_path, train_state, thumb_px, has_override=has_train_override)
             card_thumb_by_name[name] = thumb
 
             title_style = "DoneCardTitle.TLabel" if train_state == "done" else "CardTitle.TLabel"
@@ -2277,24 +2716,27 @@ def launch_ui() -> int:
 
             image_label = ttk.Label(card, image=thumb, style=title_style, anchor="center")
             image_label.grid(row=0, column=0, sticky="n")
+
             title_label = ttk.Label(card, text=name, style=title_style, anchor="center")
             title_label.grid(row=1, column=0, sticky="ew", pady=(6, 0))
             status_text = ""
             if train_state == "done":
                 status_text = "COMPLETED"
             elif train_state == "in_progress" and checkpoint_path is not None:
-                status_text = f"RESUME {checkpoint_step}/{STEPS}"
+                status_text = f"RESUME {checkpoint_step}/{train_steps_target}"
             else:
                 status_text = "START"
             status_label = ttk.Label(card, text=status_text, style=meta_style, anchor="center")
             status_label.grid(row=2, column=0, sticky="ew", pady=(2, 8))
 
-            for clickable in (card, image_label, title_label, status_label):
+            click_targets: list[tk.Widget] = [card, image_label, title_label, status_label]
+
+            for clickable in click_targets:
                 clickable.bind("<ButtonPress-1>", lambda _e, n=name: on_card_press(n))
                 clickable.bind("<B1-Motion>", lambda _e: on_card_motion())
                 clickable.bind("<ButtonRelease-1>", lambda _e, n=name: on_card_release(n))
-
-            image_label.bind("<Button-3>", lambda e, n=name: show_thumbnail_context_menu(e, n))
+                clickable.bind("<Button-3>", lambda e, n=name: show_thumbnail_context_menu(e, n))
+                clickable.bind("<Double-Button-1>", lambda _e, n=name: open_dataset_config_dialog(n))
 
             card_widgets.append(card)
 
@@ -2416,35 +2858,77 @@ def launch_ui() -> int:
             try:
                 log("")
                 log("Training is in progress...")
-                train_models(
-                    runtime_config,
-                    names,
-                    default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
-                    enable_compile_optimizations=(
-                        settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0").strip().lower()
-                        in {"1", "true", "yes", "on"}
-                    ),
-                    enable_cuda_allow_tf32=(
-                        settings_state.get(ENABLE_CUDA_ALLOW_TF32_KEY, "1").strip().lower() in {"1", "true", "yes", "on"}
-                    ),
-                    enable_cuda_cudnn_benchmark=(
-                        settings_state.get(ENABLE_CUDA_CUDNN_BENCHMARK_KEY, "1").strip().lower()
-                        in {"1", "true", "yes", "on"}
-                    ),
-                    enable_fp8_dit=(
-                        settings_state.get(ENABLE_FP8_DIT_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
-                    ),
-                    enable_gradient_checkpointing_cpu_offload=(
-                        settings_state.get(ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY, "0").strip().lower()
-                        in {"1", "true", "yes", "on"}
-                    ),
-                    logger=log,
-                    do_prep_dataset=True,
-                    do_cache_latents=True,
-                    do_cache_text=True,
-                    do_train=True,
-                    cancel_requested=(lambda: run_cancel_event is not None and run_cancel_event.is_set()),
-                )
+                failed_models: list[str] = []
+                for dataset_name in names:
+                    if run_cancel_event is not None and run_cancel_event.is_set():
+                        break
+
+                    effective_train = effective_train_settings_for_dataset(dataset_name)
+                    use_global = is_truthy(effective_train.get(DATASET_USE_GLOBAL_TRAIN_KEY), default=True)
+                    mode_label = "global" if use_global else "dataset override"
+                    log(f"[{dataset_name}] train settings source: {mode_label}")
+
+                    exit_code = train_models(
+                        runtime_config,
+                        [dataset_name],
+                        default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+                        resolution=get_positive_int_setting(
+                            effective_train,
+                            TRAIN_RESOLUTION_KEY,
+                            DEFAULT_RESOLUTION,
+                            minimum=64,
+                        ),
+                        network_dim=get_positive_int_setting(
+                            effective_train,
+                            TRAIN_NETWORK_DIM_KEY,
+                            DEFAULT_NETWORK_DIM,
+                        ),
+                        network_alpha=get_positive_int_setting(
+                            effective_train,
+                            TRAIN_NETWORK_ALPHA_KEY,
+                            DEFAULT_NETWORK_ALPHA,
+                        ),
+                        learning_rate=effective_train.get(TRAIN_LEARNING_RATE_KEY, DEFAULT_LEARNING_RATE),
+                        train_steps=get_positive_int_setting(
+                            effective_train,
+                            TRAIN_STEPS_KEY,
+                            DEFAULT_TRAIN_STEPS,
+                        ),
+                        enable_compile_optimizations=(
+                            settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0").strip().lower()
+                            in {"1", "true", "yes", "on"}
+                        ),
+                        enable_cuda_allow_tf32=(
+                            settings_state.get(ENABLE_CUDA_ALLOW_TF32_KEY, "1").strip().lower()
+                            in {"1", "true", "yes", "on"}
+                        ),
+                        enable_cuda_cudnn_benchmark=(
+                            settings_state.get(ENABLE_CUDA_CUDNN_BENCHMARK_KEY, "1").strip().lower()
+                            in {"1", "true", "yes", "on"}
+                        ),
+                        enable_fp8_dit=(
+                            settings_state.get(ENABLE_FP8_DIT_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
+                        ),
+                        enable_gradient_checkpointing_cpu_offload=(
+                            settings_state.get(ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY, "0").strip().lower()
+                            in {"1", "true", "yes", "on"}
+                        ),
+                        logger=log,
+                        do_prep_dataset=True,
+                        do_cache_latents=True,
+                        do_cache_text=True,
+                        do_train=True,
+                        cancel_requested=(lambda: run_cancel_event is not None and run_cancel_event.is_set()),
+                    )
+                    if exit_code != 0 and not (run_cancel_event is not None and run_cancel_event.is_set()):
+                        failed_models.append(dataset_name)
+
+                if run_cancel_event is not None and run_cancel_event.is_set():
+                    log("Training cancelled by user.")
+                elif failed_models:
+                    log(f"Training completed with failures: {', '.join(failed_models)}")
+                else:
+                    log("Training completed.")
             except Exception as exc:
                 log(f"Training failed unexpectedly: {exc}")
             finally:
@@ -2518,6 +3002,11 @@ def main() -> int:
             runtime_config,
             model_names,
             default_caption_keyword=settings.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+            resolution=get_positive_int_setting(settings, TRAIN_RESOLUTION_KEY, DEFAULT_RESOLUTION, minimum=64),
+            network_dim=get_positive_int_setting(settings, TRAIN_NETWORK_DIM_KEY, DEFAULT_NETWORK_DIM),
+            network_alpha=get_positive_int_setting(settings, TRAIN_NETWORK_ALPHA_KEY, DEFAULT_NETWORK_ALPHA),
+            learning_rate=get_learning_rate_setting(settings),
+            train_steps=get_positive_int_setting(settings, TRAIN_STEPS_KEY, DEFAULT_TRAIN_STEPS),
             enable_compile_optimizations=(
                 settings.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
             ),

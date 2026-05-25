@@ -25,6 +25,11 @@ ENABLE_CUDA_ALLOW_TF32_KEY = "enable_cuda_allow_tf32"
 ENABLE_CUDA_CUDNN_BENCHMARK_KEY = "enable_cuda_cudnn_benchmark"
 ENABLE_FP8_DIT_KEY = "enable_fp8_dit"
 ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY = "enable_gradient_checkpointing_cpu_offload"
+TRAIN_RESOLUTION_KEY = "train_resolution"
+TRAIN_NETWORK_DIM_KEY = "train_network_dim"
+TRAIN_NETWORK_ALPHA_KEY = "train_network_alpha"
+TRAIN_LEARNING_RATE_KEY = "train_learning_rate"
+TRAIN_STEPS_KEY = "train_steps"
 
 
 def load_settings() -> dict[str, str]:
