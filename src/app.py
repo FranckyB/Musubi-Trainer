@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
+from typing import Callable
 
 from .app_settings import (
     DEFAULT_CAPTION_KEYWORD_KEY,
@@ -30,9 +31,14 @@ from .app_settings import (
     MUSUBI_PYTHON_KEY,
     SETTINGS_FILE,
     TRAIN_LEARNING_RATE_KEY,
+    TRAIN_LOG_BACKEND_KEY,
+    TRAIN_LOG_TRACKER_NAME_KEY,
+    TRAIN_AUTO_CLEANUP_STATES_KEY,
     TRAIN_NETWORK_ALPHA_KEY,
     TRAIN_NETWORK_DIM_KEY,
+    TRAIN_ENABLE_LOGGING_KEY,
     TRAIN_RESOLUTION_KEY,
+    TRAIN_SAVE_CHECKPOINT_METADATA_KEY,
     TRAIN_STEPS_KEY,
     WINDOW_HEIGHT_KEY,
     WINDOW_WIDTH_KEY,
@@ -75,6 +81,15 @@ def get_positive_int_setting(settings: dict[str, str], key: str, fallback: int, 
 def get_learning_rate_setting(settings: dict[str, str]) -> str:
     value = settings.get(TRAIN_LEARNING_RATE_KEY, "").strip()
     return value if value else DEFAULT_LEARNING_RATE
+
+
+def get_train_log_backend_setting(settings: dict[str, str]) -> str:
+    value = settings.get(TRAIN_LOG_BACKEND_KEY, "").strip().lower()
+    return value if value in {"tensorboard", "wandb", "all"} else "tensorboard"
+
+
+def dataset_log_dir(training_dir: Path, dataset_name: str) -> Path:
+    return training_dir / dataset_name / "logs"
 
 
 def is_truthy(raw_value: str | None, default: bool = False) -> bool:
@@ -397,6 +412,31 @@ def launch_ui() -> int:
         foreground=[("disabled", fg_muted)],
     )
     style.configure("PathDisplay.TLabel", background="#1f1f1f", foreground=fg_text)
+    style.configure(
+        "TCombobox",
+        fieldbackground="#1f1f1f",
+        background="#1f1f1f",
+        foreground=fg_text,
+        arrowcolor=fg_text,
+        bordercolor=border_dark,
+        lightcolor=border_dark,
+        darkcolor=border_dark,
+    )
+    style.map(
+        "TCombobox",
+        fieldbackground=[("readonly", "#1f1f1f"), ("disabled", "#2a2a2a")],
+        foreground=[("readonly", fg_text), ("disabled", fg_muted)],
+        background=[("readonly", "#1f1f1f")],
+        selectbackground=[("readonly", "#2f4f66")],
+        selectforeground=[("readonly", "#ffffff")],
+    )
+    # Style ttk.Combobox dropdown list to avoid OS-default bright colors.
+    root.option_add("*TCombobox*Listbox.background", "#1f1f1f")
+    root.option_add("*TCombobox*Listbox.foreground", fg_text)
+    root.option_add("*TCombobox*Listbox.selectBackground", "#2f4f66")
+    root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+    root.option_add("*TCombobox*Listbox.highlightThickness", 0)
+    root.option_add("*TCombobox*Listbox.borderWidth", 0)
     style.configure("TCheckbutton", background=bg_panel, foreground=fg_text)
     style.map("TCheckbutton", background=[("active", bg_panel)], foreground=[("disabled", fg_muted)])
     style.configure(
@@ -726,6 +766,35 @@ def launch_ui() -> int:
             TRAIN_STEPS_KEY,
             DEFAULT_TRAIN_STEPS,
         )
+        current_enable_training_logging = settings_state.get(
+            TRAIN_ENABLE_LOGGING_KEY,
+            "1",
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        current_train_log_backend = get_train_log_backend_setting(settings_state)
+        current_train_log_tracker_name = settings_state.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip()
+        current_save_checkpoint_metadata = settings_state.get(
+            TRAIN_SAVE_CHECKPOINT_METADATA_KEY,
+            "0",
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        current_auto_cleanup_states = settings_state.get(
+            TRAIN_AUTO_CLEANUP_STATES_KEY,
+            "1",
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         current_gc_cpu_offload = settings_state.get(
             ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY,
             "0",
@@ -804,6 +873,11 @@ def launch_ui() -> int:
         train_network_alpha_var = tk.StringVar(value=str(current_train_network_alpha))
         train_learning_rate_var = tk.StringVar(value=current_train_learning_rate)
         train_steps_var = tk.StringVar(value=str(current_train_steps))
+        enable_training_logging_var = tk.BooleanVar(value=current_enable_training_logging)
+        train_log_backend_var = tk.StringVar(value=current_train_log_backend)
+        train_log_tracker_name_var = tk.StringVar(value=current_train_log_tracker_name)
+        save_checkpoint_metadata_var = tk.BooleanVar(value=current_save_checkpoint_metadata)
+        auto_cleanup_states_var = tk.BooleanVar(value=current_auto_cleanup_states)
 
         ttk.Label(musubi_section, text="Musubi-Tuner folder:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         musubi_display = ttk.Label(
@@ -897,6 +971,41 @@ def launch_ui() -> int:
             text="Enable CPU Gradient Checkpointing (Low Ram)",
             variable=gc_cpu_offload_var,
         ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        ttk.Separator(advanced_section, orient="horizontal").grid(row=8, column=0, columnspan=4, sticky="ew", pady=(10, 2))
+        ttk.Checkbutton(
+            advanced_section,
+            text="Enable training logs",
+            variable=enable_training_logging_var,
+        ).grid(row=9, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        ttk.Label(advanced_section, text="Log backend:").grid(row=10, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Combobox(
+            advanced_section,
+            textvariable=train_log_backend_var,
+            values=("tensorboard", "wandb", "all"),
+            state="readonly",
+        ).grid(row=10, column=1, sticky="ew", pady=(6, 0))
+        ttk.Label(advanced_section, text="Tracker name:").grid(row=10, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        ttk.Entry(advanced_section, textvariable=train_log_tracker_name_var, style="Flat.TEntry").grid(
+            row=10,
+            column=3,
+            sticky="ew",
+            pady=(6, 0),
+        )
+        ttk.Checkbutton(
+            advanced_section,
+            text="Save checkpoint metadata (.json sidecar)",
+            variable=save_checkpoint_metadata_var,
+        ).grid(row=11, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            advanced_section,
+            text="Auto-clean resume state folders (keep only latest useful state)",
+            variable=auto_cleanup_states_var,
+        ).grid(row=12, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Label(
+            advanced_section,
+            text="Logs are stored per dataset in logs and can be viewed via the Metrics Viewer button.",
+        ).grid(row=13, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         ttk.Label(klein_section, text="Model version:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         klein_model_version_entry = ttk.Entry(klein_section, textvariable=klein_model_version_var, style="Flat.TEntry")
@@ -1181,6 +1290,11 @@ def launch_ui() -> int:
             settings_state[TRAIN_NETWORK_ALPHA_KEY] = str(train_network_alpha)
             settings_state[TRAIN_LEARNING_RATE_KEY] = train_learning_rate
             settings_state[TRAIN_STEPS_KEY] = str(train_steps)
+            settings_state[TRAIN_ENABLE_LOGGING_KEY] = "1" if enable_training_logging_var.get() else "0"
+            settings_state[TRAIN_LOG_BACKEND_KEY] = train_log_backend_var.get().strip().lower() or "tensorboard"
+            settings_state[TRAIN_LOG_TRACKER_NAME_KEY] = train_log_tracker_name_var.get().strip()
+            settings_state[TRAIN_SAVE_CHECKPOINT_METADATA_KEY] = "1" if save_checkpoint_metadata_var.get() else "0"
+            settings_state[TRAIN_AUTO_CLEANUP_STATES_KEY] = "1" if auto_cleanup_states_var.get() else "0"
             save_settings(settings_state)
             result = klein_runtime_config_from_settings(settings_state)
             dialog.destroy()
@@ -1324,11 +1438,13 @@ def launch_ui() -> int:
         images_dir = dataset_dir / "images"
         cache_dir = dataset_dir / "cache"
         output_dir = dataset_dir / "output"
+        logs_dir = dataset_dir / "logs"
 
         try:
             images_dir.mkdir(parents=True, exist_ok=False)
             cache_dir.mkdir(parents=True, exist_ok=True)
             output_dir.mkdir(parents=True, exist_ok=True)
+            logs_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             messagebox.showerror("Create failed", f"Could not create dataset structure:\n{exc}", parent=root)
             return
@@ -1396,6 +1512,143 @@ def launch_ui() -> int:
                 subprocess.Popen(["xdg-open", str(dataset_dir)])
         except OSError as exc:
             messagebox.showerror("Open failed", f"Could not open folder:\n{exc}", parent=root)
+
+    def open_metrics_viewer_dialog() -> None:
+        dataset_names = scan_training_folders(runtime_config.training_dir)
+        if not dataset_names:
+            messagebox.showinfo("No datasets", "No datasets found in the Training folder.", parent=root)
+            return
+
+        dialog = tk.Toplevel(root)
+        dialog.title("Metrics Viewer")
+        dialog.transient(root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.configure(bg=bg_panel)
+        set_dark_title_bar(dialog)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+
+        frame = ttk.Frame(dialog, padding=10)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(1, weight=1)
+
+        dataset_var = tk.StringVar(value=dataset_names[0])
+        log_dir_var = tk.StringVar(value="")
+        summary_var = tk.StringVar(value="")
+
+        ttk.Label(frame, text="Dataset:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        dataset_combo = ttk.Combobox(frame, textvariable=dataset_var, values=dataset_names, state="readonly")
+        dataset_combo.grid(row=0, column=1, sticky="ew")
+
+        ttk.Label(frame, text="Log folder:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(
+            frame,
+            textvariable=log_dir_var,
+            anchor="w",
+            style="PathDisplay.TLabel",
+            padding=(6, 4),
+        ).grid(row=1, column=1, sticky="ew", pady=(8, 0))
+
+        ttk.Label(frame, textvariable=summary_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        def current_log_dir() -> Path:
+            return dataset_log_dir(runtime_config.training_dir, dataset_var.get().strip())
+
+        def update_summary() -> None:
+            log_dir = current_log_dir()
+            log_dir_var.set(str(log_dir))
+            if not log_dir.exists() or not log_dir.is_dir():
+                summary_var.set("No logs yet for this dataset.")
+                return
+            run_dirs = [p for p in log_dir.iterdir() if p.is_dir()]
+            event_files = list(log_dir.glob("**/events.out.tfevents*"))
+            summary_var.set(f"Runs: {len(run_dirs)} | Event files: {len(event_files)}")
+
+        def open_log_folder() -> None:
+            log_dir = current_log_dir()
+            if not log_dir.exists() or not log_dir.is_dir():
+                messagebox.showinfo("No logs", "No log folder exists for this dataset yet.", parent=dialog)
+                return
+            try:
+                if sys.platform == "win32":
+                    os.startfile(str(log_dir))
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", str(log_dir)])
+                else:
+                    subprocess.Popen(["xdg-open", str(log_dir)])
+            except OSError as exc:
+                messagebox.showerror("Open failed", f"Could not open folder:\n{exc}", parent=dialog)
+
+        def launch_tensorboard() -> None:
+            launch_tensorboard_for_dataset(dataset_var.get().strip(), parent=dialog)
+
+        dataset_combo.bind("<<ComboboxSelected>>", lambda _e: update_summary())
+        update_summary()
+
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        button_row.columnconfigure(0, weight=1)
+
+        ttk.Button(button_row, text="Open Log Folder", command=open_log_folder).grid(row=0, column=0, sticky="w")
+        ttk.Button(button_row, text="Launch TensorBoard", command=launch_tensorboard).grid(row=0, column=1, padx=(8, 8))
+        ttk.Button(button_row, text="Close", command=dialog.destroy).grid(row=0, column=2)
+
+        dialog.update_idletasks()
+        dialog.geometry(f"{max(680, dialog.winfo_reqwidth())}x{dialog.winfo_reqheight()}")
+        center_window(dialog)
+        dialog.focus_set()
+        root.wait_window(dialog)
+
+    def launch_tensorboard_for_dataset(dataset_name: str, parent: tk.Misc | None = None) -> None:
+        log_dir = dataset_log_dir(runtime_config.training_dir, dataset_name)
+        if not log_dir.exists() or not log_dir.is_dir():
+            messagebox.showinfo(
+                "No logs",
+                f"No logs found yet for '{dataset_name}'.\nRun training with logging enabled first.",
+                parent=(parent or root),
+            )
+            return
+
+        python_path = runtime_config.musubi_python
+        if python_path is None or not python_path.is_file():
+            messagebox.showerror(
+                "Python not found",
+                "Musubi-Tuner Python (venv) is not configured. Set it in Settings first.",
+                parent=(parent or root),
+            )
+            return
+
+        command = [
+            str(python_path),
+            "-m",
+            "tensorboard.main",
+            "--logdir",
+            str(log_dir),
+            "--port",
+            "6006",
+            "--reload_interval",
+            "5",
+        ]
+
+        try:
+            popen_kwargs: dict[str, object] = {
+                "cwd": str(runtime_config.musubi_dir),
+            }
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+            subprocess.Popen(command, **popen_kwargs)
+        except OSError as exc:
+            messagebox.showerror("Launch failed", f"Could not start TensorBoard:\n{exc}", parent=(parent or root))
+            return
+
+        log(f"[Metrics Viewer] TensorBoard launched for {dataset_name} @ http://localhost:6006")
+        messagebox.showinfo(
+            "TensorBoard launched",
+            "TensorBoard started at http://localhost:6006\n\n"
+            "If the page does not load, wait a few seconds and refresh.",
+            parent=(parent or root),
+        )
 
     def add_images_to_dataset(dataset_name: str) -> None:
         dataset_dir = runtime_config.training_dir / dataset_name
@@ -1663,16 +1916,80 @@ def launch_ui() -> int:
 
         return f"s{unique_steps[0]}-{unique_steps[-1]}x{len(unique_steps)}"
 
+    def merge_preset_file_token(preset_name: str) -> str:
+        preset_key = preset_name.strip().lower()
+        if preset_key == "smooth":
+            return "Smooth"
+        if preset_key == "anti-overfit":
+            return "NoOverfit"
+        return "Balance"
+
+    def merge_preset_tooltip_text() -> str:
+        return (
+            "Preset guide\n"
+            "Balanced: General starting point for most training runs.\n"
+            "Smooth: Prefer when training converged early and you want a smoother blend.\n"
+            "Anti-overfit: Prefer when late checkpoints look overfit and too close to training images."
+        )
+
+    def attach_hover_tooltip(widget: tk.Widget, text_provider: Callable[[], str] | str) -> None:
+        tooltip_window: tk.Toplevel | None = None
+
+        def tooltip_text() -> str:
+            if callable(text_provider):
+                return text_provider().strip()
+            return str(text_provider).strip()
+
+        def show_tooltip(_event: tk.Event | None = None) -> None:
+            nonlocal tooltip_window
+            text = tooltip_text()
+            if not text:
+                return
+            hide_tooltip()
+            tooltip_window = tk.Toplevel(widget)
+            tooltip_window.wm_overrideredirect(True)
+            tooltip_window.configure(bg="#1f1f1f")
+            label = tk.Label(
+                tooltip_window,
+                text=text,
+                justify="left",
+                bg="#1f1f1f",
+                fg=fg_text,
+                relief="solid",
+                bd=1,
+                padx=8,
+                pady=6,
+            )
+            label.pack()
+            x = widget.winfo_rootx() + 8
+            y = widget.winfo_rooty() + widget.winfo_height() + 6
+            tooltip_window.wm_geometry(f"+{x}+{y}")
+
+        def hide_tooltip(_event: tk.Event | None = None) -> None:
+            nonlocal tooltip_window
+            if tooltip_window is not None and tooltip_window.winfo_exists():
+                tooltip_window.destroy()
+            tooltip_window = None
+
+        widget.bind("<Enter>", show_tooltip, add="+")
+        widget.bind("<Leave>", hide_tooltip, add="+")
+        widget.bind("<ButtonPress>", hide_tooltip, add="+")
+        widget.bind("<FocusOut>", hide_tooltip, add="+")
+
     def next_merged_output_path(
         dataset_name: str,
         output_dir: Path,
         merge_mode_suffix: str,
+        preset_name: str,
         selected_files: list[str],
     ) -> Path:
         # Keep method name in the filename to make comparisons between merge modes easy.
         method_token = re.sub(r"[^A-Za-z0-9]+", "_", merge_mode_suffix.strip()).strip("_")
+        preset_token = merge_preset_file_token(preset_name)
         selection_token = compact_merge_selection_token(selected_files)
-        if method_token:
+        if method_token and preset_token:
+            base_name = f"{dataset_name}_merged_{method_token}_{preset_token}_{selection_token}"
+        elif method_token:
             base_name = f"{dataset_name}_merged_{method_token}_{selection_token}"
         else:
             base_name = f"{dataset_name}_merged_{selection_token}"
@@ -1687,10 +2004,30 @@ def launch_ui() -> int:
                 return candidate
             index += 1
 
+    def post_hoc_ema_mode_args_for_preset(preset_name: str) -> dict[str, list[str]]:
+        preset_key = preset_name.strip().lower()
+        if preset_key == "smooth":
+            return {
+                "beta": ["--beta", "0.95"],
+                "beta2": ["--beta", "0.95", "--beta2", "0.98"],
+                "sigma_rel": ["--sigma_rel", "0.25"],
+            }
+        if preset_key == "anti-overfit":
+            return {
+                "beta": ["--beta", "0.8"],
+                "beta2": ["--beta", "0.80", "--beta2", "0.90"],
+                "sigma_rel": ["--sigma_rel", "0.15"],
+            }
+        return {
+            "beta": ["--beta", "0.9"],
+            "beta2": ["--beta", "0.90", "--beta2", "0.95"],
+            "sigma_rel": ["--sigma_rel", "0.2"],
+        }
+
     def ask_lora_merge_options(
         dataset_name: str,
         available_loras: list[Path],
-    ) -> tuple[list[str], list[tuple[str, str, list[str]]]] | None:
+    ) -> tuple[list[str], list[tuple[str, str, list[str]]], str] | None:
         dialog = tk.Toplevel(root)
         dialog.title("LoRA Post-Hoc EMA Merge")
         dialog.transient(root)
@@ -1747,27 +2084,39 @@ def launch_ui() -> int:
             text="Post-Hoc EMA smooths checkpoints from the same run into one more stable LoRA.",
         ).grid(row=2, column=0, sticky="ew", pady=(10, 0))
 
-        ttk.Label(frame, text="Select merge mode(s):").grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(frame, text="Preset:").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        preset_var = tk.StringVar(value="Balanced")
+        preset_combo = ttk.Combobox(
+            frame,
+            textvariable=preset_var,
+            values=("Balanced", "Smooth", "Anti-overfit"),
+            state="readonly",
+            width=14,
+        )
+        preset_combo.grid(row=4, column=0, sticky="w", pady=(6, 0))
+        attach_hover_tooltip(preset_combo, merge_preset_tooltip_text)
+
+        ttk.Label(frame, text="Select merge mode(s):").grid(row=5, column=0, sticky="ew", pady=(10, 0))
 
         mode_beta_var = tk.BooleanVar(value=True)
         mode_beta2_var = tk.BooleanVar(value=False)
         mode_sigma_var = tk.BooleanVar(value=False)
 
         ttk.Checkbutton(frame, text="BETA (Default)", variable=mode_beta_var).grid(
-            row=4, column=0, sticky="ew", pady=(8, 0)
+            row=6, column=0, sticky="ew", pady=(8, 0)
         )
         ttk.Checkbutton(frame, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(
-            row=5, column=0, sticky="ew", pady=(6, 0)
+            row=7, column=0, sticky="ew", pady=(6, 0)
         )
         ttk.Checkbutton(frame, text="SIGMA_REL", variable=mode_sigma_var).grid(
-            row=6, column=0, sticky="ew", pady=(6, 0)
+            row=8, column=0, sticky="ew", pady=(6, 0)
         )
 
         button_row = ttk.Frame(frame)
-        button_row.grid(row=7, column=0, sticky="ew", pady=(12, 0))
+        button_row.grid(row=9, column=0, sticky="ew", pady=(12, 0))
         button_row.columnconfigure(0, weight=1)
 
-        choice: tuple[list[str], list[tuple[str, str, list[str]]]] | None = None
+        choice: tuple[list[str], list[tuple[str, str, list[str]]], str] | None = None
 
         def choose_and_close() -> None:
             nonlocal choice
@@ -1782,12 +2131,13 @@ def launch_ui() -> int:
                 return
 
             selected_modes: list[tuple[str, str, list[str]]] = []
+            preset_args = post_hoc_ema_mode_args_for_preset(preset_var.get())
             if mode_beta_var.get():
-                selected_modes.append(("BETA", "Beta", ["--beta", "0.9"]))
+                selected_modes.append(("BETA", "Beta", preset_args["beta"]))
             if mode_beta2_var.get():
-                selected_modes.append(("BETA2", "Beta2", ["--beta", "0.90", "--beta2", "0.95"]))
+                selected_modes.append(("BETA2", "Beta2", preset_args["beta2"]))
             if mode_sigma_var.get():
-                selected_modes.append(("SIGMA_REL", "Sigma", ["--sigma_rel", "0.2"]))
+                selected_modes.append(("SIGMA_REL", "Sigma", preset_args["sigma_rel"]))
 
             if not selected_modes:
                 messagebox.showerror(
@@ -1797,7 +2147,7 @@ def launch_ui() -> int:
                 )
                 return
 
-            choice = (selected_file_paths, selected_modes)
+            choice = (selected_file_paths, selected_modes, preset_var.get())
             dialog.destroy()
 
         def cancel_and_close() -> None:
@@ -1843,7 +2193,7 @@ def launch_ui() -> int:
         merge_options = ask_lora_merge_options(dataset_name, available)
         if merge_options is None:
             return
-        selected_files, selected_modes = merge_options
+        selected_files, selected_modes, selected_preset_name = merge_options
 
         musubi_python = runtime_config.musubi_python
         if musubi_python is None or not musubi_python.is_file():
@@ -1865,7 +2215,13 @@ def launch_ui() -> int:
         log("")
         created_paths: list[Path] = []
         for merge_mode_label, merge_mode_suffix, merge_mode_args in selected_modes:
-            output_path = next_merged_output_path(dataset_name, output_dir, merge_mode_suffix, selected_files)
+            output_path = next_merged_output_path(
+                dataset_name,
+                output_dir,
+                merge_mode_suffix,
+                selected_preset_name,
+                selected_files,
+            )
             command: list[str]
             if module_script.exists():
                 command = [
@@ -2033,20 +2389,31 @@ def launch_ui() -> int:
         mode_beta_var = tk.BooleanVar(value=True)
         mode_beta2_var = tk.BooleanVar(value=False)
         mode_sigma_var = tk.BooleanVar(value=False)
-        ttk.Label(mode_section, text="Mode(s):").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Checkbutton(mode_section, text="BETA (Default)", variable=mode_beta_var).grid(row=1, column=1, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=2, column=1, sticky="w")
-        ttk.Checkbutton(mode_section, text="SIGMA_REL", variable=mode_sigma_var).grid(row=3, column=1, sticky="w")
+        preset_var = tk.StringVar(value="Balanced")
+        ttk.Label(mode_section, text="Preset:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        preset_combo = ttk.Combobox(
+            mode_section,
+            textvariable=preset_var,
+            values=("Balanced", "Smooth", "Anti-overfit"),
+            state="readonly",
+            width=14,
+        )
+        preset_combo.grid(row=1, column=1, sticky="w", pady=(8, 0))
+        attach_hover_tooltip(preset_combo, merge_preset_tooltip_text)
+        ttk.Label(mode_section, text="Mode(s):").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Checkbutton(mode_section, text="BETA (Default)", variable=mode_beta_var).grid(row=2, column=1, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=3, column=1, sticky="w")
+        ttk.Checkbutton(mode_section, text="SIGMA_REL", variable=mode_sigma_var).grid(row=4, column=1, sticky="w")
 
         output_name_var = tk.StringVar(value="merged_lora")
         output_dir_var = tk.StringVar(value="")
 
-        ttk.Label(mode_section, text="Output name:").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Entry(mode_section, textvariable=output_name_var, style="Flat.TEntry").grid(row=4, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(mode_section, text="Output name:").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Entry(mode_section, textvariable=output_name_var, style="Flat.TEntry").grid(row=5, column=1, sticky="ew", pady=(8, 0))
 
-        ttk.Label(mode_section, text="Output folder:").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(mode_section, text="Output folder:").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         ttk.Label(mode_section, textvariable=output_dir_var, style="PathDisplay.TLabel", anchor="w", padding=(6, 4)).grid(
-            row=5,
+            row=6,
             column=1,
             sticky="ew",
             pady=(8, 0),
@@ -2166,8 +2533,9 @@ def launch_ui() -> int:
             output_name = output_name[:-12] if output_name.lower().endswith(".safetensors") else output_name
             return output_folder, output_name
 
-        def build_output_path(output_folder: Path, output_name: str, mode_suffix: str) -> Path:
-            return output_folder / f"{output_name}_{mode_suffix}.safetensors"
+        def build_output_path(output_folder: Path, output_name: str, mode_suffix: str, preset_name: str) -> Path:
+            preset_token = merge_preset_file_token(preset_name)
+            return output_folder / f"{output_name}_{mode_suffix}_{preset_token}.safetensors"
 
         def run_merge() -> None:
             if len(merge_loras) < 2:
@@ -2175,12 +2543,13 @@ def launch_ui() -> int:
                 return
 
             selected_modes: list[tuple[str, str, list[str]]] = []
+            preset_args = post_hoc_ema_mode_args_for_preset(preset_var.get())
             if mode_beta_var.get():
-                selected_modes.append(("BETA", "Beta", ["--beta", "0.9"]))
+                selected_modes.append(("BETA", "Beta", preset_args["beta"]))
             if mode_beta2_var.get():
-                selected_modes.append(("BETA2", "Beta2", ["--beta", "0.90", "--beta2", "0.95"]))
+                selected_modes.append(("BETA2", "Beta2", preset_args["beta2"]))
             if mode_sigma_var.get():
-                selected_modes.append(("SIGMA_REL", "Sigma", ["--sigma_rel", "0.2"]))
+                selected_modes.append(("SIGMA_REL", "Sigma", preset_args["sigma_rel"]))
             if not selected_modes:
                 messagebox.showerror("Merge unavailable", "Select at least one merge mode.", parent=dialog)
                 return
@@ -2189,10 +2558,11 @@ def launch_ui() -> int:
             if output_base is None:
                 return
             output_folder, output_name = output_base
+            selected_preset_name = preset_var.get()
 
             existing_outputs: list[Path] = []
             for _merge_mode_label, merge_mode_suffix, _merge_mode_args in selected_modes:
-                candidate = build_output_path(output_folder, output_name, merge_mode_suffix)
+                candidate = build_output_path(output_folder, output_name, merge_mode_suffix, selected_preset_name)
                 if candidate.exists():
                     existing_outputs.append(candidate)
             if existing_outputs:
@@ -2214,7 +2584,7 @@ def launch_ui() -> int:
             log("")
             created_paths: list[Path] = []
             for merge_mode_label, merge_mode_suffix, merge_mode_args in selected_modes:
-                output_path = build_output_path(output_folder, output_name, merge_mode_suffix)
+                output_path = build_output_path(output_folder, output_name, merge_mode_suffix, selected_preset_name)
                 command: list[str]
                 if module_script.exists():
                     command = [
@@ -2285,7 +2655,7 @@ def launch_ui() -> int:
         ttk.Button(merge_actions, text="Down", command=move_merge_down).grid(row=0, column=2, padx=(0, 6))
         ttk.Button(merge_actions, text="Clear", command=clear_merge_list).grid(row=0, column=3)
 
-        ttk.Button(mode_section, text="Browse", command=browse_output_folder).grid(row=5, column=2, padx=(8, 0), pady=(8, 0))
+        ttk.Button(mode_section, text="Browse", command=browse_output_folder).grid(row=6, column=2, padx=(8, 0), pady=(8, 0))
 
         ttk.Button(actions, text="Close", command=dialog.destroy).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(actions, text="Go", command=run_merge).grid(row=0, column=2)
@@ -2301,6 +2671,7 @@ def launch_ui() -> int:
         menu.add_separator()
         menu.add_command(label="Open Dataset", command=lambda: open_dataset_in_file_manager(dataset_name))
         menu.add_command(label="Add Images", command=lambda: add_images_to_dataset(dataset_name))
+        menu.add_command(label="Open Metrics (TensorBoard)", command=lambda: launch_tensorboard_for_dataset(dataset_name))
         menu.add_separator()
         has_output_loras = bool(dataset_output_safetensors(dataset_name))
         menu.add_command(
@@ -2958,6 +3329,20 @@ def launch_ui() -> int:
                             settings_state.get(ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY, "0").strip().lower()
                             in {"1", "true", "yes", "on"}
                         ),
+                        enable_training_logging=(
+                            settings_state.get(TRAIN_ENABLE_LOGGING_KEY, "1").strip().lower()
+                            in {"1", "true", "yes", "on"}
+                        ),
+                        training_log_backend=get_train_log_backend_setting(settings_state),
+                        training_log_tracker_name=settings_state.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip(),
+                        save_checkpoint_metadata=(
+                            settings_state.get(TRAIN_SAVE_CHECKPOINT_METADATA_KEY, "0").strip().lower()
+                            in {"1", "true", "yes", "on"}
+                        ),
+                        auto_cleanup_states=(
+                            settings_state.get(TRAIN_AUTO_CLEANUP_STATES_KEY, "1").strip().lower()
+                            in {"1", "true", "yes", "on"}
+                        ),
                         logger=log,
                         do_prep_dataset=True,
                         do_cache_latents=True,
@@ -2999,6 +3384,7 @@ def launch_ui() -> int:
     select_all_button = ttk.Button(controls, text="Select All", command=select_all)
     clear_button = ttk.Button(controls, text="Clear", command=clear_selection)
     create_dataset_button = ttk.Button(controls, text="Create Dataset", command=create_dataset)
+    metrics_viewer_button = ttk.Button(controls, text="Metrics Viewer", command=open_metrics_viewer_dialog)
     lora_merge_tool_button = ttk.Button(controls, text="LoRA Post-Hoc EMA Merge", command=open_lora_merge_tool_dialog)
     settings_button = ttk.Button(controls, text="Settings", command=apply_settings_from_dialog)
     run_button = ttk.Button(start_bar, text="START", command=run_selected, style="StartDisabled.TButton")
@@ -3007,8 +3393,9 @@ def launch_ui() -> int:
     select_all_button.grid(row=0, column=1, padx=(0, 8), sticky="w")
     clear_button.grid(row=0, column=2, padx=(0, 8), sticky="w")
     create_dataset_button.grid(row=0, column=4, padx=(0, 8), sticky="e")
-    lora_merge_tool_button.grid(row=0, column=5, padx=(0, 8), sticky="e")
-    settings_button.grid(row=0, column=6, sticky="e")
+    metrics_viewer_button.grid(row=0, column=5, padx=(0, 8), sticky="e")
+    lora_merge_tool_button.grid(row=0, column=6, padx=(0, 8), sticky="e")
+    settings_button.grid(row=0, column=7, sticky="e")
     run_button.grid(row=0, column=0, sticky="ew")
 
     def on_canvas_configure(event: tk.Event) -> None:
@@ -3072,6 +3459,17 @@ def main() -> int:
             enable_gradient_checkpointing_cpu_offload=(
                 settings.get(ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY, "0").strip().lower()
                 in {"1", "true", "yes", "on"}
+            ),
+            enable_training_logging=(
+                settings.get(TRAIN_ENABLE_LOGGING_KEY, "1").strip().lower() in {"1", "true", "yes", "on"}
+            ),
+            training_log_backend=get_train_log_backend_setting(settings),
+            training_log_tracker_name=settings.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip(),
+            save_checkpoint_metadata=(
+                settings.get(TRAIN_SAVE_CHECKPOINT_METADATA_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
+            ),
+            auto_cleanup_states=(
+                settings.get(TRAIN_AUTO_CLEANUP_STATES_KEY, "1").strip().lower() in {"1", "true", "yes", "on"}
             ),
             logger=print,
             do_prep_dataset=do_prep_dataset,

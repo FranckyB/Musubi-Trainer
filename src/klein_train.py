@@ -200,25 +200,158 @@ def count_text_cache_ready(training_dir: Path, dataset_name: str) -> tuple[int, 
     return ready, len(image_files)
 
 
-def backup_existing_step_checkpoints(output_dir: Path, output_name: str) -> tuple[Path | None, int]:
+def remap_resume_artifacts_to_continued_steps(
+    training_dir: Path,
+    dataset_name: str,
+    resume_step_offset: int,
+    logger: Callable[[str], None],
+) -> None:
+    if resume_step_offset <= 0:
+        return
+
+    output_dir = training_dir / dataset_name / "output"
     if not output_dir.exists() or not output_dir.is_dir():
-        return None, 0
+        return
 
-    pattern = re.compile(rf"^{re.escape(output_name)}-step\d{{8}}\.safetensors$", re.IGNORECASE)
-    step_files = sorted([p for p in output_dir.glob("*.safetensors") if pattern.match(p.name)])
-    if not step_files:
-        return None, 0
+    base_output_name = f"{dataset_name}_Klein"
+    resume_output_name = f"{base_output_name}-resume"
 
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup_dir = output_dir / "backup" / f"resume-pre-{stamp}"
-    backup_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_pattern = re.compile(rf"^{re.escape(resume_output_name)}-step(\d{{8}})\.safetensors$", re.IGNORECASE)
+    state_pattern = re.compile(rf"^{re.escape(resume_output_name)}-step(\d{{8}})-state$", re.IGNORECASE)
 
-    copied = 0
-    for source in step_files:
-        shutil.copy2(source, backup_dir / source.name)
-        copied += 1
+    renamed_ckpts = 0
+    renamed_states = 0
 
-    return backup_dir, copied
+    resume_ckpts: list[tuple[Path, int]] = []
+    for path in output_dir.glob("*.safetensors"):
+        match = ckpt_pattern.match(path.name)
+        if not match:
+            continue
+        resume_ckpts.append((path, int(match.group(1))))
+
+    for source, source_step in sorted(resume_ckpts, key=lambda pair: pair[1]):
+        target_step = source_step + resume_step_offset
+        target = output_dir / f"{base_output_name}-step{target_step:08d}.safetensors"
+        if target.exists():
+            logger(f"  rename warning: target exists, keeping {source.name} (target: {target.name})")
+            continue
+        try:
+            source.rename(target)
+            renamed_ckpts += 1
+        except OSError as exc:
+            logger(f"  rename warning: could not rename {source.name} -> {target.name}: {exc}")
+
+    resume_states: list[tuple[Path, int]] = []
+    for path in output_dir.iterdir():
+        if not path.is_dir():
+            continue
+        match = state_pattern.match(path.name)
+        if not match:
+            continue
+        resume_states.append((path, int(match.group(1))))
+
+    for source, source_step in sorted(resume_states, key=lambda pair: pair[1]):
+        target_step = source_step + resume_step_offset
+        target = output_dir / f"{base_output_name}-step{target_step:08d}-state"
+        if target.exists():
+            logger(f"  rename warning: target exists, keeping {source.name} (target: {target.name})")
+            continue
+        try:
+            source.rename(target)
+            renamed_states += 1
+        except OSError as exc:
+            logger(f"  rename warning: could not rename {source.name} -> {target.name}: {exc}")
+
+    resume_last_state = output_dir / f"{resume_output_name}-state"
+    if resume_last_state.is_dir():
+        target_last_state = output_dir / f"{base_output_name}-state"
+        try:
+            if target_last_state.exists():
+                shutil.rmtree(target_last_state)
+            resume_last_state.rename(target_last_state)
+            logger(f"  rename: {resume_last_state.name} -> {target_last_state.name}")
+        except OSError as exc:
+            logger(
+                f"  rename warning: could not rename {resume_last_state.name} -> {target_last_state.name}: {exc}"
+            )
+
+    if renamed_ckpts > 0 or renamed_states > 0:
+        logger(
+            "  rename: remapped resumed artifacts with continued step numbering "
+            f"(+{resume_step_offset}, checkpoints={renamed_ckpts}, states={renamed_states})"
+        )
+
+
+def _step_state_dirs(output_dir: Path, output_name: str) -> list[tuple[Path, int]]:
+    if not output_dir.exists() or not output_dir.is_dir():
+        return []
+
+    pattern = re.compile(rf"^{re.escape(output_name)}-step(\d{{8}})-state$", re.IGNORECASE)
+    result: list[tuple[Path, int]] = []
+    for item in output_dir.iterdir():
+        if not item.is_dir():
+            continue
+        match = pattern.match(item.name)
+        if not match:
+            continue
+        result.append((item, int(match.group(1))))
+    return sorted(result, key=lambda pair: pair[1])
+
+
+def cleanup_step_states_for_cancel(training_dir: Path, dataset_name: str, logger: Callable[[str], None]) -> None:
+    output_dir = training_dir / dataset_name / "output"
+    output_name = f"{dataset_name}_Klein"
+    step_state_dirs = _step_state_dirs(output_dir, output_name)
+    if not step_state_dirs:
+        return
+
+    _latest_ckpt, latest_step = latest_checkpoint_for_dataset(training_dir, dataset_name)
+    keep_dir: Path | None = None
+
+    if latest_step > 0:
+        for state_dir, state_step in step_state_dirs:
+            if state_step == latest_step:
+                keep_dir = state_dir
+                break
+
+    if keep_dir is None:
+        # Fallback to newest step-state directory if checkpoint and state names do not line up.
+        keep_dir = step_state_dirs[-1][0]
+
+    removed = 0
+    for state_dir, _state_step in step_state_dirs:
+        if state_dir == keep_dir:
+            continue
+        try:
+            shutil.rmtree(state_dir)
+            removed += 1
+        except OSError as exc:
+            logger(f"  cleanup warning: could not remove {state_dir.name}: {exc}")
+
+    logger(f"  cleanup: kept latest resume state {keep_dir.name}, removed {removed} older step state folder(s)")
+
+
+def cleanup_step_states_for_completed_run(training_dir: Path, dataset_name: str, logger: Callable[[str], None]) -> None:
+    output_dir = training_dir / dataset_name / "output"
+    output_name = f"{dataset_name}_Klein"
+    last_state_dir = output_dir / f"{output_name}-state"
+    if not last_state_dir.is_dir():
+        logger(f"  cleanup skipped: final state folder not found ({last_state_dir.name})")
+        return
+
+    step_state_dirs = _step_state_dirs(output_dir, output_name)
+    if not step_state_dirs:
+        return
+
+    removed = 0
+    for state_dir, _state_step in step_state_dirs:
+        try:
+            shutil.rmtree(state_dir)
+            removed += 1
+        except OSError as exc:
+            logger(f"  cleanup warning: could not remove {state_dir.name}: {exc}")
+
+    logger(f"  cleanup: kept final state {last_state_dir.name}, removed {removed} step state folder(s)")
 
 
 def run_command(
@@ -356,11 +489,16 @@ def run_steps_for_model(
     enable_cuda_cudnn_benchmark: bool,
     enable_fp8_dit: bool,
     enable_gradient_checkpointing_cpu_offload: bool,
+    enable_training_logging: bool,
+    training_log_backend: str,
+    training_log_tracker_name: str,
+    save_checkpoint_metadata: bool,
     do_prep_dataset: bool,
     do_cache_latents: bool,
     do_cache_text: bool,
     do_train: bool,
     resume_state_dir: Path | None,
+    resume_step_offset: int,
     warmstart_checkpoint: Path | None,
     train_steps_override: int | None,
     logger: Callable[[str], None],
@@ -393,6 +531,9 @@ def run_steps_for_model(
     dataset_config = dataset_config.resolve()
     output_dir = output_dir.resolve()
     output_name = f"{model_name}_Klein"
+    output_name_for_run = (
+        f"{output_name}-resume" if (resume_state_dir is not None and resume_step_offset > 0) else output_name
+    )
 
     divider = "=" * 58
     logger(divider)
@@ -503,11 +644,6 @@ def run_steps_for_model(
         text_encoder_path = text_encoder_path.resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        if resume_state_dir is not None:
-            backup_dir, copied = backup_existing_step_checkpoints(output_dir, output_name)
-            if copied > 0 and backup_dir is not None:
-                logger(f"  resume safety: backed up {copied} step checkpoint(s) to {backup_dir}")
-
         train_steps_for_run = train_steps_override if train_steps_override is not None else train_steps
         compile_flags: list[str] = []
         if enable_compile_optimizations:
@@ -520,6 +656,22 @@ def run_steps_for_model(
             compile_flags.extend(["--compile_cache_size_limit", "32"])
         fp8_flags = ["--fp8_base", "--fp8_scaled"] if enable_fp8_dit else []
         gc_offload_flags = ["--gradient_checkpointing_cpu_offload"] if enable_gradient_checkpointing_cpu_offload else []
+        logging_flags: list[str] = []
+        if enable_training_logging:
+            log_backend = (training_log_backend or "tensorboard").strip().lower()
+            if log_backend not in {"tensorboard", "wandb", "all"}:
+                log_backend = "tensorboard"
+            logging_dir = runtime_config.training_dir / model_name / "logs"
+            logging_flags.extend([
+                "--log_with",
+                log_backend,
+                "--logging_dir",
+                str(logging_dir),
+            ])
+            tracker_name = training_log_tracker_name.strip()
+            if tracker_name:
+                logging_flags.extend(["--log_tracker_name", tracker_name])
+        metadata_flags = ["--save_checkpoint_metadata"] if save_checkpoint_metadata else []
         train_args = [
             str(musubi_python),
             "flux_2_train_network.py",
@@ -532,7 +684,7 @@ def run_steps_for_model(
             "--timestep_sampling", "flux2_shift",
             "--dataset_config", str(dataset_config),
             "--output_dir", str(output_dir),
-            "--output_name", output_name,
+            "--output_name", output_name_for_run,
             "--network_module", "networks.lora_flux_2",
             "--network_dim", str(network_dim),
             "--network_alpha", str(network_alpha),
@@ -550,6 +702,8 @@ def run_steps_for_model(
             "--seed", "42",
             *fp8_flags,
             *compile_flags,
+            *logging_flags,
+            *metadata_flags,
             *(["--network_weights", str(warmstart_checkpoint)] if warmstart_checkpoint is not None else []),
             *(["--resume", str(resume_state_dir)] if resume_state_dir is not None else []),
         ]
@@ -578,6 +732,11 @@ def train_models(
     enable_cuda_cudnn_benchmark: bool,
     enable_fp8_dit: bool,
     enable_gradient_checkpointing_cpu_offload: bool,
+    enable_training_logging: bool,
+    training_log_backend: str,
+    training_log_tracker_name: str,
+    save_checkpoint_metadata: bool,
+    auto_cleanup_states: bool,
     logger: Callable[[str], None],
     do_prep_dataset: bool,
     do_cache_latents: bool,
@@ -615,6 +774,7 @@ def train_models(
         )
         progress_step = max(resume_step, resume_state_step)
         effective_resume_state: Path | None = None
+        resume_step_offset = 0
         effective_warmstart_checkpoint: Path | None = None
         train_steps_override: int | None = None
 
@@ -625,6 +785,7 @@ def train_models(
         if resume_state_dir is not None and resume_state_step >= resume_step:
             effective_resume_state = resume_state_dir
             known_progress_step = max(resume_step, resume_state_step)
+            resume_step_offset = known_progress_step
             if known_progress_step > 0:
                 train_steps_override = max(1, train_steps - known_progress_step)
             if resume_state_step > 0:
@@ -657,18 +818,41 @@ def train_models(
                 enable_cuda_cudnn_benchmark=enable_cuda_cudnn_benchmark,
                 enable_fp8_dit=enable_fp8_dit,
                 enable_gradient_checkpointing_cpu_offload=enable_gradient_checkpointing_cpu_offload,
+                enable_training_logging=enable_training_logging,
+                training_log_backend=training_log_backend,
+                training_log_tracker_name=training_log_tracker_name,
+                save_checkpoint_metadata=save_checkpoint_metadata,
                 do_prep_dataset=effective_do_prep_dataset,
                 do_cache_latents=effective_do_cache_latents,
                 do_cache_text=effective_do_cache_text,
                 do_train=effective_do_train,
                 resume_state_dir=effective_resume_state,
+                resume_step_offset=resume_step_offset,
                 warmstart_checkpoint=effective_warmstart_checkpoint,
                 train_steps_override=train_steps_override,
                 logger=logger,
                 cancel_requested=cancel_requested,
             )
+            if effective_resume_state is not None and resume_step_offset > 0:
+                remap_resume_artifacts_to_continued_steps(
+                    runtime_config.training_dir,
+                    model_name,
+                    resume_step_offset,
+                    logger,
+                )
+            if auto_cleanup_states:
+                cleanup_step_states_for_completed_run(runtime_config.training_dir, model_name, logger)
             logger(f"[{index}/{len(model_names)}] Completed: {model_name}")
         except TrainingCancelledError:
+            if effective_resume_state is not None and resume_step_offset > 0:
+                remap_resume_artifacts_to_continued_steps(
+                    runtime_config.training_dir,
+                    model_name,
+                    resume_step_offset,
+                    logger,
+                )
+            if auto_cleanup_states:
+                cleanup_step_states_for_cancel(runtime_config.training_dir, model_name, logger)
             logger("Training cancelled by user. Stopping remaining models.")
             return 1
         except Exception as exc:

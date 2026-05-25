@@ -30,6 +30,11 @@ TRAIN_NETWORK_DIM_KEY = "train_network_dim"
 TRAIN_NETWORK_ALPHA_KEY = "train_network_alpha"
 TRAIN_LEARNING_RATE_KEY = "train_learning_rate"
 TRAIN_STEPS_KEY = "train_steps"
+TRAIN_ENABLE_LOGGING_KEY = "train_enable_logging"
+TRAIN_LOG_BACKEND_KEY = "train_log_backend"
+TRAIN_LOG_TRACKER_NAME_KEY = "train_log_tracker_name"
+TRAIN_SAVE_CHECKPOINT_METADATA_KEY = "train_save_checkpoint_metadata"
+TRAIN_AUTO_CLEANUP_STATES_KEY = "train_auto_cleanup_states"
 
 
 def load_settings() -> dict[str, str]:
