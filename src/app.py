@@ -2833,12 +2833,30 @@ def launch_ui() -> int:
         run_in_progress = True
         update_start_button_state()
 
+        def refresh_ui_now_from_worker() -> None:
+            done = threading.Event()
+
+            def do_refresh() -> None:
+                try:
+                    if not root.winfo_exists():
+                        return
+                    rebuild_folder_list(force=True)
+                    update_start_button_state()
+                finally:
+                    done.set()
+
+            try:
+                root.after(0, do_refresh)
+            except Exception:
+                return
+            done.wait(timeout=10)
+
         def background_train() -> None:
             try:
                 log("")
                 log("Training is in progress...")
                 failed_models: list[str] = []
-                for dataset_name in names:
+                for index, dataset_name in enumerate(names, start=1):
                     if run_cancel_event is not None and run_cancel_event.is_set():
                         break
 
@@ -2901,6 +2919,11 @@ def launch_ui() -> int:
                     )
                     if exit_code != 0 and not (run_cancel_event is not None and run_cancel_event.is_set()):
                         failed_models.append(dataset_name)
+
+                    has_next = index < len(names)
+                    if has_next and not (run_cancel_event is not None and run_cancel_event.is_set()):
+                        log("Refreshing dataset list before next model...")
+                        refresh_ui_now_from_worker()
 
                 if run_cancel_event is not None and run_cancel_event.is_set():
                     log("Training cancelled by user.")
