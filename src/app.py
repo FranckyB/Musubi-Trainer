@@ -2053,7 +2053,7 @@ def launch_ui() -> int:
 
         selected_list = tk.Listbox(
             selected_box_frame,
-            selectmode="multiple",
+            selectmode="extended",
             exportselection=False,
             activestyle="none",
             width=1,

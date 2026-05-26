@@ -45,6 +45,18 @@ def latest_checkpoint_for_dataset(training_dir: Path, dataset_name: str) -> tupl
     return latest_path, latest_step
 
 
+def finished_checkpoint_for_dataset(training_dir: Path, dataset_name: str) -> Path | None:
+    output_dir = training_dir / dataset_name / "output"
+    if not output_dir.exists():
+        return None
+
+    finished_path = output_dir / f"{dataset_name}_Klein.safetensors"
+    if finished_path.is_file():
+        return finished_path
+
+    return None
+
+
 def latest_resume_state_for_dataset(training_dir: Path, dataset_name: str, checkpoint_step: int) -> tuple[Path | None, int]:
     output_dir = training_dir / dataset_name / "output"
     if not output_dir.exists():
@@ -261,6 +273,20 @@ def remap_resume_artifacts_to_continued_steps(
             renamed_states += 1
         except OSError as exc:
             logger(f"  rename warning: could not rename {source.name} -> {target.name}: {exc}")
+
+    resume_last_checkpoint = output_dir / f"{resume_output_name}.safetensors"
+    if resume_last_checkpoint.is_file():
+        target_last_checkpoint = output_dir / f"{base_output_name}.safetensors"
+        try:
+            if target_last_checkpoint.exists():
+                target_last_checkpoint.unlink()
+            resume_last_checkpoint.rename(target_last_checkpoint)
+            logger(f"  rename: {resume_last_checkpoint.name} -> {target_last_checkpoint.name}")
+        except OSError as exc:
+            logger(
+                f"  rename warning: could not rename {resume_last_checkpoint.name} -> "
+                f"{target_last_checkpoint.name}: {exc}"
+            )
 
     resume_last_state = output_dir / f"{resume_output_name}-state"
     if resume_last_state.is_dir():
@@ -767,6 +793,7 @@ def train_models(
         effective_do_cache_text = do_cache_text
         effective_do_train = do_train
         resume_checkpoint, resume_step = latest_checkpoint_for_dataset(runtime_config.training_dir, model_name)
+        finished_checkpoint = finished_checkpoint_for_dataset(runtime_config.training_dir, model_name)
         resume_state_dir, resume_state_step = latest_resume_state_for_dataset(
             runtime_config.training_dir,
             model_name,
@@ -784,6 +811,8 @@ def train_models(
 
         if resume_state_dir is not None and resume_state_step >= resume_step:
             effective_resume_state = resume_state_dir
+            if finished_checkpoint is not None:
+                effective_warmstart_checkpoint = finished_checkpoint
             known_progress_step = max(resume_step, resume_state_step)
             resume_step_offset = known_progress_step
             if known_progress_step > 0:
@@ -795,6 +824,8 @@ def train_models(
                 )
             else:
                 logger(f"  resuming optimizer state from {resume_state_dir.name}")
+            if finished_checkpoint is not None:
+                logger(f"  using finished checkpoint weights: {finished_checkpoint.name}")
         elif resume_checkpoint is not None and resume_step > 0:
             effective_warmstart_checkpoint = resume_checkpoint
             train_steps_override = max(1, train_steps - resume_step)
