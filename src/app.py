@@ -1932,6 +1932,14 @@ def launch_ui() -> int:
             "Anti-overfit: Prefer when late checkpoints look overfit and too close to training images."
         )
 
+    def merge_mode_tooltip_text() -> str:
+        return (
+            "Merge mode guide\n"
+            "BETA: Uses a single constant decay rate across all checkpoints.\n"
+            "BETA + BETA2: Interpolates decay from beta to beta2 across the merge order.\n"
+            "SIGMA_REL: Uses Power Function EMA to compute decay schedule and reduce first-checkpoint bias."
+        )
+
     def attach_hover_tooltip(widget: tk.Widget, text_provider: Callable[[], str] | str) -> None:
         tooltip_window: tk.Toplevel | None = None
 
@@ -2027,7 +2035,7 @@ def launch_ui() -> int:
     def ask_lora_merge_options(
         dataset_name: str,
         available_loras: list[Path],
-    ) -> tuple[list[str], list[tuple[str, str, list[str]]], str] | None:
+    ) -> tuple[list[str], list[tuple[str, str, list[str], str]]] | None:
         dialog = tk.Toplevel(root)
         dialog.title("LoRA Post-Hoc EMA Merge")
         dialog.transient(root)
@@ -2035,19 +2043,20 @@ def launch_ui() -> int:
         dialog.resizable(False, False)
         dialog.configure(bg=bg_panel)
         set_dark_title_bar(dialog)
-        dialog.minsize(380, 280)
+        dialog.minsize(380, 460)
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(0, weight=1)
 
         frame = ttk.Frame(dialog, padding=12)
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(1, weight=1)
+        frame.rowconfigure(2, weight=1)
 
         ttk.Label(frame, text=f"LoRAs in output for {dataset_name}:").grid(row=0, column=0, sticky="w")
+        ttk.Label(frame, text="Select the LoRAs you want to merge.").grid(row=1, column=0, sticky="w", pady=(4, 0))
 
         selected_box_frame = ttk.Frame(frame)
-        selected_box_frame.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        selected_box_frame.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
         selected_box_frame.columnconfigure(0, weight=1)
         selected_box_frame.rowconfigure(0, weight=1)
 
@@ -2082,41 +2091,40 @@ def launch_ui() -> int:
         ttk.Label(
             frame,
             text="Post-Hoc EMA smooths checkpoints from the same run into one more stable LoRA.",
-        ).grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ).grid(row=3, column=0, sticky="ew", pady=(10, 0))
 
-        ttk.Label(frame, text="Preset:").grid(row=3, column=0, sticky="w", pady=(10, 0))
-        preset_var = tk.StringVar(value="Balanced")
-        preset_combo = ttk.Combobox(
-            frame,
-            textvariable=preset_var,
-            values=("Balanced", "Smooth", "Anti-overfit"),
-            state="readonly",
-            width=14,
-        )
-        preset_combo.grid(row=4, column=0, sticky="w", pady=(6, 0))
-        attach_hover_tooltip(preset_combo, merge_preset_tooltip_text)
+        options_frame = ttk.Frame(frame)
+        options_frame.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        options_frame.columnconfigure(0, weight=1)
+        options_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(frame, text="Select merge mode(s):").grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        preset_section = ttk.LabelFrame(options_frame, text="Preset(s)", padding=6)
+        preset_section.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        attach_hover_tooltip(preset_section, merge_preset_tooltip_text)
 
-        mode_beta_var = tk.BooleanVar(value=True)
+        mode_section = ttk.LabelFrame(options_frame, text="Mode(s)", padding=6)
+        mode_section.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        attach_hover_tooltip(mode_section, merge_mode_tooltip_text)
+
+        preset_balanced_var = tk.BooleanVar(value=False)
+        preset_smooth_var = tk.BooleanVar(value=False)
+        preset_anti_overfit_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(preset_section, text="Balanced", variable=preset_balanced_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(preset_section, text="Smooth", variable=preset_smooth_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(preset_section, text="Anti-overfit", variable=preset_anti_overfit_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+        mode_beta_var = tk.BooleanVar(value=False)
         mode_beta2_var = tk.BooleanVar(value=False)
         mode_sigma_var = tk.BooleanVar(value=False)
-
-        ttk.Checkbutton(frame, text="BETA (Default)", variable=mode_beta_var).grid(
-            row=6, column=0, sticky="ew", pady=(8, 0)
-        )
-        ttk.Checkbutton(frame, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(
-            row=7, column=0, sticky="ew", pady=(6, 0)
-        )
-        ttk.Checkbutton(frame, text="SIGMA_REL", variable=mode_sigma_var).grid(
-            row=8, column=0, sticky="ew", pady=(6, 0)
-        )
+        ttk.Checkbutton(mode_section, text="BETA (Default)", variable=mode_beta_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(mode_section, text="SIGMA_REL", variable=mode_sigma_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
 
         button_row = ttk.Frame(frame)
-        button_row.grid(row=9, column=0, sticky="ew", pady=(12, 0))
+        button_row.grid(row=5, column=0, sticky="ew", pady=(12, 0))
         button_row.columnconfigure(0, weight=1)
 
-        choice: tuple[list[str], list[tuple[str, str, list[str]]], str] | None = None
+        choice: tuple[list[str], list[tuple[str, str, list[str], str]]] | None = None
 
         def choose_and_close() -> None:
             nonlocal choice
@@ -2130,16 +2138,30 @@ def launch_ui() -> int:
                 )
                 return
 
-            selected_modes: list[tuple[str, str, list[str]]] = []
-            preset_args = post_hoc_ema_mode_args_for_preset(preset_var.get())
-            if mode_beta_var.get():
-                selected_modes.append(("BETA", "Beta", preset_args["beta"]))
-            if mode_beta2_var.get():
-                selected_modes.append(("BETA2", "Beta2", preset_args["beta2"]))
-            if mode_sigma_var.get():
-                selected_modes.append(("SIGMA_REL", "Sigma", preset_args["sigma_rel"]))
+            selected_preset_names: list[str] = []
+            if preset_balanced_var.get():
+                selected_preset_names.append("Balanced")
+            if preset_smooth_var.get():
+                selected_preset_names.append("Smooth")
+            if preset_anti_overfit_var.get():
+                selected_preset_names.append("Anti-overfit")
+            if not selected_preset_names:
+                messagebox.showerror(
+                    "Merge unavailable",
+                    "Select at least one preset.",
+                    parent=dialog,
+                )
+                return
 
-            if not selected_modes:
+            mode_defs: list[tuple[str, str, str]] = []
+            if mode_beta_var.get():
+                mode_defs.append(("BETA", "Beta", "beta"))
+            if mode_beta2_var.get():
+                mode_defs.append(("BETA2", "Beta2", "beta2"))
+            if mode_sigma_var.get():
+                mode_defs.append(("SIGMA_REL", "Sigma", "sigma_rel"))
+
+            if not mode_defs:
                 messagebox.showerror(
                     "Merge unavailable",
                     "Select at least one merge mode.",
@@ -2147,7 +2169,13 @@ def launch_ui() -> int:
                 )
                 return
 
-            choice = (selected_file_paths, selected_modes, preset_var.get())
+            selected_jobs: list[tuple[str, str, list[str], str]] = []
+            for preset_name in selected_preset_names:
+                preset_args = post_hoc_ema_mode_args_for_preset(preset_name)
+                for mode_label, mode_suffix, mode_key in mode_defs:
+                    selected_jobs.append((mode_label, mode_suffix, preset_args[mode_key], preset_name))
+
+            choice = (selected_file_paths, selected_jobs)
             dialog.destroy()
 
         def cancel_and_close() -> None:
@@ -2162,7 +2190,7 @@ def launch_ui() -> int:
 
         dialog.update_idletasks()
         requested_width = max(390, dialog.winfo_reqwidth())
-        requested_height = max(360, dialog.winfo_reqheight())
+        requested_height = max(500, dialog.winfo_reqheight())
         dialog.geometry(f"{requested_width}x{requested_height}")
         center_window(dialog)
         dialog.focus_set()
@@ -2193,7 +2221,7 @@ def launch_ui() -> int:
         merge_options = ask_lora_merge_options(dataset_name, available)
         if merge_options is None:
             return
-        selected_files, selected_modes, selected_preset_name = merge_options
+        selected_files, selected_jobs = merge_options
 
         musubi_python = runtime_config.musubi_python
         if musubi_python is None or not musubi_python.is_file():
@@ -2214,12 +2242,12 @@ def launch_ui() -> int:
 
         log("")
         created_paths: list[Path] = []
-        for merge_mode_label, merge_mode_suffix, merge_mode_args in selected_modes:
+        for merge_mode_label, merge_mode_suffix, merge_mode_args, preset_name in selected_jobs:
             output_path = next_merged_output_path(
                 dataset_name,
                 output_dir,
                 merge_mode_suffix,
-                selected_preset_name,
+                preset_name,
                 selected_files,
             )
             command: list[str]
@@ -2245,7 +2273,7 @@ def launch_ui() -> int:
 
             log(
                 f"[Post-Hoc EMA] Merging {len(selected_files)} checkpoint(s) for '{dataset_name}' "
-                f"using {merge_mode_label}..."
+                f"using {merge_mode_label} / {preset_name}..."
             )
             result = subprocess.run(
                 command,
@@ -2262,13 +2290,13 @@ def launch_ui() -> int:
 
             if result.returncode != 0:
                 message = stderr_text if stderr_text else "lora_post_hoc_ema.py failed with no error output."
-                log(f"[Post-Hoc EMA] Failed ({result.returncode}) while running {merge_mode_label}.")
+                log(f"[Post-Hoc EMA] Failed ({result.returncode}) while running {merge_mode_label} / {preset_name}.")
                 if stderr_text:
                     log(stderr_text)
                 messagebox.showerror("Post-Hoc EMA merge failed", message, parent=root)
                 return
 
-            log(f"[Post-Hoc EMA] Created ({merge_mode_suffix}): {output_path}")
+            log(f"[Post-Hoc EMA] Created ({merge_mode_suffix} / {preset_name}): {output_path}")
             if stderr_text:
                 log(stderr_text)
             created_paths.append(output_path)
@@ -2379,6 +2407,7 @@ def launch_ui() -> int:
 
         mode_section = ttk.LabelFrame(frame, text="Merge options", padding=8)
         mode_section.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        mode_section.columnconfigure(0, weight=1)
         mode_section.columnconfigure(1, weight=1)
 
         ttk.Label(
@@ -2386,34 +2415,36 @@ def launch_ui() -> int:
             text="Post-Hoc EMA smooths checkpoints from the same run into one more stable LoRA.",
         ).grid(row=0, column=0, columnspan=2, sticky="w")
 
-        mode_beta_var = tk.BooleanVar(value=True)
+        mode_beta_var = tk.BooleanVar(value=False)
         mode_beta2_var = tk.BooleanVar(value=False)
         mode_sigma_var = tk.BooleanVar(value=False)
-        preset_var = tk.StringVar(value="Balanced")
-        ttk.Label(mode_section, text="Preset:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        preset_combo = ttk.Combobox(
-            mode_section,
-            textvariable=preset_var,
-            values=("Balanced", "Smooth", "Anti-overfit"),
-            state="readonly",
-            width=14,
-        )
-        preset_combo.grid(row=1, column=1, sticky="w", pady=(8, 0))
-        attach_hover_tooltip(preset_combo, merge_preset_tooltip_text)
-        ttk.Label(mode_section, text="Mode(s):").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Checkbutton(mode_section, text="BETA (Default)", variable=mode_beta_var).grid(row=2, column=1, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=3, column=1, sticky="w")
-        ttk.Checkbutton(mode_section, text="SIGMA_REL", variable=mode_sigma_var).grid(row=4, column=1, sticky="w")
+        preset_balanced_var = tk.BooleanVar(value=False)
+        preset_smooth_var = tk.BooleanVar(value=False)
+        preset_anti_overfit_var = tk.BooleanVar(value=False)
+
+        preset_section = ttk.LabelFrame(mode_section, text="Preset(s)", padding=6)
+        preset_section.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(8, 0))
+        attach_hover_tooltip(preset_section, merge_preset_tooltip_text)
+        ttk.Checkbutton(preset_section, text="Balanced", variable=preset_balanced_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(preset_section, text="Smooth", variable=preset_smooth_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(preset_section, text="Anti-overfit", variable=preset_anti_overfit_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+        mode_group = ttk.LabelFrame(mode_section, text="Mode(s)", padding=6)
+        mode_group.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(8, 0))
+        attach_hover_tooltip(mode_group, merge_mode_tooltip_text)
+        ttk.Checkbutton(mode_group, text="BETA (Default)", variable=mode_beta_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(mode_group, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(mode_group, text="SIGMA_REL", variable=mode_sigma_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
 
         output_name_var = tk.StringVar(value="merged_lora")
         output_dir_var = tk.StringVar(value="")
 
-        ttk.Label(mode_section, text="Output name:").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Entry(mode_section, textvariable=output_name_var, style="Flat.TEntry").grid(row=5, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(mode_section, text="Output name:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Entry(mode_section, textvariable=output_name_var, style="Flat.TEntry").grid(row=2, column=1, sticky="ew", pady=(8, 0))
 
-        ttk.Label(mode_section, text="Output folder:").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(mode_section, text="Output folder:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         ttk.Label(mode_section, textvariable=output_dir_var, style="PathDisplay.TLabel", anchor="w", padding=(6, 4)).grid(
-            row=6,
+            row=3,
             column=1,
             sticky="ew",
             pady=(8, 0),
@@ -2542,15 +2573,25 @@ def launch_ui() -> int:
                 messagebox.showerror("Merge unavailable", "Add at least 2 LoRAs to merge list.", parent=dialog)
                 return
 
-            selected_modes: list[tuple[str, str, list[str]]] = []
-            preset_args = post_hoc_ema_mode_args_for_preset(preset_var.get())
+            selected_preset_names: list[str] = []
+            if preset_balanced_var.get():
+                selected_preset_names.append("Balanced")
+            if preset_smooth_var.get():
+                selected_preset_names.append("Smooth")
+            if preset_anti_overfit_var.get():
+                selected_preset_names.append("Anti-overfit")
+            if not selected_preset_names:
+                messagebox.showerror("Merge unavailable", "Select at least one preset.", parent=dialog)
+                return
+
+            mode_defs: list[tuple[str, str, str]] = []
             if mode_beta_var.get():
-                selected_modes.append(("BETA", "Beta", preset_args["beta"]))
+                mode_defs.append(("BETA", "Beta", "beta"))
             if mode_beta2_var.get():
-                selected_modes.append(("BETA2", "Beta2", preset_args["beta2"]))
+                mode_defs.append(("BETA2", "Beta2", "beta2"))
             if mode_sigma_var.get():
-                selected_modes.append(("SIGMA_REL", "Sigma", preset_args["sigma_rel"]))
-            if not selected_modes:
+                mode_defs.append(("SIGMA_REL", "Sigma", "sigma_rel"))
+            if not mode_defs:
                 messagebox.showerror("Merge unavailable", "Select at least one merge mode.", parent=dialog)
                 return
 
@@ -2558,11 +2599,16 @@ def launch_ui() -> int:
             if output_base is None:
                 return
             output_folder, output_name = output_base
-            selected_preset_name = preset_var.get()
+
+            selected_jobs: list[tuple[str, str, list[str], str]] = []
+            for preset_name in selected_preset_names:
+                preset_args = post_hoc_ema_mode_args_for_preset(preset_name)
+                for mode_label, mode_suffix, mode_key in mode_defs:
+                    selected_jobs.append((mode_label, mode_suffix, preset_args[mode_key], preset_name))
 
             existing_outputs: list[Path] = []
-            for _merge_mode_label, merge_mode_suffix, _merge_mode_args in selected_modes:
-                candidate = build_output_path(output_folder, output_name, merge_mode_suffix, selected_preset_name)
+            for _merge_mode_label, merge_mode_suffix, _merge_mode_args, preset_name in selected_jobs:
+                candidate = build_output_path(output_folder, output_name, merge_mode_suffix, preset_name)
                 if candidate.exists():
                     existing_outputs.append(candidate)
             if existing_outputs:
@@ -2583,8 +2629,8 @@ def launch_ui() -> int:
 
             log("")
             created_paths: list[Path] = []
-            for merge_mode_label, merge_mode_suffix, merge_mode_args in selected_modes:
-                output_path = build_output_path(output_folder, output_name, merge_mode_suffix, selected_preset_name)
+            for merge_mode_label, merge_mode_suffix, merge_mode_args, preset_name in selected_jobs:
+                output_path = build_output_path(output_folder, output_name, merge_mode_suffix, preset_name)
                 command: list[str]
                 if module_script.exists():
                     command = [
@@ -2608,7 +2654,10 @@ def launch_ui() -> int:
                         *merge_mode_args,
                     ]
 
-                log(f"[LoRA Post-Hoc EMA Merge] Merging {len(selected_files)} LoRA(s) using {merge_mode_label}...")
+                log(
+                    f"[LoRA Post-Hoc EMA Merge] Merging {len(selected_files)} LoRA(s) "
+                    f"using {merge_mode_label} / {preset_name}..."
+                )
                 log(f"[LoRA Post-Hoc EMA Merge] Output: {output_path}")
 
                 result = subprocess.run(
@@ -2623,7 +2672,10 @@ def launch_ui() -> int:
                     log(result.stdout.strip())
 
                 if result.returncode != 0:
-                    log(f"[LoRA Post-Hoc EMA Merge] Failed ({result.returncode}) while running {merge_mode_label}.")
+                    log(
+                        f"[LoRA Post-Hoc EMA Merge] Failed ({result.returncode}) "
+                        f"while running {merge_mode_label} / {preset_name}."
+                    )
                     if result.stderr.strip():
                         log(result.stderr.strip())
                     messagebox.showerror(
@@ -2635,7 +2687,7 @@ def launch_ui() -> int:
 
                 if result.stderr.strip():
                     log(result.stderr.strip())
-                log(f"[LoRA Post-Hoc EMA Merge] Created ({merge_mode_suffix}): {output_path}")
+                log(f"[LoRA Post-Hoc EMA Merge] Created ({merge_mode_suffix} / {preset_name}): {output_path}")
                 created_paths.append(output_path)
 
             created_text = "\n".join(str(path) for path in created_paths)
