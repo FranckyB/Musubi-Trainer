@@ -38,9 +38,19 @@ Expected training layout under this repo:
 ## Requirements
 
 - Python 3.10+ recommended
-- Pillow (for thumbnails/UI image handling)
+- App dependencies from requirements.txt (Pillow, tkinterdnd2)
 - Musubi-Tuner checkout in a separate folder (for example D:/Musubi-Tuner)
 - Musubi-Tuner virtual environment with required dependencies installed
+
+## App Setup (venv)
+
+From repository root (first time, or after dependency changes):
+
+```bat
+Setup.bat
+```
+
+This creates a local `venv` and installs app dependencies from `requirements.txt`.
 
 ## Launch
 
@@ -49,6 +59,8 @@ From repository root:
 ```bat
 Launch.bat
 ```
+
+`Launch.bat` prefers `venv\Scripts\pythonw.exe` / `venv\Scripts\python.exe` first.
 
 ## First-Time Setup
 
@@ -80,6 +92,11 @@ You can also set a manual Python path in Settings.
 When a step is already complete, it is logged as skipped instead of silently omitted.
 
 If one dataset fails, the queue continues with the next dataset.
+
+## LoRA Merge Drag-and-Drop
+
+- The standalone LoRA merge tool supports dragging `.safetensors` files onto the LoRAs list or Merge order list.
+- This uses `tkinterdnd2`, installed by `Setup.bat` through `requirements.txt`.
 
 ## Cancel Behavior
 
