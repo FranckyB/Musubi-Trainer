@@ -6,9 +6,11 @@ import json
 import configparser
 import ctypes
 import math
+import socket
 import shutil
 import subprocess
 import threading
+import webbrowser
 from pathlib import Path
 from typing import Callable
 
@@ -33,12 +35,14 @@ from .app_settings import (
     TRAIN_LEARNING_RATE_KEY,
     TRAIN_LOG_BACKEND_KEY,
     TRAIN_LOG_TRACKER_NAME_KEY,
+    TRAIN_STREAM_TO_LOGGER_KEY,
+    TRAIN_AUTO_START_TENSORBOARD_KEY,
     TRAIN_AUTO_CLEANUP_STATES_KEY,
     TRAIN_NETWORK_ALPHA_KEY,
     TRAIN_NETWORK_DIM_KEY,
+    TRAIN_OPTIMIZER_TYPE_KEY,
     TRAIN_ENABLE_LOGGING_KEY,
     TRAIN_RESOLUTION_KEY,
-    TRAIN_SAVE_CHECKPOINT_METADATA_KEY,
     TRAIN_STEPS_KEY,
     WINDOW_HEIGHT_KEY,
     WINDOW_WIDTH_KEY,
@@ -69,6 +73,7 @@ DRAG_START_THRESHOLD_PX = 20
 DATASET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 DATASET_SETTINGS_FILE_NAME = "settings.json"
 DATASET_USE_GLOBAL_TRAIN_KEY = "use_global_train_settings"
+TRAIN_DIM_ALPHA_CHOICES = ("16", "32", "64")
 
 
 def get_positive_int_setting(settings: dict[str, str], key: str, fallback: int, minimum: int = 1) -> int:
@@ -83,13 +88,18 @@ def get_learning_rate_setting(settings: dict[str, str]) -> str:
     return value if value else DEFAULT_LEARNING_RATE
 
 
+def get_train_optimizer_setting(settings: dict[str, str]) -> str:
+    value = settings.get(TRAIN_OPTIMIZER_TYPE_KEY, "").strip().lower()
+    return value if value in {"adamw8bit", "prodigy"} else "prodigy"
+
+
 def get_train_log_backend_setting(settings: dict[str, str]) -> str:
-    value = settings.get(TRAIN_LOG_BACKEND_KEY, "").strip().lower()
-    return value if value in {"tensorboard", "wandb", "all"} else "tensorboard"
+    _value = settings.get(TRAIN_LOG_BACKEND_KEY, "").strip().lower()
+    return "tensorboard"
 
 
 def dataset_log_dir(training_dir: Path, dataset_name: str) -> Path:
-    return training_dir / dataset_name / "logs"
+    return training_dir.parent / "logs"
 
 
 def is_truthy(raw_value: str | None, default: bool = False) -> bool:
@@ -234,6 +244,13 @@ def launch_ui() -> int:
         from tkinter import filedialog, messagebox, simpledialog
         from tkinter import ttk
         from PIL import Image, ImageDraw, ImageTk
+        try:
+            from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore
+            tkdnd_available = True
+        except Exception:
+            DND_FILES = None  # type: ignore[assignment]
+            TkinterDnD = None  # type: ignore[assignment]
+            tkdnd_available = False
     except ImportError:
         print("Tkinter and Pillow are required for the visual launcher.")
         print("Use CLI mode with names and step flags, or install Pillow.")
@@ -283,7 +300,10 @@ def launch_ui() -> int:
         pos_y = max(0, (screen_h - height) // 2)
         window.geometry(f"+{pos_x}+{pos_y}")
 
-    root = tk.Tk()
+    if tkdnd_available and TkinterDnD is not None:
+        root = TkinterDnD.Tk()
+    else:
+        root = tk.Tk()
     root.title("Musubi Training Launcher")
     root.geometry(f"{ui_config['window_width']}x{ui_config['window_height']}")
     root.minsize(ui_config["min_window_width"], ui_config["min_window_height"])
@@ -355,6 +375,7 @@ def launch_ui() -> int:
     def on_root_close() -> None:
         if (not settings_reset_requested) and window_position_applied and root.winfo_exists():
             save_main_window_position_now()
+        stop_tensorboard_started_by_app()
         root.destroy()
 
     root.bind("<Configure>", schedule_main_window_position_save)
@@ -622,7 +643,145 @@ def launch_ui() -> int:
     drag_moved = False
     drag_start_x: int | None = None
     drag_start_y: int | None = None
+    tensorboard_launch_in_progress = False
+    tensorboard_started_by_app = False
+    tensorboard_process: subprocess.Popen | None = None
+    metrics_viewer_button: ttk.Button | None = None
     runtime_config = klein_runtime_config_from_settings(settings_state)
+    tensorboard_host = "127.0.0.1"
+    tensorboard_port = 6006
+    tensorboard_url = f"http://{tensorboard_host}:{tensorboard_port}"
+
+    def is_tensorboard_running() -> bool:
+        try:
+            with socket.create_connection((tensorboard_host, tensorboard_port), timeout=0.3):
+                return True
+        except OSError:
+            return False
+
+    def python_has_module(python_path: Path, module_name: str) -> bool:
+        if not python_path.is_file():
+            return False
+        try:
+            result = subprocess.run(
+                [str(python_path), "-c", f"import {module_name}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+            )
+        except Exception:
+            return False
+        return result.returncode == 0
+
+    def resolve_tensorboard_python() -> Path | None:
+        if runtime_config is None or runtime_config.musubi_python is None:
+            return None
+
+        musubi_python = runtime_config.musubi_python
+        if python_has_module(musubi_python, "tensorboard"):
+            return musubi_python
+
+        return None
+
+    def launch_tensorboard_background() -> bool:
+        nonlocal tensorboard_started_by_app, tensorboard_process
+        if is_tensorboard_running():
+            return True
+        if runtime_config is None:
+            return False
+
+        logs_root = runtime_config.training_dir.parent / "logs"
+        try:
+            logs_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f"[Metrics Viewer] Could not create logs directory: {exc}")
+            return False
+
+        python_path = resolve_tensorboard_python()
+        if python_path is None:
+            print(
+                "[Metrics Viewer] TensorBoard is not installed in configured Musubi Python."
+            )
+            return False
+
+        command = [
+            str(python_path),
+            "-m",
+            "tensorboard.main",
+            "--logdir",
+            str(logs_root),
+            "--port",
+            str(tensorboard_port),
+            "--reload_interval",
+            "5",
+        ]
+
+        popen_kwargs: dict[str, object] = {
+            "cwd": str(logs_root),
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = (
+                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
+
+        try:
+            process = subprocess.Popen(command, **popen_kwargs)
+            tensorboard_process = process
+            tensorboard_started_by_app = True
+        except OSError as exc:
+            print(f"[Metrics Viewer] Could not start TensorBoard: {exc}")
+            return False
+
+        for _ in range(30):
+            if is_tensorboard_running():
+                return True
+            if process.poll() is not None:
+                print("[Metrics Viewer] TensorBoard process exited before becoming ready.")
+                return False
+            time.sleep(0.1)
+
+        # Slow startup is common; if the process is still alive, treat this as launched.
+        if process.poll() is None:
+            print("[Metrics Viewer] TensorBoard is still starting in the background.")
+            return True
+
+        return False
+
+    def stop_tensorboard_started_by_app() -> None:
+        nonlocal tensorboard_started_by_app, tensorboard_process
+        if not tensorboard_started_by_app:
+            return
+        if tensorboard_process is None:
+            return
+
+        if tensorboard_process.poll() is not None:
+            tensorboard_started_by_app = False
+            tensorboard_process = None
+            return
+
+        try:
+            tensorboard_process.terminate()
+            tensorboard_process.wait(timeout=3)
+        except Exception:
+            try:
+                tensorboard_process.kill()
+                tensorboard_process.wait(timeout=3)
+            except Exception:
+                pass
+        finally:
+            tensorboard_started_by_app = False
+            tensorboard_process = None
+
+    def maybe_autostart_tensorboard() -> None:
+        if runtime_config is None:
+            return
+        if settings_state.get(TRAIN_AUTO_START_TENSORBOARD_KEY, "0").strip().lower() not in {"1", "true", "yes", "on"}:
+            return
+        threading.Thread(target=launch_tensorboard_background, daemon=True).start()
 
     def persist_dataset_order() -> None:
         nonlocal settings_state
@@ -638,6 +797,7 @@ def launch_ui() -> int:
             TRAIN_NETWORK_ALPHA_KEY: str(
                 get_positive_int_setting(settings_state, TRAIN_NETWORK_ALPHA_KEY, DEFAULT_NETWORK_ALPHA)
             ),
+            TRAIN_OPTIMIZER_TYPE_KEY: get_train_optimizer_setting(settings_state),
             TRAIN_LEARNING_RATE_KEY: get_learning_rate_setting(settings_state),
             TRAIN_STEPS_KEY: str(get_positive_int_setting(settings_state, TRAIN_STEPS_KEY, DEFAULT_TRAIN_STEPS)),
         }
@@ -697,6 +857,11 @@ def launch_ui() -> int:
             ),
             TRAIN_NETWORK_ALPHA_KEY: str(
                 get_positive_int_setting(raw, TRAIN_NETWORK_ALPHA_KEY, int(global_values[TRAIN_NETWORK_ALPHA_KEY]))
+            ),
+            TRAIN_OPTIMIZER_TYPE_KEY: (
+                raw.get(TRAIN_OPTIMIZER_TYPE_KEY, "").strip().lower()
+                if raw.get(TRAIN_OPTIMIZER_TYPE_KEY, "").strip().lower() in {"adamw8bit", "prodigy"}
+                else global_values[TRAIN_OPTIMIZER_TYPE_KEY]
             ),
             TRAIN_LEARNING_RATE_KEY: raw.get(TRAIN_LEARNING_RATE_KEY, "").strip() or global_values[TRAIN_LEARNING_RATE_KEY],
             TRAIN_STEPS_KEY: str(get_positive_int_setting(raw, TRAIN_STEPS_KEY, int(global_values[TRAIN_STEPS_KEY]))),
@@ -760,6 +925,7 @@ def launch_ui() -> int:
             TRAIN_NETWORK_ALPHA_KEY,
             DEFAULT_NETWORK_ALPHA,
         )
+        current_train_optimizer = get_train_optimizer_setting(settings_state)
         current_train_learning_rate = get_learning_rate_setting(settings_state)
         current_train_steps = get_positive_int_setting(
             settings_state,
@@ -775,10 +941,18 @@ def launch_ui() -> int:
             "yes",
             "on",
         }
-        current_train_log_backend = get_train_log_backend_setting(settings_state)
         current_train_log_tracker_name = settings_state.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip()
-        current_save_checkpoint_metadata = settings_state.get(
-            TRAIN_SAVE_CHECKPOINT_METADATA_KEY,
+        current_train_stream_to_logger = settings_state.get(
+            TRAIN_STREAM_TO_LOGGER_KEY,
+            "0",
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        current_auto_start_tensorboard = settings_state.get(
+            TRAIN_AUTO_START_TENSORBOARD_KEY,
             "0",
         ).strip().lower() in {
             "1",
@@ -824,20 +998,28 @@ def launch_ui() -> int:
         musubi_section.grid(row=0, column=0, sticky="ew")
         musubi_section.columnconfigure(1, weight=1)
 
+        klein_toggle_var = tk.BooleanVar(value=False)
+        klein_toggle = ttk.Checkbutton(frame, text="Show Klein settings", variable=klein_toggle_var)
+        klein_toggle.grid(row=1, column=0, sticky="w", pady=(10, 0))
+
         klein_section = ttk.LabelFrame(frame, text="Klein", padding=8)
-        klein_section.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        klein_section.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         klein_section.columnconfigure(1, weight=1)
 
+        ltx_toggle_var = tk.BooleanVar(value=False)
+        ltx_toggle = ttk.Checkbutton(frame, text="Show LTX settings", variable=ltx_toggle_var)
+        ltx_toggle.grid(row=3, column=0, sticky="w", pady=(10, 0))
+
         ltx_section = ttk.LabelFrame(frame, text="LTX", padding=8)
-        ltx_section.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ltx_section.grid(row=4, column=0, sticky="ew", pady=(6, 0))
         ltx_section.columnconfigure(1, weight=1)
 
         captions_section = ttk.LabelFrame(frame, text="Captions", padding=8)
-        captions_section.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        captions_section.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         captions_section.columnconfigure(1, weight=1)
 
-        advanced_section = ttk.LabelFrame(frame, text="Advanced", padding=8)
-        advanced_section.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        advanced_section = ttk.LabelFrame(frame, text="Training", padding=8)
+        advanced_section.grid(row=6, column=0, sticky="ew", pady=(10, 0))
         advanced_section.columnconfigure(0, weight=0)
         advanced_section.columnconfigure(1, weight=1)
         advanced_section.columnconfigure(2, weight=0)
@@ -869,14 +1051,19 @@ def launch_ui() -> int:
         fp8_dit_var = tk.BooleanVar(value=current_fp8_dit)
         gc_cpu_offload_var = tk.BooleanVar(value=current_gc_cpu_offload)
         train_resolution_var = tk.StringVar(value=str(current_train_resolution))
-        train_network_dim_var = tk.StringVar(value=str(current_train_network_dim))
-        train_network_alpha_var = tk.StringVar(value=str(current_train_network_alpha))
+        train_network_dim_var = tk.StringVar(
+            value=str(current_train_network_dim) if str(current_train_network_dim) in TRAIN_DIM_ALPHA_CHOICES else "32"
+        )
+        train_network_alpha_var = tk.StringVar(
+            value=str(current_train_network_alpha) if str(current_train_network_alpha) in TRAIN_DIM_ALPHA_CHOICES else "32"
+        )
+        train_optimizer_var = tk.StringVar(value=current_train_optimizer)
         train_learning_rate_var = tk.StringVar(value=current_train_learning_rate)
         train_steps_var = tk.StringVar(value=str(current_train_steps))
         enable_training_logging_var = tk.BooleanVar(value=current_enable_training_logging)
-        train_log_backend_var = tk.StringVar(value=current_train_log_backend)
         train_log_tracker_name_var = tk.StringVar(value=current_train_log_tracker_name)
-        save_checkpoint_metadata_var = tk.BooleanVar(value=current_save_checkpoint_metadata)
+        stream_to_logger_var = tk.BooleanVar(value=current_train_stream_to_logger)
+        auto_start_tensorboard_var = tk.BooleanVar(value=current_auto_start_tensorboard)
         auto_cleanup_states_var = tk.BooleanVar(value=current_auto_cleanup_states)
 
         ttk.Label(musubi_section, text="Musubi-Tuner folder:").grid(row=0, column=0, sticky="w", padx=(0, 8))
@@ -914,98 +1101,134 @@ def launch_ui() -> int:
             pady=(6, 0),
         )
 
-        ttk.Label(advanced_section, text="Training steps:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(advanced_section, textvariable=train_steps_var, style="Flat.TEntry").grid(row=0, column=1, sticky="ew")
-        ttk.Label(advanced_section, text="Learning rate:").grid(row=0, column=2, sticky="w", padx=(12, 8))
-        ttk.Entry(advanced_section, textvariable=train_learning_rate_var, style="Flat.TEntry").grid(
-            row=0,
-            column=3,
-            sticky="ew",
-        )
+        training_settings_section = ttk.LabelFrame(advanced_section, text="Training settings", padding=8)
+        training_settings_section.grid(row=0, column=0, columnspan=4, sticky="ew")
+        training_settings_section.columnconfigure(0, weight=0)
+        training_settings_section.columnconfigure(1, weight=1)
+        training_settings_section.columnconfigure(2, weight=0)
+        training_settings_section.columnconfigure(3, weight=1)
 
-        ttk.Label(advanced_section, text="LoRA network dim:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Entry(advanced_section, textvariable=train_network_dim_var, style="Flat.TEntry").grid(
-            row=1,
-            column=1,
-            sticky="ew",
-            pady=(6, 0),
+        ttk.Label(training_settings_section, text="Optimizer type:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        train_optimizer_combo = ttk.Combobox(
+            training_settings_section,
+            textvariable=train_optimizer_var,
+            values=("adamw8bit", "prodigy"),
+            state="readonly",
+            width=16,
         )
-        ttk.Label(advanced_section, text="LoRA network alpha:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
-        ttk.Entry(advanced_section, textvariable=train_network_alpha_var, style="Flat.TEntry").grid(
-            row=1,
-            column=3,
-            sticky="ew",
-            pady=(6, 0),
-        )
+        train_optimizer_combo.grid(row=0, column=1, sticky="ew")
+        ttk.Label(training_settings_section, text="Training steps:").grid(row=0, column=2, sticky="w", padx=(12, 8))
+        ttk.Entry(training_settings_section, textvariable=train_steps_var, style="Flat.TEntry").grid(row=0, column=3, sticky="ew")
 
-        ttk.Label(advanced_section, text="Dataset resolution:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Entry(advanced_section, textvariable=train_resolution_var, style="Flat.TEntry").grid(
+        ttk.Label(training_settings_section, text="Learning rate:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        train_learning_rate_entry = ttk.Entry(training_settings_section, textvariable=train_learning_rate_var, style="Flat.TEntry")
+        train_learning_rate_entry.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        ttk.Label(training_settings_section, text="LoRA network dim:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        ttk.Combobox(
+            training_settings_section,
+            textvariable=train_network_dim_var,
+            values=TRAIN_DIM_ALPHA_CHOICES,
+            state="readonly",
+            width=10,
+        ).grid(row=1, column=3, sticky="ew", pady=(6, 0))
+
+        ttk.Label(training_settings_section, text="Dataset resolution:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Entry(training_settings_section, textvariable=train_resolution_var, style="Flat.TEntry").grid(
             row=2,
             column=1,
             sticky="ew",
             pady=(6, 0),
         )
-
-        ttk.Checkbutton(
-            advanced_section,
-            text="Enable Torch Compile (Turn off if you have issues)",
-            variable=compile_optimizations_var,
-        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
-        ttk.Checkbutton(
-            advanced_section,
-            text="Enable Allow TF32 (For newer GPU, improves performance)",
-            variable=cuda_allow_tf32_var,
-        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(
-            advanced_section,
-            text="Enable cuDNN Benchmark (May improve performance)",
-            variable=cuda_cudnn_benchmark_var,
-        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(
-            advanced_section,
-            text="Enable FP8 (Low Vram)",
-            variable=fp8_dit_var,
-        ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(
-            advanced_section,
-            text="Enable CPU Gradient Checkpointing (Low Ram)",
-            variable=gc_cpu_offload_var,
-        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(6, 0))
-
-        ttk.Separator(advanced_section, orient="horizontal").grid(row=8, column=0, columnspan=4, sticky="ew", pady=(10, 2))
-        ttk.Checkbutton(
-            advanced_section,
-            text="Enable training logs",
-            variable=enable_training_logging_var,
-        ).grid(row=9, column=0, columnspan=4, sticky="w", pady=(2, 0))
-        ttk.Label(advanced_section, text="Log backend:").grid(row=10, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Label(training_settings_section, text="LoRA network alpha:").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
         ttk.Combobox(
-            advanced_section,
-            textvariable=train_log_backend_var,
-            values=("tensorboard", "wandb", "all"),
+            training_settings_section,
+            textvariable=train_network_alpha_var,
+            values=TRAIN_DIM_ALPHA_CHOICES,
             state="readonly",
-        ).grid(row=10, column=1, sticky="ew", pady=(6, 0))
-        ttk.Label(advanced_section, text="Tracker name:").grid(row=10, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
-        ttk.Entry(advanced_section, textvariable=train_log_tracker_name_var, style="Flat.TEntry").grid(
-            row=10,
-            column=3,
+            width=10,
+        ).grid(row=2, column=3, sticky="ew", pady=(6, 0))
+
+        ttk.Checkbutton(
+            training_settings_section,
+            text="Enable FP8 (Low VRAM)",
+            variable=fp8_dit_var,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(
+            training_settings_section,
+            text="Enable CPU Gradient Checkpointing (Low RAM)",
+            variable=gc_cpu_offload_var,
+        ).grid(row=3, column=2, columnspan=2, sticky="w", pady=(8, 0))
+
+        flags_section = ttk.LabelFrame(advanced_section, text="Advanced flags", padding=8)
+        flags_section.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        flags_section.columnconfigure(0, weight=1)
+        flags_section.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(
+            flags_section,
+            text="Enable Torch Compile",
+            variable=compile_optimizations_var,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            flags_section,
+            text="Enable Allow TF32",
+            variable=cuda_allow_tf32_var,
+        ).grid(row=0, column=1, sticky="w")
+        ttk.Checkbutton(
+            flags_section,
+            text="Enable cuDNN Benchmark",
+            variable=cuda_cudnn_benchmark_var,
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            flags_section,
+            text="Auto-clean resume state folders",
+            variable=auto_cleanup_states_var,
+        ).grid(row=1, column=1, sticky="w", pady=(6, 0))
+
+        logging_section = ttk.LabelFrame(advanced_section, text="Logging & metadata", padding=8)
+        logging_section.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        logging_section.columnconfigure(0, weight=0)
+        logging_section.columnconfigure(1, weight=1)
+        logging_section.columnconfigure(2, weight=0)
+        logging_section.columnconfigure(3, weight=1)
+
+        ttk.Checkbutton(
+            logging_section,
+            text="Enable TensorBoard",
+            variable=enable_training_logging_var,
+        ).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(logging_section, text="Tracker name:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Entry(logging_section, textvariable=train_log_tracker_name_var, style="Flat.TEntry").grid(
+            row=1,
+            column=1,
+            columnspan=3,
             sticky="ew",
             pady=(6, 0),
         )
         ttk.Checkbutton(
-            advanced_section,
-            text="Save checkpoint metadata (.json sidecar)",
-            variable=save_checkpoint_metadata_var,
-        ).grid(row=11, column=0, columnspan=4, sticky="w", pady=(6, 0))
+            logging_section,
+            text="Show full training output in app console",
+            variable=stream_to_logger_var,
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Checkbutton(
-            advanced_section,
-            text="Auto-clean resume state folders (keep only latest useful state)",
-            variable=auto_cleanup_states_var,
-        ).grid(row=12, column=0, columnspan=4, sticky="w", pady=(6, 0))
+            logging_section,
+            text="Keep TensorBoard running in background",
+            variable=auto_start_tensorboard_var,
+        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Label(
-            advanced_section,
-            text="Logs are stored per dataset in logs and can be viewed via the Metrics Viewer button.",
-        ).grid(row=13, column=0, columnspan=4, sticky="w", pady=(6, 0))
+            logging_section,
+            text="Logs are stored in the app root logs folder and can be viewed via the TensorBoard button.",
+        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        def sync_optimizer_controls() -> None:
+            if train_optimizer_var.get() == "prodigy":
+                train_learning_rate_var.set("1")
+                train_learning_rate_entry.configure(state="disabled")
+            else:
+                train_learning_rate_entry.configure(state="normal")
+
+        train_optimizer_var.trace_add("write", lambda *_args: sync_optimizer_controls())
+        sync_optimizer_controls()
 
         ttk.Label(klein_section, text="Model version:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         klein_model_version_entry = ttk.Entry(klein_section, textvariable=klein_model_version_var, style="Flat.TEntry")
@@ -1219,7 +1442,15 @@ def launch_ui() -> int:
                 messagebox.showerror("Invalid value", "LoRA network alpha must be 1 or higher.", parent=dialog)
                 return
 
+            train_optimizer = train_optimizer_var.get().strip().lower()
+            if train_optimizer not in {"adamw8bit", "prodigy"}:
+                messagebox.showerror("Invalid value", "Optimizer type must be adamw8bit or prodigy.", parent=dialog)
+                return
+
             train_learning_rate = train_learning_rate_var.get().strip()
+            if train_optimizer == "prodigy":
+                train_learning_rate = "1"
+                train_learning_rate_var.set("1")
             if not train_learning_rate:
                 messagebox.showerror("Invalid value", "Learning rate is required.", parent=dialog)
                 return
@@ -1288,12 +1519,14 @@ def launch_ui() -> int:
             settings_state[TRAIN_RESOLUTION_KEY] = str(train_resolution)
             settings_state[TRAIN_NETWORK_DIM_KEY] = str(train_network_dim)
             settings_state[TRAIN_NETWORK_ALPHA_KEY] = str(train_network_alpha)
+            settings_state[TRAIN_OPTIMIZER_TYPE_KEY] = train_optimizer
             settings_state[TRAIN_LEARNING_RATE_KEY] = train_learning_rate
             settings_state[TRAIN_STEPS_KEY] = str(train_steps)
             settings_state[TRAIN_ENABLE_LOGGING_KEY] = "1" if enable_training_logging_var.get() else "0"
-            settings_state[TRAIN_LOG_BACKEND_KEY] = train_log_backend_var.get().strip().lower() or "tensorboard"
+            settings_state[TRAIN_LOG_BACKEND_KEY] = "tensorboard"
             settings_state[TRAIN_LOG_TRACKER_NAME_KEY] = train_log_tracker_name_var.get().strip()
-            settings_state[TRAIN_SAVE_CHECKPOINT_METADATA_KEY] = "1" if save_checkpoint_metadata_var.get() else "0"
+            settings_state[TRAIN_STREAM_TO_LOGGER_KEY] = "1" if stream_to_logger_var.get() else "0"
+            settings_state[TRAIN_AUTO_START_TENSORBOARD_KEY] = "1" if auto_start_tensorboard_var.get() else "0"
             settings_state[TRAIN_AUTO_CLEANUP_STATES_KEY] = "1" if auto_cleanup_states_var.get() else "0"
             save_settings(settings_state)
             result = klein_runtime_config_from_settings(settings_state)
@@ -1342,15 +1575,34 @@ def launch_ui() -> int:
         )
 
         ttk.Label(frame, text="LTX path is saved for future support.").grid(
-            row=5, column=0, sticky="w", pady=(10, 8)
+            row=7, column=0, sticky="w", pady=(10, 8)
         )
 
         button_row = ttk.Frame(frame)
-        button_row.grid(row=6, column=0, sticky="ew")
+        button_row.grid(row=8, column=0, sticky="ew")
         button_row.columnconfigure(0, weight=1)
         ttk.Button(button_row, text="Reset Settings", command=reset_settings).grid(row=0, column=0, sticky="w")
         ttk.Button(button_row, text="Cancel", command=cancel_and_close).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(button_row, text="Save", command=save_and_close).grid(row=0, column=2)
+
+        def sync_model_sections() -> None:
+            if klein_toggle_var.get():
+                klein_section.grid()
+                klein_toggle.configure(text="Hide Klein settings")
+            else:
+                klein_section.grid_remove()
+                klein_toggle.configure(text="Show Klein settings")
+
+            if ltx_toggle_var.get():
+                ltx_section.grid()
+                ltx_toggle.configure(text="Hide LTX settings")
+            else:
+                ltx_section.grid_remove()
+                ltx_toggle.configure(text="Show LTX settings")
+
+        klein_toggle_var.trace_add("write", lambda *_args: sync_model_sections())
+        ltx_toggle_var.trace_add("write", lambda *_args: sync_model_sections())
+        sync_model_sections()
 
         dialog.protocol("WM_DELETE_WINDOW", cancel_and_close)
         dialog.update_idletasks()
@@ -1380,6 +1632,8 @@ def launch_ui() -> int:
             root.destroy()
             return 1
 
+    maybe_autostart_tensorboard()
+
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=0)
     root.rowconfigure(1, weight=0)
@@ -1407,6 +1661,7 @@ def launch_ui() -> int:
         training_path_var.set(f"Training folder: {runtime_config.training_dir}")
         dataset_order = load_dataset_order(settings_state)
         rebuild_folder_list(force=True)
+        maybe_autostart_tensorboard()
         return True
 
     def create_dataset() -> None:
@@ -1438,13 +1693,11 @@ def launch_ui() -> int:
         images_dir = dataset_dir / "images"
         cache_dir = dataset_dir / "cache"
         output_dir = dataset_dir / "output"
-        logs_dir = dataset_dir / "logs"
 
         try:
             images_dir.mkdir(parents=True, exist_ok=False)
             cache_dir.mkdir(parents=True, exist_ok=True)
             output_dir.mkdir(parents=True, exist_ok=True)
-            logs_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             messagebox.showerror("Create failed", f"Could not create dataset structure:\n{exc}", parent=root)
             return
@@ -1513,142 +1766,133 @@ def launch_ui() -> int:
         except OSError as exc:
             messagebox.showerror("Open failed", f"Could not open folder:\n{exc}", parent=root)
 
-    def open_metrics_viewer_dialog() -> None:
-        dataset_names = scan_training_folders(runtime_config.training_dir)
-        if not dataset_names:
-            messagebox.showinfo("No datasets", "No datasets found in the Training folder.", parent=root)
+    def delete_logs_for_dataset(dataset_name: str) -> None:
+        logs_root = dataset_log_dir(runtime_config.training_dir, dataset_name)
+        if not logs_root.exists() or not logs_root.is_dir():
+            messagebox.showinfo("Delete Logs", "No centralized logs folder found.", parent=root)
             return
 
-        dialog = tk.Toplevel(root)
-        dialog.title("Metrics Viewer")
-        dialog.transient(root)
-        dialog.grab_set()
-        dialog.resizable(False, False)
-        dialog.configure(bg=bg_panel)
-        set_dark_title_bar(dialog)
-        dialog.columnconfigure(0, weight=1)
-        dialog.rowconfigure(0, weight=1)
-
-        frame = ttk.Frame(dialog, padding=10)
-        frame.grid(row=0, column=0, sticky="nsew")
-        frame.columnconfigure(1, weight=1)
-
-        dataset_var = tk.StringVar(value=dataset_names[0])
-        log_dir_var = tk.StringVar(value="")
-        summary_var = tk.StringVar(value="")
-
-        ttk.Label(frame, text="Dataset:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        dataset_combo = ttk.Combobox(frame, textvariable=dataset_var, values=dataset_names, state="readonly")
-        dataset_combo.grid(row=0, column=1, sticky="ew")
-
-        ttk.Label(frame, text="Log folder:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Label(
-            frame,
-            textvariable=log_dir_var,
-            anchor="w",
-            style="PathDisplay.TLabel",
-            padding=(6, 4),
-        ).grid(row=1, column=1, sticky="ew", pady=(8, 0))
-
-        ttk.Label(frame, textvariable=summary_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
-
-        def current_log_dir() -> Path:
-            return dataset_log_dir(runtime_config.training_dir, dataset_var.get().strip())
-
-        def update_summary() -> None:
-            log_dir = current_log_dir()
-            log_dir_var.set(str(log_dir))
-            if not log_dir.exists() or not log_dir.is_dir():
-                summary_var.set("No logs yet for this dataset.")
-                return
-            run_dirs = [p for p in log_dir.iterdir() if p.is_dir()]
-            event_files = list(log_dir.glob("**/events.out.tfevents*"))
-            summary_var.set(f"Runs: {len(run_dirs)} | Event files: {len(event_files)}")
-
-        def open_log_folder() -> None:
-            log_dir = current_log_dir()
-            if not log_dir.exists() or not log_dir.is_dir():
-                messagebox.showinfo("No logs", "No log folder exists for this dataset yet.", parent=dialog)
-                return
-            try:
-                if sys.platform == "win32":
-                    os.startfile(str(log_dir))
-                elif sys.platform == "darwin":
-                    subprocess.Popen(["open", str(log_dir)])
-                else:
-                    subprocess.Popen(["xdg-open", str(log_dir)])
-            except OSError as exc:
-                messagebox.showerror("Open failed", f"Could not open folder:\n{exc}", parent=dialog)
-
-        def launch_tensorboard() -> None:
-            launch_tensorboard_for_dataset(dataset_var.get().strip(), parent=dialog)
-
-        dataset_combo.bind("<<ComboboxSelected>>", lambda _e: update_summary())
-        update_summary()
-
-        button_row = ttk.Frame(frame)
-        button_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
-        button_row.columnconfigure(0, weight=1)
-
-        ttk.Button(button_row, text="Open Log Folder", command=open_log_folder).grid(row=0, column=0, sticky="w")
-        ttk.Button(button_row, text="Launch TensorBoard", command=launch_tensorboard).grid(row=0, column=1, padx=(8, 8))
-        ttk.Button(button_row, text="Close", command=dialog.destroy).grid(row=0, column=2)
-
-        dialog.update_idletasks()
-        dialog.geometry(f"{max(680, dialog.winfo_reqwidth())}x{dialog.winfo_reqheight()}")
-        center_window(dialog)
-        dialog.focus_set()
-        root.wait_window(dialog)
-
-    def launch_tensorboard_for_dataset(dataset_name: str, parent: tk.Misc | None = None) -> None:
-        log_dir = dataset_log_dir(runtime_config.training_dir, dataset_name)
-        if not log_dir.exists() or not log_dir.is_dir():
+        date_pattern = r"\d{6}"
+        run_pattern = re.compile(rf"^{re.escape(dataset_name)}_{date_pattern}_\d{{2}}$", re.IGNORECASE)
+        run_dirs = sorted([p for p in logs_root.iterdir() if p.is_dir() and run_pattern.match(p.name)])
+        if not run_dirs:
             messagebox.showinfo(
-                "No logs",
-                f"No logs found yet for '{dataset_name}'.\nRun training with logging enabled first.",
-                parent=(parent or root),
+                "Delete Logs",
+                f"No logs found for dataset '{dataset_name}' in:\n{logs_root}",
+                parent=root,
             )
             return
 
-        python_path = runtime_config.musubi_python
-        if python_path is None or not python_path.is_file():
-            messagebox.showerror(
-                "Python not found",
-                "Musubi-Tuner Python (venv) is not configured. Set it in Settings first.",
-                parent=(parent or root),
+        if not messagebox.askyesno(
+            "Delete Logs",
+            f"Delete {len(run_dirs)} log folder(s) for '{dataset_name}'?\n\nThis cannot be undone.",
+            parent=root,
+        ):
+            return
+
+        deleted_count = 0
+        for run_dir in run_dirs:
+            try:
+                shutil.rmtree(run_dir)
+                deleted_count += 1
+            except OSError:
+                continue
+
+        if deleted_count == len(run_dirs):
+            messagebox.showinfo(
+                "Delete Logs",
+                f"Deleted {deleted_count} log folder(s) for '{dataset_name}'.",
+                parent=root,
             )
             return
 
-        command = [
-            str(python_path),
-            "-m",
-            "tensorboard.main",
-            "--logdir",
-            str(log_dir),
-            "--port",
-            "6006",
-            "--reload_interval",
-            "5",
-        ]
+        messagebox.showwarning(
+            "Delete Logs",
+            f"Deleted {deleted_count}/{len(run_dirs)} log folder(s) for '{dataset_name}'.",
+            parent=root,
+        )
+
+    def open_metrics_viewer_dialog() -> None:
+        nonlocal tensorboard_launch_in_progress
+
+        if tensorboard_launch_in_progress:
+            log("[Metrics Viewer] Launch already in progress. Please wait...")
+            return
+
+        tensorboard_launch_in_progress = True
+        if metrics_viewer_button is not None:
+            try:
+                metrics_viewer_button.configure(state="disabled")
+            except tk.TclError:
+                pass
+
+        log("[Metrics Viewer] Launching TensorBoard")
 
         try:
-            popen_kwargs: dict[str, object] = {
-                "cwd": str(runtime_config.musubi_dir),
-            }
-            if sys.platform == "win32":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
-            subprocess.Popen(command, **popen_kwargs)
-        except OSError as exc:
-            messagebox.showerror("Launch failed", f"Could not start TensorBoard:\n{exc}", parent=(parent or root))
-            return
+            if runtime_config is None:
+                messagebox.showerror(
+                    "Metrics Viewer",
+                    "Runtime configuration is not available. Open Settings and verify Musubi paths.",
+                    parent=root,
+                )
+                return
+            if resolve_tensorboard_python() is None:
+                messagebox.showerror(
+                    "Metrics Viewer",
+                    "TensorBoard is not installed in Musubi-Tuner Python.\n\n"
+                    "Install it in Musubi Python:\n"
+                    "pip install tensorboard",
+                    parent=root,
+                )
+                return
 
-        log(f"[Metrics Viewer] TensorBoard launched for {dataset_name} @ http://localhost:6006")
-        messagebox.showinfo(
-            "TensorBoard launched",
-            "TensorBoard started at http://localhost:6006\n\n"
-            "If the page does not load, wait a few seconds and refresh.",
-            parent=(parent or root),
-        )
+            if is_tensorboard_running():
+                log("[Metrics Viewer] TensorBoard is already running. Opening browser...")
+            else:
+                log("[Metrics Viewer] Starting TensorBoard... please wait a few seconds.")
+
+            if not launch_tensorboard_background():
+                log("[Metrics Viewer] Failed to start TensorBoard.")
+                messagebox.showerror(
+                    "Metrics Viewer",
+                    "Could not start TensorBoard. Check the app log for details.",
+                    parent=root,
+                )
+                return
+
+            if is_tensorboard_running():
+                log(f"[Metrics Viewer] TensorBoard is ready at {tensorboard_url}")
+            else:
+                log("[Metrics Viewer] TensorBoard is still starting. Opening browser now; refresh in a few seconds if needed.")
+
+            opened = webbrowser.open(tensorboard_url, new=2)
+            if opened:
+                log("[Metrics Viewer] Opened TensorBoard in your default browser.")
+                return
+
+            try:
+                if sys.platform == "win32":
+                    os.startfile(tensorboard_url)
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", tensorboard_url])
+                else:
+                    subprocess.Popen(["xdg-open", tensorboard_url])
+                log("[Metrics Viewer] Opened TensorBoard using OS browser launcher.")
+                return
+            except OSError:
+                log("[Metrics Viewer] Browser auto-open failed. Open the URL manually.")
+                messagebox.showerror(
+                    "Metrics Viewer",
+                    f"TensorBoard is running, but the browser could not be opened automatically.\n\nOpen manually:\n{tensorboard_url}",
+                    parent=root,
+                )
+        finally:
+            tensorboard_launch_in_progress = False
+            if metrics_viewer_button is not None:
+                try:
+                    metrics_viewer_button.configure(state="normal")
+                except tk.TclError:
+                    pass
 
     def add_images_to_dataset(dataset_name: str) -> None:
         dataset_dir = runtime_config.training_dir / dataset_name
@@ -1748,10 +1992,19 @@ def launch_ui() -> int:
         section.columnconfigure(3, weight=1)
 
         use_global_var = tk.BooleanVar(value=is_truthy(effective.get(DATASET_USE_GLOBAL_TRAIN_KEY), default=True))
+        train_optimizer_var = tk.StringVar(value=effective[TRAIN_OPTIMIZER_TYPE_KEY])
         train_steps_var = tk.StringVar(value=effective[TRAIN_STEPS_KEY])
         train_learning_rate_var = tk.StringVar(value=effective[TRAIN_LEARNING_RATE_KEY])
-        train_network_dim_var = tk.StringVar(value=effective[TRAIN_NETWORK_DIM_KEY])
-        train_network_alpha_var = tk.StringVar(value=effective[TRAIN_NETWORK_ALPHA_KEY])
+        train_network_dim_var = tk.StringVar(
+            value=effective[TRAIN_NETWORK_DIM_KEY]
+            if effective[TRAIN_NETWORK_DIM_KEY] in TRAIN_DIM_ALPHA_CHOICES
+            else "32"
+        )
+        train_network_alpha_var = tk.StringVar(
+            value=effective[TRAIN_NETWORK_ALPHA_KEY]
+            if effective[TRAIN_NETWORK_ALPHA_KEY] in TRAIN_DIM_ALPHA_CHOICES
+            else "32"
+        )
         train_resolution_var = tk.StringVar(value=effective[TRAIN_RESOLUTION_KEY])
 
         ttk.Checkbutton(
@@ -1760,23 +2013,44 @@ def launch_ui() -> int:
             variable=use_global_var,
         ).grid(row=0, column=0, columnspan=4, sticky="w")
 
-        ttk.Label(section, text="Training steps:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(section, text="Optimizer type:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        train_optimizer_combo = ttk.Combobox(
+            section,
+            textvariable=train_optimizer_var,
+            values=("adamw8bit", "prodigy"),
+            state="readonly",
+            width=14,
+        )
+        train_optimizer_combo.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(section, text="Training steps:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(8, 0))
         train_steps_entry = ttk.Entry(section, textvariable=train_steps_var, style="Flat.TEntry")
-        train_steps_entry.grid(row=1, column=1, sticky="ew", pady=(8, 0))
-        ttk.Label(section, text="Learning rate:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(8, 0))
-        train_learning_rate_entry = ttk.Entry(section, textvariable=train_learning_rate_var, style="Flat.TEntry")
-        train_learning_rate_entry.grid(row=1, column=3, sticky="ew", pady=(8, 0))
+        train_steps_entry.grid(row=1, column=3, sticky="ew", pady=(8, 0))
 
-        ttk.Label(section, text="LoRA network dim:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        train_network_dim_entry = ttk.Entry(section, textvariable=train_network_dim_var, style="Flat.TEntry")
-        train_network_dim_entry.grid(row=2, column=1, sticky="ew", pady=(6, 0))
-        ttk.Label(section, text="LoRA network alpha:").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
-        train_network_alpha_entry = ttk.Entry(section, textvariable=train_network_alpha_var, style="Flat.TEntry")
-        train_network_alpha_entry.grid(row=2, column=3, sticky="ew", pady=(6, 0))
+        ttk.Label(section, text="Learning rate:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        train_learning_rate_entry = ttk.Entry(section, textvariable=train_learning_rate_var, style="Flat.TEntry")
+        train_learning_rate_entry.grid(row=2, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(section, text="LoRA network dim:").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=(8, 0))
+        train_network_dim_combo = ttk.Combobox(
+            section,
+            textvariable=train_network_dim_var,
+            values=TRAIN_DIM_ALPHA_CHOICES,
+            state="readonly",
+            width=10,
+        )
+        train_network_dim_combo.grid(row=2, column=3, sticky="ew", pady=(8, 0))
 
         ttk.Label(section, text="Dataset resolution:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
         train_resolution_entry = ttk.Entry(section, textvariable=train_resolution_var, style="Flat.TEntry")
         train_resolution_entry.grid(row=3, column=1, sticky="ew", pady=(6, 0))
+        ttk.Label(section, text="LoRA network alpha:").grid(row=3, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        train_network_alpha_combo = ttk.Combobox(
+            section,
+            textvariable=train_network_alpha_var,
+            values=TRAIN_DIM_ALPHA_CHOICES,
+            state="readonly",
+            width=10,
+        )
+        train_network_alpha_combo.grid(row=3, column=3, sticky="ew", pady=(6, 0))
 
         help_label = ttk.Label(
             section,
@@ -1785,18 +2059,32 @@ def launch_ui() -> int:
         help_label.grid(row=4, column=0, columnspan=4, sticky="w", pady=(8, 0))
         ttk.Label(section, text=f"Images found: {image_count}").grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
+        def sync_optimizer_controls() -> None:
+            if train_optimizer_var.get() == "prodigy":
+                train_learning_rate_var.set("1")
+                train_learning_rate_entry.configure(state="disabled")
+            else:
+                train_learning_rate_entry.configure(state="normal")
+
         def sync_entry_state() -> None:
-            state = "disabled" if use_global_var.get() else "normal"
-            for entry in (
-                train_steps_entry,
-                train_learning_rate_entry,
-                train_network_dim_entry,
-                train_network_alpha_entry,
-                train_resolution_entry,
-            ):
-                entry.configure(state=state)
+            if use_global_var.get():
+                train_optimizer_combo.configure(state="disabled")
+                train_steps_entry.configure(state="disabled")
+                train_learning_rate_entry.configure(state="disabled")
+                train_network_dim_combo.configure(state="disabled")
+                train_network_alpha_combo.configure(state="disabled")
+                train_resolution_entry.configure(state="disabled")
+                return
+
+            train_optimizer_combo.configure(state="readonly")
+            train_steps_entry.configure(state="normal")
+            train_network_dim_combo.configure(state="readonly")
+            train_network_alpha_combo.configure(state="readonly")
+            train_resolution_entry.configure(state="normal")
+            sync_optimizer_controls()
 
         def reset_to_global_defaults() -> None:
+            train_optimizer_var.set(global_values[TRAIN_OPTIMIZER_TYPE_KEY])
             train_steps_var.set(global_values[TRAIN_STEPS_KEY])
             train_learning_rate_var.set(global_values[TRAIN_LEARNING_RATE_KEY])
             train_network_dim_var.set(global_values[TRAIN_NETWORK_DIM_KEY])
@@ -1820,7 +2108,15 @@ def launch_ui() -> int:
                     messagebox.showerror("Invalid value", "Training steps must be 1 or higher.", parent=dialog)
                     return
 
+                train_optimizer = train_optimizer_var.get().strip().lower()
+                if train_optimizer not in {"adamw8bit", "prodigy"}:
+                    messagebox.showerror("Invalid value", "Optimizer type must be adamw8bit or prodigy.", parent=dialog)
+                    return
+
                 train_learning_rate = train_learning_rate_var.get().strip()
+                if train_optimizer == "prodigy":
+                    train_learning_rate = "1"
+                    train_learning_rate_var.set("1")
                 if not train_learning_rate:
                     messagebox.showerror("Invalid value", "Learning rate is required.", parent=dialog)
                     return
@@ -1861,6 +2157,7 @@ def launch_ui() -> int:
                     return
 
                 raw_to_save[TRAIN_STEPS_KEY] = str(train_steps)
+                raw_to_save[TRAIN_OPTIMIZER_TYPE_KEY] = train_optimizer
                 raw_to_save[TRAIN_LEARNING_RATE_KEY] = train_learning_rate
                 raw_to_save[TRAIN_NETWORK_DIM_KEY] = str(network_dim)
                 raw_to_save[TRAIN_NETWORK_ALPHA_KEY] = str(network_alpha)
@@ -1885,6 +2182,7 @@ def launch_ui() -> int:
         ttk.Button(button_row, text="Save", command=save_and_close).grid(row=0, column=2)
 
         use_global_var.trace_add("write", lambda *_args: sync_entry_state())
+        train_optimizer_var.trace_add("write", lambda *_args: sync_entry_state())
         sync_entry_state()
 
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
@@ -2464,6 +2762,62 @@ def launch_ui() -> int:
             for path in merge_loras:
                 merge_list.insert("end", path.name)
 
+        def _normalize_lora_paths(raw_paths: list[str]) -> list[Path]:
+            normalized: list[Path] = []
+            for raw_path in raw_paths:
+                value = raw_path.strip().strip('"')
+                if not value:
+                    continue
+                path = Path(value).expanduser()
+                if not path.exists() or not path.is_file() or path.suffix.lower() != ".safetensors":
+                    continue
+                normalized.append(path)
+            return normalized
+
+        def add_loras_to_candidate_pool(paths: list[Path]) -> int:
+            if not paths:
+                return 0
+            existing = {str(path.resolve()) for path in candidate_loras}
+            added = 0
+            for path in paths:
+                key = str(path.resolve())
+                if key in existing:
+                    continue
+                candidate_loras.append(path)
+                existing.add(key)
+                added += 1
+
+            if added > 0:
+                candidate_loras.sort(key=lambda p: p.name.lower())
+                refresh_candidate_list()
+            return added
+
+        def add_paths_to_merge_list(paths: list[Path]) -> int:
+            if not paths:
+                return 0
+            existing = {str(path.resolve()) for path in merge_loras}
+            added = 0
+            for path in paths:
+                key = str(path.resolve())
+                if key in existing:
+                    continue
+                merge_loras.append(path)
+                existing.add(key)
+                added += 1
+
+            if added > 0:
+                if merge_loras and not output_dir_var.get().strip():
+                    output_dir_var.set(str(merge_loras[0].parent))
+                refresh_merge_list()
+            return added
+
+        def add_raw_paths(raw_paths: list[str], to_merge: bool = False) -> int:
+            paths = _normalize_lora_paths(raw_paths)
+            if not paths:
+                return 0
+            add_loras_to_candidate_pool(paths)
+            return add_paths_to_merge_list(paths) if to_merge else len(paths)
+
         def add_loras_to_pool() -> None:
             initial_dir = str(runtime_config.training_dir)
             if candidate_loras:
@@ -2477,34 +2831,93 @@ def launch_ui() -> int:
             if not picked:
                 return
 
-            existing = {str(path.resolve()) for path in candidate_loras}
-            for raw_path in picked:
-                path = Path(raw_path).expanduser()
-                if not path.exists() or not path.is_file() or path.suffix.lower() != ".safetensors":
-                    continue
-                key = str(path.resolve())
-                if key in existing:
-                    continue
-                candidate_loras.append(path)
-                existing.add(key)
-
-            candidate_loras.sort(key=lambda p: p.name.lower())
-            refresh_candidate_list()
+            add_raw_paths([str(p) for p in picked], to_merge=False)
 
         def add_to_merge_list() -> None:
-            selected_indices = list(candidate_list.curselection())
+            raw_selected_indices = list(candidate_list.curselection())
+            if not raw_selected_indices:
+                return
+
+            selected_indices: list[int] = []
+            for raw_index in raw_selected_indices:
+                try:
+                    index = int(raw_index)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= index < len(candidate_loras):
+                    selected_indices.append(index)
+
             if not selected_indices:
                 return
-            existing = {str(path.resolve()) for path in merge_loras}
-            for index in selected_indices:
-                path = candidate_loras[index]
-                key = str(path.resolve())
-                if key not in existing:
-                    merge_loras.append(path)
-                    existing.add(key)
-            if merge_loras and not output_dir_var.get().strip():
-                output_dir_var.set(str(merge_loras[0].parent))
-            refresh_merge_list()
+
+            selected_paths = [candidate_loras[index] for index in selected_indices]
+            add_paths_to_merge_list(selected_paths)
+
+        def on_candidate_double_click(event: tk.Event) -> str:
+            # Only treat double-clicks on an actual item row as "add to merge".
+            clicked_index = candidate_list.nearest(event.y)
+            if clicked_index < 0 or clicked_index >= len(candidate_loras):
+                return "break"
+
+            row_bbox = candidate_list.bbox(clicked_index)
+            if row_bbox is None:
+                return "break"
+            _x, y, _w, h = row_bbox
+            if not (y <= event.y < y + h):
+                return "break"
+
+            candidate_list.selection_clear(0, "end")
+            candidate_list.selection_set(clicked_index)
+            candidate_list.activate(clicked_index)
+            add_to_merge_list()
+            return "break"
+
+        def try_enable_file_dnd() -> bool:
+            if not tkdnd_available or DND_FILES is None:
+                return False
+
+            def process_drop_on_ui_thread(raw_paths: list[str], to_merge: bool, target_name: str) -> None:
+                if not dialog.winfo_exists():
+                    return
+
+                def _apply_drop() -> None:
+                    try:
+                        added = add_raw_paths(raw_paths, to_merge=to_merge)
+                        if added > 0:
+                            destination = "merge list" if to_merge else "pool"
+                            log(f"[LoRA Post-Hoc EMA Merge] Added {added} dropped LoRA file(s) to {destination}.")
+                    except Exception as exc:
+                        log(f"[LoRA Post-Hoc EMA Merge] Drop handling failed on {target_name}: {exc}")
+
+                dialog.after(0, _apply_drop)
+
+            def decode_dropped_paths(event_data: str) -> list[str]:
+                if not event_data:
+                    return []
+                try:
+                    split_values = dialog.tk.splitlist(event_data)
+                except Exception:
+                    split_values = [event_data]
+                return [str(item) for item in split_values if str(item).strip()]
+
+            def on_drop_to_pool(event: tk.Event) -> str:
+                raw_paths = decode_dropped_paths(str(getattr(event, "data", "")))
+                process_drop_on_ui_thread(raw_paths, to_merge=False, target_name="LoRAs")
+                return "break"
+
+            def on_drop_to_merge(event: tk.Event) -> str:
+                raw_paths = decode_dropped_paths(str(getattr(event, "data", "")))
+                process_drop_on_ui_thread(raw_paths, to_merge=True, target_name="Merge order")
+                return "break"
+
+            try:
+                candidate_list.drop_target_register(DND_FILES)
+                candidate_list.dnd_bind("<<Drop>>", on_drop_to_pool)
+                merge_list.drop_target_register(DND_FILES)
+                merge_list.dnd_bind("<<Drop>>", on_drop_to_merge)
+                return True
+            except Exception:
+                return False
 
         def remove_from_merge_list() -> None:
             selected_indices = list(merge_list.curselection())
@@ -2693,12 +3106,26 @@ def launch_ui() -> int:
             created_text = "\n".join(str(path) for path in created_paths)
             messagebox.showinfo("Merge complete", f"Created:\n{created_text}", parent=dialog)
 
-        candidate_list.bind("<Double-Button-1>", lambda _e: add_to_merge_list())
+        candidate_list.bind("<Double-Button-1>", on_candidate_double_click)
 
         candidate_actions = ttk.Frame(candidate_section)
         candidate_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Button(candidate_actions, text="Add LoRA", command=add_loras_to_pool).grid(row=0, column=0, padx=(0, 8), sticky="w")
         ttk.Button(candidate_actions, text="Add to Merge List >>", command=add_to_merge_list).grid(row=0, column=1, sticky="w")
+
+        dnd_enabled = try_enable_file_dnd()
+        dnd_hint = (
+            "Tip: Drag .safetensors files onto LoRAs or Merge order lists."
+            if dnd_enabled
+            else "Tip: Drag-and-drop requires tkinterdnd2 in app Python (pip install tkinterdnd2). Use Add LoRA for now."
+        )
+        ttk.Label(candidate_section, text=dnd_hint, style="Dim.TLabel", wraplength=320).grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(8, 0),
+        )
 
         merge_actions = ttk.Frame(merge_section)
         merge_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -2723,7 +3150,8 @@ def launch_ui() -> int:
         menu.add_separator()
         menu.add_command(label="Open Dataset", command=lambda: open_dataset_in_file_manager(dataset_name))
         menu.add_command(label="Add Images", command=lambda: add_images_to_dataset(dataset_name))
-        menu.add_command(label="Open Metrics (TensorBoard)", command=lambda: launch_tensorboard_for_dataset(dataset_name))
+        menu.add_command(label="Open Metrics (TensorBoard)", command=open_metrics_viewer_dialog)
+        menu.add_command(label="Delete Logs", command=lambda: delete_logs_for_dataset(dataset_name))
         menu.add_separator()
         has_output_loras = bool(dataset_output_safetensors(dataset_name))
         menu.add_command(
@@ -3356,6 +3784,7 @@ def launch_ui() -> int:
                             TRAIN_NETWORK_ALPHA_KEY,
                             DEFAULT_NETWORK_ALPHA,
                         ),
+                        optimizer_type=get_train_optimizer_setting(effective_train),
                         learning_rate=effective_train.get(TRAIN_LEARNING_RATE_KEY, DEFAULT_LEARNING_RATE),
                         train_steps=get_positive_int_setting(
                             effective_train,
@@ -3387,8 +3816,8 @@ def launch_ui() -> int:
                         ),
                         training_log_backend=get_train_log_backend_setting(settings_state),
                         training_log_tracker_name=settings_state.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip(),
-                        save_checkpoint_metadata=(
-                            settings_state.get(TRAIN_SAVE_CHECKPOINT_METADATA_KEY, "0").strip().lower()
+                        stream_training_output=(
+                            settings_state.get(TRAIN_STREAM_TO_LOGGER_KEY, "0").strip().lower()
                             in {"1", "true", "yes", "on"}
                         ),
                         auto_cleanup_states=(
@@ -3436,7 +3865,7 @@ def launch_ui() -> int:
     select_all_button = ttk.Button(controls, text="Select All", command=select_all)
     clear_button = ttk.Button(controls, text="Clear", command=clear_selection)
     create_dataset_button = ttk.Button(controls, text="Create Dataset", command=create_dataset)
-    metrics_viewer_button = ttk.Button(controls, text="Metrics Viewer", command=open_metrics_viewer_dialog)
+    metrics_viewer_button = ttk.Button(controls, text="TensorBoard", command=open_metrics_viewer_dialog)
     lora_merge_tool_button = ttk.Button(controls, text="LoRA Post-Hoc EMA Merge", command=open_lora_merge_tool_dialog)
     settings_button = ttk.Button(controls, text="Settings", command=apply_settings_from_dialog)
     run_button = ttk.Button(start_bar, text="START", command=run_selected, style="StartDisabled.TButton")
@@ -3494,6 +3923,7 @@ def main() -> int:
             resolution=get_positive_int_setting(settings, TRAIN_RESOLUTION_KEY, DEFAULT_RESOLUTION, minimum=64),
             network_dim=get_positive_int_setting(settings, TRAIN_NETWORK_DIM_KEY, DEFAULT_NETWORK_DIM),
             network_alpha=get_positive_int_setting(settings, TRAIN_NETWORK_ALPHA_KEY, DEFAULT_NETWORK_ALPHA),
+            optimizer_type=get_train_optimizer_setting(settings),
             learning_rate=get_learning_rate_setting(settings),
             train_steps=get_positive_int_setting(settings, TRAIN_STEPS_KEY, DEFAULT_TRAIN_STEPS),
             enable_compile_optimizations=(
@@ -3517,8 +3947,8 @@ def main() -> int:
             ),
             training_log_backend=get_train_log_backend_setting(settings),
             training_log_tracker_name=settings.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip(),
-            save_checkpoint_metadata=(
-                settings.get(TRAIN_SAVE_CHECKPOINT_METADATA_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
+            stream_training_output=(
+                settings.get(TRAIN_STREAM_TO_LOGGER_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
             ),
             auto_cleanup_states=(
                 settings.get(TRAIN_AUTO_CLEANUP_STATES_KEY, "1").strip().lower() in {"1", "true", "yes", "on"}

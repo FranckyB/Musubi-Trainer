@@ -4,6 +4,7 @@ import time
 import tempfile
 import os
 import shutil
+from datetime import datetime
 from collections import deque
 from pathlib import Path
 from typing import Callable, Iterable
@@ -18,6 +19,37 @@ DEFAULT_TRAIN_STEPS = 3000
 
 VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 LATENT_SUFFIX = "f2k9b"
+
+
+def centralized_logs_root(training_dir: Path) -> Path:
+    return training_dir.parent / "logs"
+
+
+def next_dataset_log_run_dir(training_dir: Path, dataset_name: str) -> tuple[Path, str]:
+    logs_root = centralized_logs_root(training_dir)
+    logs_root.mkdir(parents=True, exist_ok=True)
+
+    date_tag = datetime.now().strftime("%y%m%d")
+    escaped_dataset = re.escape(dataset_name)
+    run_pattern = re.compile(rf"^{escaped_dataset}_{date_tag}_(\d{{2}})$", re.IGNORECASE)
+
+    max_index = 0
+    for child in logs_root.iterdir():
+        if not child.is_dir():
+            continue
+        match = run_pattern.match(child.name)
+        if not match:
+            continue
+        max_index = max(max_index, int(match.group(1)))
+
+    while True:
+        run_index = max_index + 1
+        run_name = f"{dataset_name}_{date_tag}_{run_index:02d}"
+        run_dir = logs_root / run_name
+        if not run_dir.exists():
+            run_dir.mkdir(parents=True, exist_ok=False)
+            return run_dir, run_name
+        max_index += 1
 
 
 class TrainingCancelledError(RuntimeError):
@@ -508,6 +540,7 @@ def run_steps_for_model(
     resolution: int,
     network_dim: int,
     network_alpha: int,
+    optimizer_type: str,
     learning_rate: str,
     train_steps: int,
     enable_compile_optimizations: bool,
@@ -518,7 +551,7 @@ def run_steps_for_model(
     enable_training_logging: bool,
     training_log_backend: str,
     training_log_tracker_name: str,
-    save_checkpoint_metadata: bool,
+    stream_training_output: bool,
     do_prep_dataset: bool,
     do_cache_latents: bool,
     do_cache_text: bool,
@@ -549,6 +582,32 @@ def run_steps_for_model(
     def check_cancel() -> None:
         if cancel_requested is not None and cancel_requested():
             raise TrainingCancelledError("Cancelled by user.")
+
+    def module_available(module_name: str) -> bool:
+        result = subprocess.run(
+            [str(musubi_python), "-c", f"import {module_name}"],
+            cwd=str(runtime_config.musubi_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+        )
+        return result.returncode == 0
+
+    def wandb_key_available() -> bool:
+        if os.environ.get("WANDB_API_KEY", "").strip():
+            return True
+        home_dir = Path.home()
+        for netrc_name in (".netrc", "_netrc"):
+            netrc_path = home_dir / netrc_name
+            if not netrc_path.is_file():
+                continue
+            try:
+                content = netrc_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if "api.wandb.ai" in content:
+                return True
+        return False
 
     musubi_python = require_musubi_python()
 
@@ -687,17 +746,80 @@ def run_steps_for_model(
             log_backend = (training_log_backend or "tensorboard").strip().lower()
             if log_backend not in {"tensorboard", "wandb", "all"}:
                 log_backend = "tensorboard"
-            logging_dir = runtime_config.training_dir / model_name / "logs"
+            has_tensorboard = module_available("tensorboard")
+            has_wandb = module_available("wandb")
+            has_wandb_key = wandb_key_available()
+            requirements_hint = (
+                "Install dependencies in Musubi-Tuner venv using "
+                "requirements-musubi-tuner.txt from Musubi-Trainer."
+            )
+            if log_backend == "tensorboard":
+                if not has_tensorboard:
+                    raise RuntimeError(
+                        "Logging backend 'tensorboard' requires the tensorboard package. "
+                        f"{requirements_hint}"
+                    )
+            elif log_backend == "wandb":
+                if not has_wandb:
+                    raise RuntimeError(
+                        "Logging backend 'wandb' requires the wandb package. "
+                        f"{requirements_hint}"
+                    )
+                if not has_wandb_key:
+                    raise RuntimeError(
+                        "Logging backend 'wandb' requires a configured W&B API key "
+                        "(WANDB_API_KEY env var or wandb login)."
+                    )
+            else:
+                if has_tensorboard and has_wandb:
+                    if not has_wandb_key:
+                        logger("  logging note: W&B API key not configured; using tensorboard only")
+                        log_backend = "tensorboard"
+                elif has_tensorboard:
+                    logger("  logging note: wandb is not installed in Musubi venv; using tensorboard only")
+                    log_backend = "tensorboard"
+                elif has_wandb:
+                    if not has_wandb_key:
+                        raise RuntimeError(
+                            "Logging backend 'all' could only use wandb, but W&B API key is not configured "
+                            "(WANDB_API_KEY env var or wandb login)."
+                        )
+                    logger("  logging note: tensorboard is not installed in Musubi venv; using wandb only")
+                    log_backend = "wandb"
+                else:
+                    raise RuntimeError(
+                        "Logging backend 'all' requires tensorboard and wandb, but neither package is installed. "
+                        f"{requirements_hint}"
+                    )
+            logging_dir, auto_tracker_name = next_dataset_log_run_dir(runtime_config.training_dir, model_name)
             logging_flags.extend([
                 "--log_with",
                 log_backend,
                 "--logging_dir",
                 str(logging_dir),
             ])
-            tracker_name = training_log_tracker_name.strip()
+            tracker_name = training_log_tracker_name.strip() or auto_tracker_name
             if tracker_name:
                 logging_flags.extend(["--log_tracker_name", tracker_name])
-        metadata_flags = ["--save_checkpoint_metadata"] if save_checkpoint_metadata else []
+            logger(f"  logging_dir: {logging_dir}")
+            logger(f"  log_tracker_name: {tracker_name}")
+        optimizer_key = (optimizer_type or "adamw8bit").strip().lower()
+        if optimizer_key == "prodigy" and not module_available("prodigyopt"):
+            raise RuntimeError(
+                "Optimizer 'prodigy' requires the prodigyopt package. "
+                "Install dependencies in Musubi-Tuner venv using requirements-musubi-tuner.txt from Musubi-Trainer."
+            )
+        optimizer_arg = "prodigyopt.Prodigy" if optimizer_key == "prodigy" else "adamw8bit"
+        learning_rate_for_run = "1" if optimizer_key == "prodigy" else learning_rate
+        optimizer_args_flags: list[str] = []
+        if optimizer_key == "prodigy":
+            optimizer_args_flags = [
+                "--optimizer_args",
+                "safeguard_warmup=True",
+                "use_bias_correction=True",
+                "weight_decay=0.01",
+                "betas=(0.9,0.99)",
+            ]
         train_args = [
             str(musubi_python),
             "flux_2_train_network.py",
@@ -706,7 +828,7 @@ def run_steps_for_model(
             "--vae_dtype", "bf16",
             "--text_encoder", str(text_encoder_path),
             "--model_version", runtime_config.model_version,
-            "--optimizer_type", "adamw8bit",
+            "--optimizer_type", optimizer_arg,
             "--timestep_sampling", "flux2_shift",
             "--dataset_config", str(dataset_config),
             "--output_dir", str(output_dir),
@@ -714,7 +836,7 @@ def run_steps_for_model(
             "--network_module", "networks.lora_flux_2",
             "--network_dim", str(network_dim),
             "--network_alpha", str(network_alpha),
-            "--learning_rate", learning_rate,
+            "--learning_rate", learning_rate_for_run,
             "--max_train_steps", str(train_steps_for_run),
             "--mixed_precision", "bf16",
             "--sdpa",
@@ -726,10 +848,10 @@ def run_steps_for_model(
             "--save_state",
             "--save_state_on_train_end",
             "--seed", "42",
+            *optimizer_args_flags,
             *fp8_flags,
             *compile_flags,
             *logging_flags,
-            *metadata_flags,
             *(["--network_weights", str(warmstart_checkpoint)] if warmstart_checkpoint is not None else []),
             *(["--resume", str(resume_state_dir)] if resume_state_dir is not None else []),
         ]
@@ -739,7 +861,7 @@ def run_steps_for_model(
             cwd=runtime_config.musubi_dir,
             cancel_requested=cancel_requested,
             logger=logger,
-            stream_to_logger=False,
+            stream_to_logger=stream_training_output,
         )
         logger("")
 
@@ -751,6 +873,7 @@ def train_models(
     resolution: int,
     network_dim: int,
     network_alpha: int,
+    optimizer_type: str,
     learning_rate: str,
     train_steps: int,
     enable_compile_optimizations: bool,
@@ -761,7 +884,7 @@ def train_models(
     enable_training_logging: bool,
     training_log_backend: str,
     training_log_tracker_name: str,
-    save_checkpoint_metadata: bool,
+    stream_training_output: bool,
     auto_cleanup_states: bool,
     logger: Callable[[str], None],
     do_prep_dataset: bool,
@@ -842,6 +965,7 @@ def train_models(
                 resolution=resolution,
                 network_dim=network_dim,
                 network_alpha=network_alpha,
+                optimizer_type=optimizer_type,
                 learning_rate=learning_rate,
                 train_steps=train_steps,
                 enable_compile_optimizations=enable_compile_optimizations,
@@ -852,7 +976,7 @@ def train_models(
                 enable_training_logging=enable_training_logging,
                 training_log_backend=training_log_backend,
                 training_log_tracker_name=training_log_tracker_name,
-                save_checkpoint_metadata=save_checkpoint_metadata,
+                stream_training_output=stream_training_output,
                 do_prep_dataset=effective_do_prep_dataset,
                 do_cache_latents=effective_do_cache_latents,
                 do_cache_text=effective_do_cache_text,

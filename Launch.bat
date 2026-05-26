@@ -13,6 +13,16 @@ if %errorlevel%==1 (
 	exit /b 0
 )
 
+if exist "venv\Scripts\pythonw.exe" (
+	start "" "venv\Scripts\pythonw.exe" -m src.app
+	exit /b 0
+)
+
+if exist "venv\Scripts\python.exe" (
+	start "Musubi-Trainer" /min "venv\Scripts\python.exe" -m src.app
+	exit /b 0
+)
+
 where pyw >nul 2>nul
 if %errorlevel%==0 (
 	start "" pyw -m src.app

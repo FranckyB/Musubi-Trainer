@@ -1,0 +1,8 @@
+# Install these into the Musubi-Tuner venv used by Musubi-Trainer.
+# Example:
+#   D:/Musubi-Tuner/venv/Scripts/python.exe -m pip install -r D:/Musubi-Trainer/requirements-musubi-tuner.txt
+
+wandb
+tensorboard
+TensorFlow
+prodigyopt

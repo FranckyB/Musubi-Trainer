@@ -1,0 +1,6 @@
+# Musubi-Trainer desktop app runtime dependencies (local venv)
+# Install with:
+#   venv\Scripts\python.exe -m pip install -r requirements-app.txt
+
+Pillow
+tkinterdnd2
