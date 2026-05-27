@@ -57,7 +57,8 @@ def klein_runtime_config_from_settings(settings: dict[str, str]) -> KleinRuntime
         else resolve_musubi_python(musubi_dir)
     )
     workspace_dir = Path(__file__).resolve().parent.parent
-    training_dir = workspace_dir / "Training"
+    # Jobs are now the canonical training root (job metadata + per-job training dirs).
+    training_dir = workspace_dir / "Jobs"
 
     klein_model_version = settings.get(KLEIN_MODEL_VERSION_KEY, "").strip() or DEFAULT_KLEIN_MODEL_VERSION
 

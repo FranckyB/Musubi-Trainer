@@ -4,6 +4,7 @@ import time
 import tempfile
 import os
 import shutil
+import json
 from datetime import datetime
 from collections import deque
 from pathlib import Path
@@ -16,17 +17,21 @@ DEFAULT_NETWORK_DIM = 32
 DEFAULT_NETWORK_ALPHA = 32
 DEFAULT_LEARNING_RATE = "1e-4"
 DEFAULT_TRAIN_STEPS = 3000
+JOB_EXIT_SUCCESS = 0
+JOB_EXIT_FAILED = 1
+JOB_EXIT_CANCELLED = 2
 
 VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 LATENT_SUFFIX = "f2k9b"
+SHARDED_SAFETENSORS_NAME_RE = re.compile(r".+-\d{5}-of-\d{5}\.safetensors$", re.IGNORECASE)
 
 
 def centralized_logs_root(training_dir: Path) -> Path:
-    return training_dir.parent / "logs"
+    return training_dir
 
 
 def next_dataset_log_run_dir(training_dir: Path, dataset_name: str) -> tuple[Path, str]:
-    logs_root = centralized_logs_root(training_dir)
+    logs_root = centralized_logs_root(training_dir) / dataset_name / "logs"
     logs_root.mkdir(parents=True, exist_ok=True)
 
     date_tag = datetime.now().strftime("%y%m%d")
@@ -110,11 +115,43 @@ def latest_resume_state_for_dataset(training_dir: Path, dataset_name: str, check
     return None, 0
 
 
+def dataset_image_directory_from_config(training_dir: Path, dataset_name: str) -> Path | None:
+    dataset_toml = training_dir / dataset_name / "dataset.toml"
+    if not dataset_toml.exists() or not dataset_toml.is_file():
+        return None
+
+    try:
+        content = dataset_toml.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    match = re.search(r'^\s*image_directory\s*=\s*"([^"]+)"', content, flags=re.MULTILINE)
+    if match is None:
+        return None
+
+    raw_path = match.group(1).strip()
+    if not raw_path:
+        return None
+
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = (dataset_toml.parent / candidate).resolve()
+
+    return candidate
+
+
 def dataset_image_files(training_dir: Path, dataset_name: str) -> list[Path]:
     images_dir = training_dir / dataset_name / "images"
-    if not images_dir.exists():
+    if images_dir.exists() and images_dir.is_dir():
+        return sorted([p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTENSIONS])
+
+    configured_images_dir = dataset_image_directory_from_config(training_dir, dataset_name)
+    if configured_images_dir is None:
         return []
-    return sorted([p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTENSIONS])
+    if not configured_images_dir.exists() or not configured_images_dir.is_dir():
+        return []
+
+    return sorted([p for p in configured_images_dir.iterdir() if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTENSIONS])
 
 
 def is_step1_ready(training_dir: Path, dataset_name: str) -> bool:
@@ -418,35 +455,19 @@ def run_command(
     cancel_requested: Callable[[], bool] | None = None,
     logger: Callable[[str], None] | None = None,
     stream_to_logger: bool = False,
+    stream_mode: str = "plain",
 ) -> None:
-    if not stream_to_logger:
-        process = subprocess.Popen(list(args), cwd=str(cwd), env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
-        while True:
-            if cancel_requested is not None and cancel_requested():
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
-                raise TrainingCancelledError("Cancelled by user.")
-
-            return_code = process.poll()
-            if return_code is not None:
-                if return_code != 0:
-                    raise RuntimeError(f"Command failed with exit code {return_code}: {' '.join(args)}")
-                return
-            time.sleep(0.2)
-
     process: subprocess.Popen | None = None
     log_path: Path | None = None
     read_offset = 0
     partial_line = ""
     recent_lines: deque[str] = deque(maxlen=40)
+    cache_progress_re = re.compile(r"^\s*\d+it\s+\[")
+    train_progress_re = re.compile(r"^steps:\s+")
 
     def flush_new_output() -> None:
         nonlocal read_offset, partial_line
-        if logger is None or log_path is None or not log_path.exists():
+        if log_path is None or not log_path.exists():
             return
         try:
             with log_path.open("r", encoding="utf-8", errors="replace") as reader:
@@ -469,26 +490,50 @@ def run_command(
         for line in lines:
             cleaned = line.rstrip("\r\n")
             recent_lines.append(cleaned)
-            logger(cleaned)
+            if stream_to_logger and logger is not None:
+                if stream_mode == "cache_progress":
+                    if cache_progress_re.search(cleaned):
+                        logger("\r" + cleaned)
+                elif stream_mode == "train_progress":
+                    if train_progress_re.search(cleaned):
+                        logger("\r" + cleaned)
+                else:
+                    logger(cleaned)
 
     def flush_partial_line() -> None:
         nonlocal partial_line
-        if logger is None:
-            return
         if not partial_line:
             return
         cleaned = partial_line.rstrip("\r\n")
         recent_lines.append(cleaned)
-        logger(cleaned)
+        if stream_to_logger and logger is not None:
+            if stream_mode == "cache_progress":
+                if cache_progress_re.search(cleaned):
+                    logger("\r" + cleaned)
+            elif stream_mode == "train_progress":
+                if train_progress_re.search(cleaned):
+                    logger("\r" + cleaned)
+            else:
+                logger(cleaned)
         partial_line = ""
 
     try:
         env = os.environ.copy()
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("PYTHONIOENCODING", "utf-8")
+        popen_kwargs: dict[str, object] = {
+            "cwd": str(cwd),
+            "env": env,
+        }
+        if os.name == "nt" and stream_to_logger:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = getattr(subprocess, "SW_MINIMIZE", 6)
+            popen_kwargs["startupinfo"] = startupinfo
+
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", errors="replace", delete=False, suffix=".log") as log_file:
             log_path = Path(log_file.name)
-            process = subprocess.Popen(list(args), cwd=str(cwd), stdout=log_file, stderr=subprocess.STDOUT, env=env)
+            process = subprocess.Popen(list(args), stdout=log_file, stderr=subprocess.STDOUT, **popen_kwargs)
             while True:
                 flush_new_output()
                 if cancel_requested is not None and cancel_requested():
@@ -533,6 +578,44 @@ def format_command_for_log(args: Iterable[str]) -> str:
     return subprocess.list2cmdline([str(arg) for arg in args])
 
 
+def toml_quote(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def toml_string_list(values: list[str]) -> str:
+    return "[" + ", ".join(toml_quote(value) for value in values) + "]"
+
+
+def normalize_model_checkpoint_path(path_value: Path, label: str) -> Path:
+    candidate = path_value.expanduser()
+    if not candidate.exists():
+        return candidate
+
+    if candidate.is_file() and candidate.name.lower().endswith(".safetensors.index.json"):
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"{label} index file is invalid JSON: {candidate}\nDetails: {exc}") from exc
+
+        weight_map = payload.get("weight_map", {})
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise RuntimeError(f"{label} index file has no weight_map entries: {candidate}")
+
+        shard_names = sorted({str(v) for v in weight_map.values() if isinstance(v, str) and v.lower().endswith(".safetensors")})
+        preferred = next((name for name in shard_names if re.search(r"-00001-of-\d+\.safetensors$", name, flags=re.IGNORECASE)), None)
+        shard_name = preferred or (shard_names[0] if shard_names else None)
+        if not shard_name:
+            raise RuntimeError(f"{label} index file did not reference any .safetensors shards: {candidate}")
+
+        shard_path = candidate.parent / shard_name
+        if not shard_path.is_file():
+            raise RuntimeError(f"{label} shard file referenced by index does not exist: {shard_path}")
+        return shard_path
+
+    return candidate
+
+
 def run_steps_for_model(
     runtime_config: KleinRuntimeConfig,
     model_name: str,
@@ -560,6 +643,8 @@ def run_steps_for_model(
     resume_step_offset: int,
     warmstart_checkpoint: Path | None,
     train_steps_override: int | None,
+    output_name_override: str | None,
+    output_dir_override: Path | None,
     logger: Callable[[str], None],
     cancel_requested: Callable[[], bool] | None = None,
 ) -> None:
@@ -575,9 +660,14 @@ def run_steps_for_model(
     def require_model_file(path_value: Path | None, label: str) -> Path:
         if path_value is None:
             raise RuntimeError(f"{label} is not configured. Open Settings and select a file for {label}.")
-        if not path_value.is_file():
-            raise RuntimeError(f"{label} file does not exist: {path_value}")
-        return path_value
+        normalized = normalize_model_checkpoint_path(path_value, label)
+        if not normalized.is_file():
+            raise RuntimeError(f"{label} file does not exist: {normalized}")
+        return normalized
+
+    def resolve_text_encoder_file(path_value: Path | None) -> Path:
+        selected = require_model_file(path_value, "Klein Text Encoder")
+        return selected
 
     def check_cancel() -> None:
         if cancel_requested is not None and cancel_requested():
@@ -612,10 +702,10 @@ def run_steps_for_model(
     musubi_python = require_musubi_python()
 
     dataset_config = runtime_config.training_dir / model_name / "dataset.toml"
-    output_dir = runtime_config.training_dir / model_name / "output"
+    output_dir = output_dir_override if output_dir_override is not None else (runtime_config.training_dir / model_name / "output")
     dataset_config = dataset_config.resolve()
     output_dir = output_dir.resolve()
-    output_name = f"{model_name}_Klein"
+    output_name = (output_name_override or "").strip() or f"{model_name}_Klein"
     output_name_for_run = (
         f"{output_name}-resume" if (resume_state_dir is not None and resume_step_offset > 0) else output_name
     )
@@ -661,24 +751,35 @@ def run_steps_for_model(
         if before_total > 0 and before_ready == before_total:
             logger(f"  cache_latents: already ready ({before_ready}/{before_total}), skipped")
         else:
-            run_command(
-                [
-                    str(musubi_python),
-                    "flux_2_cache_latents.py",
-                    "--dataset_config",
-                    str(dataset_config),
-                    "--vae",
-                    str(vae_path),
-                    "--batch_size",
-                    "16",
-                    "--model_version",
-                    runtime_config.model_version,
-                ],
-                cwd=runtime_config.musubi_dir,
-                cancel_requested=cancel_requested,
-                logger=logger,
-                stream_to_logger=False,
-            )
+            try:
+                run_command(
+                    [
+                        str(musubi_python),
+                        "flux_2_cache_latents.py",
+                        "--dataset_config",
+                        str(dataset_config),
+                        "--vae",
+                        str(vae_path),
+                        "--batch_size",
+                        "16",
+                        "--model_version",
+                        runtime_config.model_version,
+                    ],
+                    cwd=runtime_config.musubi_dir,
+                    cancel_requested=cancel_requested,
+                    logger=logger,
+                    stream_to_logger=stream_training_output,
+                    stream_mode="cache_progress",
+                )
+            except TrainingCancelledError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    "Klein VAE appears invalid or incompatible for Flux2 caching.\n"
+                    "Open Settings and verify Klein > VAE points to the correct VAE checkpoint file.\n"
+                    f"Details: {exc}"
+                ) from exc
+
             after_ready, after_total = count_latent_cache_ready(runtime_config.training_dir, model_name)
             generated = max(0, after_ready - before_ready)
             logger(f"  cache_latents: done ({after_ready}/{after_total} ready, +{generated} generated)")
@@ -688,30 +789,42 @@ def run_steps_for_model(
         check_cancel()
         current_step += 1
         logger(f"[{current_step}/{total_steps}]   Cache Text Encoder:")
-        text_encoder_path = require_model_file(runtime_config.text_encoder, "Klein Text Encoder")
+        text_encoder_path = resolve_text_encoder_file(runtime_config.text_encoder)
         text_encoder_path = text_encoder_path.resolve()
+        logger(f"  text_encoder: {text_encoder_path}")
         before_ready, before_total = count_text_cache_ready(runtime_config.training_dir, model_name)
         if before_total > 0 and before_ready == before_total:
             logger(f"  cache_text: already ready ({before_ready}/{before_total}), skipped")
         else:
-            run_command(
-                [
-                    str(musubi_python),
-                    "flux_2_cache_text_encoder_outputs.py",
-                    "--dataset_config",
-                    str(dataset_config),
-                    "--text_encoder",
-                    str(text_encoder_path),
-                    "--batch_size",
-                    "16",
-                    "--model_version",
-                    runtime_config.model_version,
-                ],
-                cwd=runtime_config.musubi_dir,
-                cancel_requested=cancel_requested,
-                logger=logger,
-                stream_to_logger=False,
-            )
+            try:
+                run_command(
+                    [
+                        str(musubi_python),
+                        "flux_2_cache_text_encoder_outputs.py",
+                        "--dataset_config",
+                        str(dataset_config),
+                        "--text_encoder",
+                        str(text_encoder_path),
+                        "--batch_size",
+                        "16",
+                        "--model_version",
+                        runtime_config.model_version,
+                    ],
+                    cwd=runtime_config.musubi_dir,
+                    cancel_requested=cancel_requested,
+                    logger=logger,
+                    stream_to_logger=stream_training_output,
+                    stream_mode="cache_progress",
+                )
+            except TrainingCancelledError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    "Klein Text Encoder appears invalid or incompatible for Flux2 text caching.\n"
+                    "Open Settings and verify Klein > Text Encoder points to the correct checkpoint.\n"
+                    f"Details: {exc}"
+                ) from exc
+
             after_ready, after_total = count_text_cache_ready(runtime_config.training_dir, model_name)
             generated = max(0, after_ready - before_ready)
             logger(f"  cache_text: done ({after_ready}/{after_total} ready, +{generated} generated)")
@@ -723,10 +836,11 @@ def run_steps_for_model(
         logger(f"[{current_step}/{total_steps}]   Train:")
         dit_path = require_model_file(runtime_config.dit, "Klein Model")
         vae_path = require_model_file(runtime_config.vae, "Klein VAE")
-        text_encoder_path = require_model_file(runtime_config.text_encoder, "Klein Text Encoder")
+        text_encoder_path = resolve_text_encoder_file(runtime_config.text_encoder)
         dit_path = dit_path.resolve()
         vae_path = vae_path.resolve()
         text_encoder_path = text_encoder_path.resolve()
+        logger(f"  text_encoder: {text_encoder_path}")
         output_dir.mkdir(parents=True, exist_ok=True)
 
         train_steps_for_run = train_steps_override if train_steps_override is not None else train_steps
@@ -811,58 +925,92 @@ def run_steps_for_model(
             )
         optimizer_arg = "prodigyopt.Prodigy" if optimizer_key == "prodigy" else "adamw8bit"
         learning_rate_for_run = "1" if optimizer_key == "prodigy" else learning_rate
-        optimizer_args_flags: list[str] = []
+        optimizer_args_values: list[str] = []
         if optimizer_key == "prodigy":
-            optimizer_args_flags = [
-                "--optimizer_args",
+            optimizer_args_values = [
                 "safeguard_warmup=True",
                 "use_bias_correction=True",
                 "weight_decay=0.01",
                 "betas=(0.9,0.99)",
             ]
+        train_config_path = output_dir.parent / "train_config.toml"
+        config_lines: list[str] = [
+            f"dit = {toml_quote(str(dit_path))}",
+            f"vae = {toml_quote(str(vae_path))}",
+            'vae_dtype = "bf16"',
+            f"text_encoder = {toml_quote(str(text_encoder_path))}",
+            f"model_version = {toml_quote(runtime_config.model_version)}",
+            f"optimizer_type = {toml_quote(optimizer_arg)}",
+            'timestep_sampling = "flux2_shift"',
+            f"dataset_config = {toml_quote(str(dataset_config))}",
+            f"output_dir = {toml_quote(str(output_dir))}",
+            f"output_name = {toml_quote(output_name_for_run)}",
+            'network_module = "networks.lora_flux_2"',
+            f"network_dim = {network_dim}",
+            f"network_alpha = {network_alpha}",
+            f"learning_rate = {learning_rate_for_run}",
+            f"max_train_steps = {train_steps_for_run}",
+            'mixed_precision = "bf16"',
+            "sdpa = true",
+            "gradient_checkpointing = true",
+            f"gradient_checkpointing_cpu_offload = {'true' if enable_gradient_checkpointing_cpu_offload else 'false'}",
+            "persistent_data_loader_workers = true",
+            "max_data_loader_n_workers = 2",
+            "save_every_n_steps = 250",
+            "save_state = true",
+            "save_state_on_train_end = true",
+            "seed = 42",
+            f"fp8_base = {'true' if enable_fp8_dit else 'false'}",
+            f"fp8_scaled = {'true' if enable_fp8_dit else 'false'}",
+            f"compile = {'true' if enable_compile_optimizations else 'false'}",
+            f"cuda_allow_tf32 = {'true' if (enable_compile_optimizations and enable_cuda_allow_tf32) else 'false'}",
+            f"cuda_cudnn_benchmark = {'true' if (enable_compile_optimizations and enable_cuda_cudnn_benchmark) else 'false'}",
+            f"compile_cache_size_limit = {32 if enable_compile_optimizations else 0}",
+        ]
+        if optimizer_args_values:
+            config_lines.append(f"optimizer_args = {toml_string_list(optimizer_args_values)}")
+        if enable_training_logging:
+            config_lines.extend(
+                [
+                    f"log_with = {toml_quote(log_backend)}",
+                    f"logging_dir = {toml_quote(str(logging_dir))}",
+                ]
+            )
+            if tracker_name:
+                config_lines.append(f"log_tracker_name = {toml_quote(tracker_name)}")
+        if warmstart_checkpoint is not None:
+            config_lines.append(f"network_weights = {toml_quote(str(warmstart_checkpoint))}")
+        if resume_state_dir is not None:
+            config_lines.append(f"resume = {toml_quote(str(resume_state_dir))}")
+
+        train_config_path.write_text("\n".join(config_lines) + "\n", encoding="utf-8")
+
         train_args = [
             str(musubi_python),
             "flux_2_train_network.py",
-            "--dit", str(dit_path),
-            "--vae", str(vae_path),
-            "--vae_dtype", "bf16",
-            "--text_encoder", str(text_encoder_path),
-            "--model_version", runtime_config.model_version,
-            "--optimizer_type", optimizer_arg,
-            "--timestep_sampling", "flux2_shift",
-            "--dataset_config", str(dataset_config),
-            "--output_dir", str(output_dir),
-            "--output_name", output_name_for_run,
-            "--network_module", "networks.lora_flux_2",
-            "--network_dim", str(network_dim),
-            "--network_alpha", str(network_alpha),
-            "--learning_rate", learning_rate_for_run,
-            "--max_train_steps", str(train_steps_for_run),
-            "--mixed_precision", "bf16",
-            "--sdpa",
-            "--gradient_checkpointing",
-            *gc_offload_flags,
-            "--persistent_data_loader_workers",
-            "--max_data_loader_n_workers", "2",
-            "--save_every_n_steps", "250",
-            "--save_state",
-            "--save_state_on_train_end",
-            "--seed", "42",
-            *optimizer_args_flags,
-            *fp8_flags,
-            *compile_flags,
-            *logging_flags,
-            *(["--network_weights", str(warmstart_checkpoint)] if warmstart_checkpoint is not None else []),
-            *(["--resume", str(resume_state_dir)] if resume_state_dir is not None else []),
+            "--config_file",
+            str(train_config_path),
         ]
+        logger(f"  train_config: {train_config_path}")
         logger(f"  train_command: {format_command_for_log(train_args)}")
-        run_command(
-            train_args,
-            cwd=runtime_config.musubi_dir,
-            cancel_requested=cancel_requested,
-            logger=logger,
-            stream_to_logger=stream_training_output,
-        )
+        try:
+            run_command(
+                train_args,
+                cwd=runtime_config.musubi_dir,
+                cancel_requested=cancel_requested,
+                logger=logger,
+                stream_to_logger=stream_training_output,
+                stream_mode="train_progress",
+            )
+        except TrainingCancelledError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                "Training launch failed due to invalid or incompatible Klein model files.\n"
+                "Open Settings and verify Klein > Model, VAE, and Text Encoder paths.\n"
+                f"Details: {exc}"
+            ) from exc
+
         logger("")
 
 
@@ -985,6 +1133,8 @@ def train_models(
                 resume_step_offset=resume_step_offset,
                 warmstart_checkpoint=effective_warmstart_checkpoint,
                 train_steps_override=train_steps_override,
+                output_name_override=None,
+                output_dir_override=None,
                 logger=logger,
                 cancel_requested=cancel_requested,
             )
@@ -1024,3 +1174,104 @@ def train_models(
 
     logger("All model runs completed.")
     return 0
+
+
+def run_job(
+    runtime_config: KleinRuntimeConfig,
+    dataset_name: str,
+    output_name: str,
+    output_dir: Path,
+    default_caption_keyword: str,
+    resolution: int,
+    network_dim: int,
+    network_alpha: int,
+    optimizer_type: str,
+    learning_rate: str,
+    train_steps: int,
+    enable_compile_optimizations: bool,
+    enable_cuda_allow_tf32: bool,
+    enable_cuda_cudnn_benchmark: bool,
+    enable_fp8_dit: bool,
+    enable_gradient_checkpointing_cpu_offload: bool,
+    enable_training_logging: bool,
+    training_log_backend: str,
+    training_log_tracker_name: str,
+    stream_training_output: bool,
+    auto_cleanup_states: bool,
+    logger: Callable[[str], None],
+    do_prep_dataset: bool,
+    do_cache_latents: bool,
+    do_cache_text: bool,
+    do_train: bool,
+    cancel_requested: Callable[[], bool] | None = None,
+    on_error: Callable[[str], None] | None = None,
+) -> int:
+    if not dataset_name.strip():
+        message = "No dataset selected for job."
+        logger(message)
+        if on_error is not None:
+            on_error(message)
+        return 1
+
+    if not output_name.strip():
+        message = "Output name is required for job."
+        logger(message)
+        if on_error is not None:
+            on_error(message)
+        return 1
+
+    if not (do_prep_dataset or do_cache_latents or do_cache_text or do_train):
+        message = "No steps selected. Select at least one step."
+        logger(message)
+        if on_error is not None:
+            on_error(message)
+        return 1
+
+    try:
+        run_steps_for_model(
+            runtime_config,
+            dataset_name,
+            default_caption_keyword=default_caption_keyword,
+            resolution=resolution,
+            network_dim=network_dim,
+            network_alpha=network_alpha,
+            optimizer_type=optimizer_type,
+            learning_rate=learning_rate,
+            train_steps=train_steps,
+            enable_compile_optimizations=enable_compile_optimizations,
+            enable_cuda_allow_tf32=enable_cuda_allow_tf32,
+            enable_cuda_cudnn_benchmark=enable_cuda_cudnn_benchmark,
+            enable_fp8_dit=enable_fp8_dit,
+            enable_gradient_checkpointing_cpu_offload=enable_gradient_checkpointing_cpu_offload,
+            enable_training_logging=enable_training_logging,
+            training_log_backend=training_log_backend,
+            training_log_tracker_name=training_log_tracker_name,
+            stream_training_output=stream_training_output,
+            do_prep_dataset=do_prep_dataset,
+            do_cache_latents=do_cache_latents,
+            do_cache_text=do_cache_text,
+            do_train=do_train,
+            resume_state_dir=None,
+            resume_step_offset=0,
+            warmstart_checkpoint=None,
+            train_steps_override=None,
+            output_name_override=output_name,
+            output_dir_override=output_dir,
+            logger=logger,
+            cancel_requested=cancel_requested,
+        )
+        if auto_cleanup_states:
+            cleanup_step_states_for_completed_run(runtime_config.training_dir, dataset_name, logger)
+        logger(f"Job completed: {output_name}")
+        return JOB_EXIT_SUCCESS
+    except TrainingCancelledError:
+        if auto_cleanup_states:
+            cleanup_step_states_for_cancel(runtime_config.training_dir, dataset_name, logger)
+        logger("Job cancelled by user.")
+        return JOB_EXIT_CANCELLED
+    except Exception as exc:
+        message = str(exc)
+        logger(f"Job failed for '{output_name}': {message}")
+        if on_error is not None:
+            on_error(message)
+        return JOB_EXIT_FAILED

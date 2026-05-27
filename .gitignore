@@ -1,8 +1,11 @@
 # Large local assets
 Models/*
 !Models/.gitkeep
-Training/*
-!Training/.gitkeep
+Jobs/*
+!Jobs/.gitkeep
+Datasets/*
+!Datasets/.gitkeep
+logs/*
 
 # Python bytecode and caches
 __pycache__/

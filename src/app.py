@@ -5,11 +5,13 @@ import re
 import json
 import configparser
 import ctypes
-import math
 import socket
 import shutil
 import subprocess
 import threading
+import time
+import traceback
+import uuid
 import webbrowser
 from pathlib import Path
 from typing import Callable
@@ -61,6 +63,9 @@ from .klein_train import (
     DEFAULT_NETWORK_DIM,
     DEFAULT_RESOLUTION,
     DEFAULT_TRAIN_STEPS,
+    JOB_EXIT_CANCELLED,
+    JOB_EXIT_SUCCESS,
+    run_job,
     train_models,
 )
 
@@ -74,6 +79,8 @@ DATASET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 DATASET_SETTINGS_FILE_NAME = "settings.json"
 DATASET_USE_GLOBAL_TRAIN_KEY = "use_global_train_settings"
 TRAIN_DIM_ALPHA_CHOICES = ("16", "32", "64")
+JOB_SETTINGS_FILE_NAME = "settings.json"
+JOBS_ORDER_FILE_NAME = "_order.json"
 
 
 def get_positive_int_setting(settings: dict[str, str], key: str, fallback: int, minimum: int = 1) -> int:
@@ -96,10 +103,6 @@ def get_train_optimizer_setting(settings: dict[str, str]) -> str:
 def get_train_log_backend_setting(settings: dict[str, str]) -> str:
     _value = settings.get(TRAIN_LOG_BACKEND_KEY, "").strip().lower()
     return "tensorboard"
-
-
-def dataset_log_dir(training_dir: Path, dataset_name: str) -> Path:
-    return training_dir.parent / "logs"
 
 
 def is_truthy(raw_value: str | None, default: bool = False) -> bool:
@@ -179,10 +182,11 @@ def scan_training_folders(training_dir: Path) -> list[str]:
 
 
 def dataset_image_files(training_dir: Path, dataset_name: str) -> list[Path]:
-    images_dir = training_dir / dataset_name / "images"
-    if not images_dir.exists():
+    dataset_dir = training_dir / dataset_name
+    if not dataset_dir.exists() or not dataset_dir.is_dir():
         return []
-    return sorted([p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTENSIONS])
+
+    return sorted([p for p in dataset_dir.iterdir() if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTENSIONS])
 
 
 def is_step1_ready(training_dir: Path, dataset_name: str) -> bool:
@@ -400,7 +404,7 @@ def launch_ui() -> int:
         "TButton",
         background="#353535",
         foreground=fg_text,
-        padding=(10, 4),
+        padding=(10, 2),
         bordercolor=border_dark,
         lightcolor=border_dark,
         darkcolor=border_dark,
@@ -572,16 +576,57 @@ def launch_ui() -> int:
         arrowcolor=[("active", "#b0b0b0")],
     )
     style.configure(
+        "Queue.Treeview",
+        background="#141924",
+        fieldbackground="#141924",
+        foreground=fg_text,
+        font=("Segoe UI", 10),
+        borderwidth=0,
+        relief="flat",
+        rowheight=52,
+    )
+    style.map(
+        "Queue.Treeview",
+        background=[("selected", "#1e4a7a")],
+        foreground=[("selected", "#e8f4ff")],
+    )
+    style.configure(
+        "Queue.Treeview.Heading",
+        background="#1a2233",
+        foreground="#8ba7cc",
+        font=("Segoe UI", 8, "bold"),
+        borderwidth=0,
+        relief="flat",
+        padding=(4, 6),
+    )
+    style.map(
+        "Queue.Treeview.Heading",
+        background=[("active", "#1e2a40")],
+    )
+    style.configure(
+        "QueueAction.TButton",
+        background="#1f1f1f",
+        padding=(0, 0),
+        borderwidth=0,
+        relief="flat",
+        focuscolor="#1f1f1f",
+        font=("Segoe UI Emoji", 10),
+    )
+    style.map(
+        "QueueAction.TButton",
+        background=[("active", "#1f1f1f"), ("disabled", "#1f1f1f")],
+    )
+    style.configure(
         "StartDisabled.TButton",
         background=color_start_disabled,
         foreground="#c6c6c6",
-        padding=(10, 8),
-        borderwidth=2,
+        padding=(10, 4),
+        borderwidth=1,
         bordercolor="#4a4a4a",
         lightcolor="#565656",
         darkcolor="#2f2f2f",
         relief="raised",
-        font=("Segoe UI", 10, "bold"),
+        font=("Segoe UI", 9, "bold"),
     )
     style.map(
         "StartDisabled.TButton",
@@ -592,13 +637,13 @@ def launch_ui() -> int:
         "StartEnabled.TButton",
         background=color_start_enabled,
         foreground="#ffffff",
-        padding=(10, 8),
-        borderwidth=2,
+        padding=(10, 4),
+        borderwidth=1,
         bordercolor="#2ea95a",
         lightcolor="#63e394",
         darkcolor="#238149",
         relief="raised",
-        font=("Segoe UI", 10, "bold"),
+        font=("Segoe UI", 9, "bold"),
     )
     style.map(
         "StartEnabled.TButton",
@@ -609,13 +654,13 @@ def launch_ui() -> int:
         "StartInProgress.TButton",
         background=color_start_in_progress,
         foreground="#ffffff",
-        padding=(10, 8),
-        borderwidth=2,
+        padding=(10, 4),
+        borderwidth=1,
         bordercolor="#cc7000",
         lightcolor="#ffb347",
         darkcolor="#a85b00",
         relief="raised",
-        font=("Segoe UI", 10, "bold"),
+        font=("Segoe UI", 9, "bold"),
     )
     style.map(
         "StartInProgress.TButton",
@@ -647,6 +692,16 @@ def launch_ui() -> int:
     tensorboard_started_by_app = False
     tensorboard_process: subprocess.Popen | None = None
     metrics_viewer_button: ttk.Button | None = None
+    job_queue: list[dict[str, str]] = []
+    queue_drag_index: int | None = None
+    queue_drag_moved = False
+    queue_drag_allowed = False
+    queue_row_action_buttons: dict[str, tk.Label] = {}
+    queue_row_thumb_labels: dict[str, tk.Label] = {}
+    queue_row_checkbox_labels: dict[str, tk.Label] = {}
+    queue_row_dividers: dict[str, tk.Frame] = {}
+    queue_col_dividers: list[tk.Frame] = []
+    queue_thumb_by_item: dict[str, ImageTk.PhotoImage] = {}
     runtime_config = klein_runtime_config_from_settings(settings_state)
     tensorboard_host = "127.0.0.1"
     tensorboard_port = 6006
@@ -690,7 +745,7 @@ def launch_ui() -> int:
         if runtime_config is None:
             return False
 
-        logs_root = runtime_config.training_dir.parent / "logs"
+        logs_root = runtime_config.training_dir
         try:
             logs_root.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -802,10 +857,74 @@ def launch_ui() -> int:
             TRAIN_STEPS_KEY: str(get_positive_int_setting(settings_state, TRAIN_STEPS_KEY, DEFAULT_TRAIN_STEPS)),
         }
 
+    def datasets_root_dir() -> Path:
+        return runtime_config.training_dir.parent / "Datasets"
+
+    def ensure_datasets_root_dir() -> Path:
+        path = datasets_root_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def dataset_dir_path(dataset_name: str) -> Path:
+        return datasets_root_dir() / dataset_name
+
+    def training_job_dir_path(training_name: str) -> Path:
+        return runtime_config.training_dir / training_name
+
+    def ensure_training_job_structure(
+        training_name: str,
+        dataset_name: str,
+        resolution: int,
+        default_caption_keyword: str,
+    ) -> tuple[Path, Path, int]:
+        dataset_dir = dataset_dir_path(dataset_name)
+        image_files = dataset_image_files(datasets_root_dir(), dataset_name)
+        if not image_files:
+            raise RuntimeError(f"Dataset images not found in: {dataset_dir}")
+        images_dir = image_files[0].parent
+
+        job_dir = training_job_dir_path(training_name)
+        cache_dir = job_dir / "cache"
+        output_dir = job_dir / "output"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        created_captions = 0
+        caption_text = default_caption_keyword.strip()
+        for image_path in image_files:
+            caption_path = image_path.with_suffix(".txt")
+            if caption_path.exists():
+                continue
+            caption_path.write_text(caption_text, encoding="utf-8")
+            created_captions += 1
+
+        dataset_toml_path = job_dir / "dataset.toml"
+        dataset_toml_path.write_text(
+            "\n".join(
+                [
+                    "[general]",
+                    f"resolution = [{resolution}, {resolution}]",
+                    'caption_extension = ".txt"',
+                    "batch_size = 1",
+                    "enable_bucket = true",
+                    "bucket_no_upscale = false",
+                    "",
+                    "[[datasets]]",
+                    f'image_directory = "{images_dir.resolve().as_posix()}"',
+                    f'cache_directory = "{cache_dir.resolve().as_posix()}"',
+                    "num_repeats = 1",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        return job_dir, output_dir, created_captions
+
     def dataset_settings_path(dataset_name: str) -> Path:
         if runtime_config is None:
             return Path(DATASET_SETTINGS_FILE_NAME)
-        return runtime_config.training_dir / dataset_name / DATASET_SETTINGS_FILE_NAME
+        return dataset_dir_path(dataset_name) / DATASET_SETTINGS_FILE_NAME
 
     def load_dataset_train_settings_raw(dataset_name: str, refresh: bool = False) -> dict[str, str]:
         if not refresh and dataset_name in dataset_train_settings_cache:
@@ -984,15 +1103,64 @@ def launch_ui() -> int:
         dialog.title("Settings")
         dialog.transient(root)
         dialog.grab_set()
-        dialog.resizable(False, False)
+        dialog.resizable(True, True)
         dialog.configure(bg=bg_panel)
         set_dark_title_bar(dialog)
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=0)
 
-        frame = ttk.Frame(dialog, padding=10)
-        frame.grid(row=0, column=0, sticky="nsew")
+        scroll_host = ttk.Frame(dialog)
+        scroll_host.grid(row=0, column=0, sticky="nsew")
+        scroll_host.columnconfigure(0, weight=1)
+        scroll_host.rowconfigure(0, weight=1)
+
+        settings_canvas = tk.Canvas(
+            scroll_host,
+            bg=bg_panel,
+            bd=0,
+            highlightthickness=0,
+            relief="flat",
+        )
+        settings_canvas.grid(row=0, column=0, sticky="nsew")
+        settings_scrollbar = ttk.Scrollbar(scroll_host, orient="vertical", command=settings_canvas.yview)
+        settings_scrollbar.grid(row=0, column=1, sticky="ns")
+        settings_canvas.configure(yscrollcommand=settings_scrollbar.set)
+
+        frame = ttk.Frame(settings_canvas, padding=10)
+        frame_window_id = settings_canvas.create_window((0, 0), window=frame, anchor="nw")
         frame.columnconfigure(0, weight=1)
+
+        footer = ttk.Frame(dialog, padding=(10, 8, 10, 10))
+        footer.grid(row=1, column=0, sticky="ew")
+        footer.columnconfigure(0, weight=1)
+
+        def sync_settings_scrollregion(_event: tk.Event | None = None) -> None:
+            settings_canvas.configure(scrollregion=settings_canvas.bbox("all"))
+
+        def sync_settings_canvas_width(_event: tk.Event) -> None:
+            settings_canvas.itemconfigure(frame_window_id, width=_event.width)
+
+        def on_settings_mousewheel(event: tk.Event) -> str:
+            delta = int(-event.delta / 120)
+            if delta == 0:
+                delta = -1 if event.delta > 0 else 1
+            settings_canvas.yview_scroll(delta, "units")
+            return "break"
+
+        def on_settings_linux_up(_event: tk.Event) -> str:
+            settings_canvas.yview_scroll(-1, "units")
+            return "break"
+
+        def on_settings_linux_down(_event: tk.Event) -> str:
+            settings_canvas.yview_scroll(1, "units")
+            return "break"
+
+        frame.bind("<Configure>", sync_settings_scrollregion)
+        settings_canvas.bind("<Configure>", sync_settings_canvas_width)
+        dialog.bind("<MouseWheel>", on_settings_mousewheel)
+        dialog.bind("<Button-4>", on_settings_linux_up)
+        dialog.bind("<Button-5>", on_settings_linux_down)
 
         musubi_section = ttk.LabelFrame(frame, text="Musubi-Tuner", padding=8)
         musubi_section.grid(row=0, column=0, sticky="ew")
@@ -1217,7 +1385,7 @@ def launch_ui() -> int:
         ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Label(
             logging_section,
-            text="Logs are stored in the app root logs folder and can be viewed via the TensorBoard button.",
+            text="Logs are stored per job under each Training/<job>/logs folder and can be viewed via TensorBoard.",
         ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         def sync_optimizer_controls() -> None:
@@ -1380,6 +1548,27 @@ def launch_ui() -> int:
                 selected_ltx_text_encoder = picked
                 ltx_text_encoder_var.set(picked)
 
+        def normalize_model_checkpoint_path(raw_path: str | None) -> str:
+            if not raw_path:
+                return ""
+            candidate = Path(raw_path).expanduser()
+            if candidate.is_file() and candidate.name.lower().endswith(".safetensors.index.json"):
+                try:
+                    payload = json.loads(candidate.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    return str(candidate)
+                weight_map = payload.get("weight_map", {})
+                if not isinstance(weight_map, dict) or not weight_map:
+                    return str(candidate)
+                shard_names = sorted({str(v) for v in weight_map.values() if isinstance(v, str) and v.lower().endswith(".safetensors")})
+                preferred = next((name for name in shard_names if re.search(r"-00001-of-\d+\.safetensors$", name, flags=re.IGNORECASE)), None)
+                shard_name = preferred or (shard_names[0] if shard_names else None)
+                if shard_name:
+                    shard_path = candidate.parent / shard_name
+                    if shard_path.is_file():
+                        return str(shard_path)
+            return str(candidate)
+
         def save_and_close() -> None:
             nonlocal result, settings_state, selected_musubi_python
             if not selected_musubi_path:
@@ -1472,10 +1661,17 @@ def launch_ui() -> int:
                 messagebox.showerror("Invalid value", "Train steps must be 1 or higher.", parent=dialog)
                 return
 
+            normalized_klein_dit = normalize_model_checkpoint_path(selected_klein_dit)
+            normalized_klein_vae = normalize_model_checkpoint_path(selected_klein_vae)
+            normalized_klein_text_encoder = normalize_model_checkpoint_path(selected_klein_text_encoder)
+            normalized_ltx_dit = normalize_model_checkpoint_path(selected_ltx_dit)
+            normalized_ltx_vae = normalize_model_checkpoint_path(selected_ltx_vae)
+            normalized_ltx_text_encoder = normalize_model_checkpoint_path(selected_ltx_text_encoder)
+
             for label, raw_path in (
-                ("Klein Model", selected_klein_dit),
-                ("Klein VAE", selected_klein_vae),
-                ("Klein Text Encoder", selected_klein_text_encoder),
+                ("Klein Model", normalized_klein_dit),
+                ("Klein VAE", normalized_klein_vae),
+                ("Klein Text Encoder", normalized_klein_text_encoder),
             ):
                 if not raw_path:
                     continue
@@ -1485,9 +1681,9 @@ def launch_ui() -> int:
                     return
 
             for label, raw_path in (
-                ("LTX Model", selected_ltx_dit),
-                ("LTX VAE", selected_ltx_vae),
-                ("LTX Text Encoder", selected_ltx_text_encoder),
+                ("LTX Model", normalized_ltx_dit),
+                ("LTX VAE", normalized_ltx_vae),
+                ("LTX Text Encoder", normalized_ltx_text_encoder),
             ):
                 if not raw_path:
                     continue
@@ -1499,17 +1695,13 @@ def launch_ui() -> int:
             settings_state[MUSUBI_DIR_KEY] = str(musubi_path)
             settings_state[MUSUBI_PYTHON_KEY] = str(musubi_python_path) if musubi_python_path is not None else ""
             settings_state[KLEIN_MODEL_VERSION_KEY] = klein_model_version
-            settings_state[KLEIN_DIT_KEY] = str(Path(selected_klein_dit).expanduser()) if selected_klein_dit else ""
-            settings_state[KLEIN_VAE_KEY] = str(Path(selected_klein_vae).expanduser()) if selected_klein_vae else ""
-            settings_state[KLEIN_TEXT_ENCODER_KEY] = (
-                str(Path(selected_klein_text_encoder).expanduser()) if selected_klein_text_encoder else ""
-            )
+            settings_state[KLEIN_DIT_KEY] = normalized_klein_dit
+            settings_state[KLEIN_VAE_KEY] = normalized_klein_vae
+            settings_state[KLEIN_TEXT_ENCODER_KEY] = normalized_klein_text_encoder
             settings_state[LTX_MODEL_VERSION_KEY] = ltx_model_version_var.get().strip()
-            settings_state[LTX_DIT_KEY] = str(Path(selected_ltx_dit).expanduser()) if selected_ltx_dit else ""
-            settings_state[LTX_VAE_KEY] = str(Path(selected_ltx_vae).expanduser()) if selected_ltx_vae else ""
-            settings_state[LTX_TEXT_ENCODER_KEY] = (
-                str(Path(selected_ltx_text_encoder).expanduser()) if selected_ltx_text_encoder else ""
-            )
+            settings_state[LTX_DIT_KEY] = normalized_ltx_dit
+            settings_state[LTX_VAE_KEY] = normalized_ltx_vae
+            settings_state[LTX_TEXT_ENCODER_KEY] = normalized_ltx_text_encoder
             settings_state[DEFAULT_CAPTION_KEYWORD_KEY] = default_caption_keyword_var.get().strip()
             settings_state[ENABLE_COMPILE_OPTIMIZATIONS_KEY] = "1" if compile_optimizations_var.get() else "0"
             settings_state[ENABLE_CUDA_ALLOW_TF32_KEY] = "1" if cuda_allow_tf32_var.get() else "0"
@@ -1578,8 +1770,8 @@ def launch_ui() -> int:
             row=7, column=0, sticky="w", pady=(10, 8)
         )
 
-        button_row = ttk.Frame(frame)
-        button_row.grid(row=8, column=0, sticky="ew")
+        button_row = ttk.Frame(footer)
+        button_row.grid(row=0, column=0, sticky="ew")
         button_row.columnconfigure(0, weight=1)
         ttk.Button(button_row, text="Reset Settings", command=reset_settings).grid(row=0, column=0, sticky="w")
         ttk.Button(button_row, text="Cancel", command=cancel_and_close).grid(row=0, column=1, padx=(0, 8))
@@ -1606,12 +1798,17 @@ def launch_ui() -> int:
 
         dialog.protocol("WM_DELETE_WINDOW", cancel_and_close)
         dialog.update_idletasks()
+        sync_settings_scrollregion()
 
-        content_w = frame.winfo_reqwidth() + 20
+        content_w = max(frame.winfo_reqwidth(), footer.winfo_reqwidth()) + 44
         content_h = frame.winfo_reqheight() + 20
+        max_w = max(760, dialog.winfo_screenwidth() - 80)
+        max_h = max(480, dialog.winfo_screenheight() - 80)
         win_w = max(780, min(1080, content_w))
-        win_h = max(520, content_h)
+        win_w = min(win_w, max_w)
+        win_h = min(max(520, content_h), max_h)
         dialog.geometry(f"{win_w}x{win_h}")
+        settings_canvas.yview_moveto(0.0)
         center_window(dialog)
         dialog.focus_set()
         root.wait_window(dialog)
@@ -1639,7 +1836,9 @@ def launch_ui() -> int:
     root.rowconfigure(1, weight=0)
     root.rowconfigure(2, weight=5, minsize=360)
     root.rowconfigure(3, weight=0)
-    root.rowconfigure(4, weight=2)
+    root.rowconfigure(4, weight=0)
+    root.rowconfigure(5, weight=0)
+    root.rowconfigure(6, weight=2)
 
     header = ttk.Frame(root, padding=8)
     header.grid(row=0, column=0, sticky="ew")
@@ -1649,7 +1848,7 @@ def launch_ui() -> int:
 
     controls = ttk.Frame(root, padding=(8, 0, 8, 8))
     controls.grid(row=1, column=0, sticky="ew")
-    controls.columnconfigure(3, weight=1)
+    controls.columnconfigure(1, weight=1)
 
     def apply_settings_from_dialog(required: bool = False) -> bool:
         nonlocal runtime_config, dataset_order
@@ -1661,6 +1860,9 @@ def launch_ui() -> int:
         training_path_var.set(f"Training folder: {runtime_config.training_dir}")
         dataset_order = load_dataset_order(settings_state)
         rebuild_folder_list(force=True)
+        load_job_queue_from_disk()
+        refresh_job_queue_list()
+        update_start_button_state()
         maybe_autostart_tensorboard()
         return True
 
@@ -1685,19 +1887,16 @@ def launch_ui() -> int:
             )
             return
 
-        dataset_dir = runtime_config.training_dir / dataset_name
+        datasets_root = ensure_datasets_root_dir()
+        dataset_dir = datasets_root / dataset_name
         if dataset_dir.exists():
             messagebox.showerror("Name unavailable", f"Dataset '{dataset_name}' already exists.", parent=root)
             return
 
-        images_dir = dataset_dir / "images"
-        cache_dir = dataset_dir / "cache"
-        output_dir = dataset_dir / "output"
+        images_dir = dataset_dir
 
         try:
             images_dir.mkdir(parents=True, exist_ok=False)
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             messagebox.showerror("Create failed", f"Could not create dataset structure:\n{exc}", parent=root)
             return
@@ -1747,12 +1946,12 @@ def launch_ui() -> int:
         else:
             messagebox.showinfo(
                 "Dataset created",
-                f"Created dataset '{dataset_name}' with an empty images folder.",
+                f"Created dataset '{dataset_name}' with an empty dataset folder.",
                 parent=root,
             )
 
     def open_dataset_in_file_manager(dataset_name: str) -> None:
-        dataset_dir = runtime_config.training_dir / dataset_name
+        dataset_dir = dataset_dir_path(dataset_name)
         if not dataset_dir.exists() or not dataset_dir.is_dir():
             messagebox.showerror("Open failed", f"Dataset folder not found:\n{dataset_dir}", parent=root)
             return
@@ -1765,52 +1964,6 @@ def launch_ui() -> int:
                 subprocess.Popen(["xdg-open", str(dataset_dir)])
         except OSError as exc:
             messagebox.showerror("Open failed", f"Could not open folder:\n{exc}", parent=root)
-
-    def delete_logs_for_dataset(dataset_name: str) -> None:
-        logs_root = dataset_log_dir(runtime_config.training_dir, dataset_name)
-        if not logs_root.exists() or not logs_root.is_dir():
-            messagebox.showinfo("Delete Logs", "No centralized logs folder found.", parent=root)
-            return
-
-        date_pattern = r"\d{6}"
-        run_pattern = re.compile(rf"^{re.escape(dataset_name)}_{date_pattern}_\d{{2}}$", re.IGNORECASE)
-        run_dirs = sorted([p for p in logs_root.iterdir() if p.is_dir() and run_pattern.match(p.name)])
-        if not run_dirs:
-            messagebox.showinfo(
-                "Delete Logs",
-                f"No logs found for dataset '{dataset_name}' in:\n{logs_root}",
-                parent=root,
-            )
-            return
-
-        if not messagebox.askyesno(
-            "Delete Logs",
-            f"Delete {len(run_dirs)} log folder(s) for '{dataset_name}'?\n\nThis cannot be undone.",
-            parent=root,
-        ):
-            return
-
-        deleted_count = 0
-        for run_dir in run_dirs:
-            try:
-                shutil.rmtree(run_dir)
-                deleted_count += 1
-            except OSError:
-                continue
-
-        if deleted_count == len(run_dirs):
-            messagebox.showinfo(
-                "Delete Logs",
-                f"Deleted {deleted_count} log folder(s) for '{dataset_name}'.",
-                parent=root,
-            )
-            return
-
-        messagebox.showwarning(
-            "Delete Logs",
-            f"Deleted {deleted_count}/{len(run_dirs)} log folder(s) for '{dataset_name}'.",
-            parent=root,
-        )
 
     def open_metrics_viewer_dialog() -> None:
         nonlocal tensorboard_launch_in_progress
@@ -1895,14 +2048,14 @@ def launch_ui() -> int:
                     pass
 
     def add_images_to_dataset(dataset_name: str) -> None:
-        dataset_dir = runtime_config.training_dir / dataset_name
-        images_dir = dataset_dir / "images"
+        dataset_dir = dataset_dir_path(dataset_name)
+        images_dir = dataset_dir
         allowed_import_suffixes = VALID_IMAGE_EXTENSIONS | {".txt"}
         if not images_dir.exists():
             try:
                 images_dir.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
-                messagebox.showerror("Add images failed", f"Could not create images folder:\n{exc}", parent=root)
+                messagebox.showerror("Add images failed", f"Could not create dataset folder:\n{exc}", parent=root)
                 return
 
         selected_files = filedialog.askopenfilenames(
@@ -1968,7 +2121,7 @@ def launch_ui() -> int:
     def open_dataset_config_dialog(dataset_name: str) -> None:
         effective = effective_train_settings_for_dataset(dataset_name)
         global_values = global_train_settings()
-        image_count = len(dataset_image_files(runtime_config.training_dir, dataset_name))
+        image_count = len(dataset_image_files(datasets_root_dir(), dataset_name))
 
         dialog = tk.Toplevel(root)
         dialog.title(f"Dataset Configure - {dataset_name}")
@@ -2498,11 +2651,22 @@ def launch_ui() -> int:
 
     def lora_post_hoc_ema_merge(dataset_name: str) -> None:
         output_dir = runtime_config.training_dir / dataset_name / "output"
-        available = dataset_output_safetensors(dataset_name)
+        lora_post_hoc_ema_merge_for_output(dataset_name, output_dir)
+
+    def lora_post_hoc_ema_merge_for_output(target_name: str, output_dir: Path) -> None:
+        if not output_dir.exists() or not output_dir.is_dir():
+            messagebox.showerror(
+                "Merge unavailable",
+                "No output folder was found for this job.",
+                parent=root,
+            )
+            return
+
+        available = sorted([p for p in output_dir.iterdir() if p.is_file() and p.suffix.lower() == ".safetensors"])
         if not available:
             messagebox.showerror(
                 "Merge unavailable",
-                "No .safetensors files were found in this dataset output folder.",
+                "No .safetensors files were found in this output folder.",
                 parent=root,
             )
             return
@@ -2516,7 +2680,7 @@ def launch_ui() -> int:
             )
             return
 
-        merge_options = ask_lora_merge_options(dataset_name, available)
+        merge_options = ask_lora_merge_options(target_name, available)
         if merge_options is None:
             return
         selected_files, selected_jobs = merge_options
@@ -2542,7 +2706,7 @@ def launch_ui() -> int:
         created_paths: list[Path] = []
         for merge_mode_label, merge_mode_suffix, merge_mode_args, preset_name in selected_jobs:
             output_path = next_merged_output_path(
-                dataset_name,
+                target_name,
                 output_dir,
                 merge_mode_suffix,
                 preset_name,
@@ -2570,7 +2734,7 @@ def launch_ui() -> int:
                 ]
 
             log(
-                f"[Post-Hoc EMA] Merging {len(selected_files)} checkpoint(s) for '{dataset_name}' "
+                f"[Post-Hoc EMA] Merging {len(selected_files)} checkpoint(s) for '{target_name}' "
                 f"using {merge_mode_label} / {preset_name}..."
             )
             result = subprocess.run(
@@ -2603,7 +2767,7 @@ def launch_ui() -> int:
             created_text = "\n".join(str(path) for path in created_paths)
             messagebox.showinfo("Post-Hoc EMA merge complete", f"Created:\n{created_text}", parent=root)
 
-        checkpoint_cache.pop(dataset_name, None)
+        checkpoint_cache.pop(target_name, None)
         rebuild_folder_list(force=True)
 
     def open_lora_merge_tool_dialog() -> None:
@@ -3146,26 +3310,15 @@ def launch_ui() -> int:
 
     def show_thumbnail_context_menu(event: tk.Event, dataset_name: str) -> str:
         menu = tk.Menu(root, tearoff=0)
-        menu.add_command(label="Configure", command=lambda: open_dataset_config_dialog(dataset_name))
-        menu.add_separator()
         menu.add_command(label="Open Dataset", command=lambda: open_dataset_in_file_manager(dataset_name))
         menu.add_command(label="Add Images", command=lambda: add_images_to_dataset(dataset_name))
-        menu.add_command(label="Open Metrics (TensorBoard)", command=open_metrics_viewer_dialog)
-        menu.add_command(label="Delete Logs", command=lambda: delete_logs_for_dataset(dataset_name))
-        menu.add_separator()
-        has_output_loras = bool(dataset_output_safetensors(dataset_name))
-        menu.add_command(
-            label="LoRA Post-Hoc EMA Merge",
-            state=("normal" if has_output_loras else "disabled"),
-            command=lambda: lora_post_hoc_ema_merge(dataset_name),
-        )
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
         return "break"
 
-    list_container = ttk.LabelFrame(root, text="Datasets (click thumbnail to toggle, drag to reorder)", padding=8)
+    list_container = ttk.LabelFrame(root, text="Datasets (click thumbnail to select)", padding=8)
     list_container.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 0))
     list_container.columnconfigure(0, weight=1)
     list_container.columnconfigure(1, weight=0, minsize=12)
@@ -3196,12 +3349,67 @@ def launch_ui() -> int:
     canvas.grid(row=0, column=0, sticky="nsew")
     scrollbar.grid(row=0, column=1, sticky="ns")
 
+    dataset_actions_bar = ttk.Frame(root, padding=(8, 8, 8, 0))
+    dataset_actions_bar.grid(row=3, column=0, sticky="ew")
+    dataset_actions_bar.columnconfigure(0, weight=1)
+
     start_bar = ttk.Frame(root, padding=(8, 0, 8, 8))
-    start_bar.grid(row=3, column=0, sticky="ew")
+    start_bar.grid(row=5, column=0, sticky="ew")
     start_bar.columnconfigure(0, weight=1)
 
+    queue_container = ttk.LabelFrame(root, text="Queue", padding=8)
+    queue_container.grid(row=4, column=0, sticky="ew", padx=8, pady=(8, 0))
+    queue_container.columnconfigure(0, weight=1)
+    queue_container.rowconfigure(0, weight=1)
+
+    queue_table_border = tk.Frame(queue_container, bg="#2a4a72", bd=0, highlightthickness=0)
+    queue_table_border.grid(row=0, column=0, columnspan=2, sticky="nsew")
+    queue_table_border.columnconfigure(0, weight=1)
+    queue_table_border.rowconfigure(0, weight=1)
+
+    queue_list = ttk.Treeview(
+        queue_table_border,
+        columns=("thumb", "name", "source", "status", "actions"),
+        show="tree headings",
+        selectmode="browse",
+        height=6,
+        style="Queue.Treeview",
+    )
+    queue_list.heading("#0", text="", anchor="center")
+    queue_list.heading("thumb", text="", anchor="center")
+    queue_list.heading("name", text="   LoRA Name", anchor="w")
+    queue_list.heading("source", text="   Source Dataset", anchor="w")
+    queue_list.heading("status", text="Status", anchor="center")
+    queue_list.heading("actions", text="", anchor="center")
+    queue_list.column("#0", width=44, minwidth=42, stretch=False, anchor="center")
+    queue_list.column("thumb", width=76, minwidth=68, stretch=False, anchor="center")
+    queue_list.column("name", width=156, minwidth=120, stretch=True, anchor="w")
+    queue_list.column("source", width=118, minwidth=90, stretch=True, anchor="w")
+    queue_list.column("status", width=96, minwidth=82, stretch=False, anchor="center")
+    queue_list.column("actions", width=36, minwidth=32, stretch=False, anchor="center")
+    queue_list.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+    queue_list.tag_configure("row_even", background="#1c2534")
+    queue_list.tag_configure("row_odd", background="#17202e")
+    queue_list.tag_configure("row_running", background="#163326", foreground="#a7f3cc")
+    queue_list.tag_configure("row_even_disabled", background="#191e28", foreground="#5a6474")
+    queue_list.tag_configure("row_odd_disabled", background="#141923", foreground="#5a6474")
+    queue_list.tag_configure("status_done", foreground="#4ade80")
+    queue_list.tag_configure("status_failed", foreground="#f87171")
+    queue_list.tag_configure("status_running", foreground="#a7f3cc")
+    queue_list.tag_configure("status_resume", foreground="#fbbf24")
+    queue_list.tag_configure("status_paused", foreground="#fb923c")
+
+    queue_scroll = ttk.Scrollbar(
+        queue_table_border,
+        orient="vertical",
+        command=queue_list.yview,
+        style="Dark.Vertical.TScrollbar",
+    )
+    queue_scroll.grid(row=0, column=1, sticky="ns", pady=1, padx=(0, 1))
+    queue_list.configure(yscrollcommand=queue_scroll.set)
+
     log_container = ttk.Frame(root)
-    log_container.grid(row=4, column=0, sticky="nsew", padx=8, pady=(0, 8))
+    log_container.grid(row=6, column=0, sticky="nsew", padx=8, pady=(0, 8))
     log_container.columnconfigure(0, weight=1)
     log_container.rowconfigure(0, weight=1)
 
@@ -3223,13 +3431,36 @@ def launch_ui() -> int:
     log_scroll_x.grid(row=1, column=0, sticky="ew")
     log_box.configure(yscrollcommand=log_scroll_y.set, xscrollcommand=log_scroll_x.set)
     log_box.configure(bg="#0e1319", fg=fg_text, insertbackground=fg_text, relief="flat", borderwidth=0)
+    log_progress_active = False
+    log_progress_mark = "log_progress_line_start"
+
+    def is_log_scrolled_to_bottom() -> bool:
+        _first, last = log_box.yview()
+        return last >= 0.999
 
     def log(message: str) -> None:
         def append_line() -> None:
+            nonlocal log_progress_active
             if not root.winfo_exists():
                 return
-            log_box.insert("end", message + "\n")
-            log_box.see("end")
+
+            at_bottom = is_log_scrolled_to_bottom()
+            if message.startswith("\r"):
+                progress_text = message[1:]
+                if not log_progress_active:
+                    log_box.mark_set(log_progress_mark, "end")
+                    log_box.mark_gravity(log_progress_mark, tk.LEFT)
+                    log_box.insert("end", progress_text + "\n")
+                    log_progress_active = True
+                else:
+                    log_box.delete(log_progress_mark, f"{log_progress_mark} lineend+1c")
+                    log_box.insert(log_progress_mark, progress_text + "\n")
+            else:
+                log_progress_active = False
+                log_box.insert("end", message + "\n")
+
+            if at_bottom:
+                log_box.see("end")
             root.update_idletasks()
 
         if threading.current_thread() is threading.main_thread():
@@ -3237,19 +3468,931 @@ def launch_ui() -> int:
         else:
             root.after(0, append_line)
 
+    def bool_to_flag(value: bool) -> str:
+        return "1" if value else "0"
+
+    def flag_to_bool(value: str, default: bool = False) -> bool:
+        return is_truthy(value, default=default)
+
+    def jobs_storage_dir() -> Path:
+        return runtime_config.training_dir
+
+    def jobs_order_file_path() -> Path:
+        return jobs_storage_dir() / JOBS_ORDER_FILE_NAME
+
+    def job_settings_file_path(training_name: str) -> Path:
+        return training_job_dir_path(training_name) / JOB_SETTINGS_FILE_NAME
+
+    def ensure_jobs_storage() -> None:
+        jobs_storage_dir().mkdir(parents=True, exist_ok=True)
+
+    def save_job_order() -> None:
+        ensure_jobs_storage()
+        order = [job.get("id", "") for job in job_queue if job.get("id", "").strip()]
+        jobs_order_file_path().write_text(json.dumps(order, indent=2), encoding="utf-8")
+
+    def save_job_to_disk(job: dict[str, str]) -> None:
+        ensure_jobs_storage()
+        job_id = job.get("id", "").strip()
+        if not job_id:
+            return
+        training_name = job.get("training_name", "").strip() or job.get("job_name", "").strip()
+        if not training_name:
+            return
+        job["training_name"] = training_name
+        job["training_dir"] = str(training_job_dir_path(training_name))
+        job["output_dir"] = str((training_job_dir_path(training_name) / "output").expanduser())
+        settings_path = job_settings_file_path(training_name)
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
+
+    def remove_job_from_disk(job: dict[str, str]) -> None:
+        try:
+            training_name = job.get("training_name", "").strip() or job.get("job_name", "").strip()
+            if not training_name:
+                return
+            path = job_settings_file_path(training_name)
+            if path.exists():
+                path.unlink()
+        except OSError:
+            pass
+
+    def make_job_id() -> str:
+        return uuid.uuid4().hex[:12]
+
+    def existing_job_names() -> set[str]:
+        return {job.get("job_name", "").strip().lower() for job in job_queue if job.get("job_name", "").strip()}
+
+    def discovered_training_names() -> set[str]:
+        discovered: set[str] = set()
+        root = jobs_storage_dir()
+        if not root.exists() or not root.is_dir():
+            return discovered
+        for child in root.iterdir():
+            if not child.is_dir():
+                continue
+            if child.name.lower() in {"logs", "__pycache__"}:
+                continue
+            if (
+                (child / "dataset.toml").exists()
+                or (child / "output").is_dir()
+                or (child / "cache").is_dir()
+                or (child / "logs").is_dir()
+            ):
+                discovered.add(child.name.strip().lower())
+        return discovered
+
+    def unique_job_name(base_name: str) -> str:
+        base = base_name.strip() or "job"
+        existing = existing_job_names() | discovered_training_names()
+        if base.lower() not in existing:
+            return base
+        suffix = 2
+        while True:
+            candidate = f"{base}_{suffix}"
+            if candidate.lower() not in existing:
+                return candidate
+            suffix += 1
+
+    def job_output_names(job: dict[str, str]) -> set[str]:
+        names = {
+            job.get("job_name", "").strip(),
+            job.get("training_name", "").strip(),
+        }
+        return {name for name in names if name}
+
+    def job_resume_progress(job: dict[str, str]) -> tuple[int, bool]:
+        output_dir = Path(job.get("output_dir", "")).expanduser()
+        if not output_dir.exists() or not output_dir.is_dir():
+            return 0, False
+
+        output_names = job_output_names(job)
+        if not output_names:
+            return 0, False
+
+        latest_step = 0
+        has_resume_state = False
+        ckpt_patterns = [
+            re.compile(rf"^{re.escape(name)}(?:_Klein)?(?:-resume)?-step(\d+)\.safetensors$", re.IGNORECASE)
+            for name in output_names
+        ]
+        state_patterns = [
+            re.compile(rf"^{re.escape(name)}(?:_Klein)?(?:-resume)?-step(\d+)-state$", re.IGNORECASE)
+            for name in output_names
+        ]
+        loose_state_names = {
+            f"{name}-state".lower() for name in output_names
+        } | {
+            f"{name}_Klein-state".lower() for name in output_names
+        } | {
+            f"{name}-resume-state".lower() for name in output_names
+        } | {
+            f"{name}_Klein-resume-state".lower() for name in output_names
+        }
+
+        for path in output_dir.iterdir():
+            path_name = path.name
+            path_name_lower = path_name.lower()
+
+            if path.is_file() and path.suffix.lower() == ".safetensors":
+                for pattern in ckpt_patterns:
+                    match = pattern.match(path_name)
+                    if match is None:
+                        continue
+                    step = int(match.group(1))
+                    if step > latest_step:
+                        latest_step = step
+                    has_resume_state = True
+                    break
+
+            if not path.is_dir():
+                continue
+
+            for pattern in state_patterns:
+                match = pattern.match(path_name)
+                if match is None:
+                    continue
+                step = int(match.group(1))
+                if step > latest_step:
+                    latest_step = step
+                has_resume_state = True
+                break
+
+            if path_name_lower in loose_state_names and (path / "scheduler.bin").exists():
+                has_resume_state = True
+
+        return latest_step, has_resume_state
+
+    def infer_dataset_name_from_training_dir(job_dir: Path) -> str:
+        dataset_toml = job_dir / "dataset.toml"
+        if dataset_toml.exists() and dataset_toml.is_file():
+            try:
+                content = dataset_toml.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                content = ""
+            match = re.search(r'^\s*image_directory\s*=\s*"([^"]+)"', content, flags=re.MULTILINE)
+            if match is not None:
+                try:
+                    image_dir = Path(match.group(1).strip()).expanduser()
+                    if not image_dir.is_absolute():
+                        image_dir = (dataset_toml.parent / image_dir).resolve()
+                    if image_dir.name.lower() == "images" and image_dir.parent.name:
+                        return image_dir.parent.name
+                    if image_dir.name:
+                        return image_dir.name
+                except Exception:
+                    pass
+        return ""
+
+    def build_recovered_job_from_training_dir(job_dir: Path) -> dict[str, str]:
+        train_settings = global_train_settings()
+        training_name = job_dir.name.strip()
+        dataset_name = infer_dataset_name_from_training_dir(job_dir).strip() or training_name
+        output_dir = (job_dir / "output").expanduser()
+        return {
+            "id": make_job_id(),
+            "dataset_name": dataset_name,
+            "training_name": training_name,
+            "training_dir": str(job_dir),
+            "job_name": training_name,
+            "model": "Klein",
+            "output_dir": str(output_dir),
+            "resolution": train_settings[TRAIN_RESOLUTION_KEY],
+            "network_dim": train_settings[TRAIN_NETWORK_DIM_KEY],
+            "network_alpha": train_settings[TRAIN_NETWORK_ALPHA_KEY],
+            "optimizer_type": train_settings[TRAIN_OPTIMIZER_TYPE_KEY],
+            "learning_rate": train_settings[TRAIN_LEARNING_RATE_KEY],
+            "train_steps": train_settings[TRAIN_STEPS_KEY],
+            "enable_compile": settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0"),
+            "enable_tf32": settings_state.get(ENABLE_CUDA_ALLOW_TF32_KEY, "1"),
+            "enable_cudnn": settings_state.get(ENABLE_CUDA_CUDNN_BENCHMARK_KEY, "1"),
+            "enable_fp8": settings_state.get(ENABLE_FP8_DIT_KEY, "0"),
+            "enable_gc": settings_state.get(ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY, "0"),
+            "enable_logging": bool_to_flag(is_truthy(settings_state.get(TRAIN_ENABLE_LOGGING_KEY), default=True)),
+            "tracker_name": training_name,
+            "stream_output": bool_to_flag(is_truthy(settings_state.get(TRAIN_STREAM_TO_LOGGER_KEY), default=False)),
+            "auto_cleanup": bool_to_flag(is_truthy(settings_state.get(TRAIN_AUTO_CLEANUP_STATES_KEY), default=True)),
+            "hold": "0",
+            "status": "queued",
+        }
+
+    def detect_job_status(job: dict[str, str]) -> str:
+        hold = flag_to_bool(job.get("hold", "0"))
+        output_dir = Path(job.get("output_dir", "")).expanduser()
+        output_names = job_output_names(job)
+        has_finished_output = any((output_dir / f"{name}.safetensors").exists() for name in output_names)
+        if has_finished_output:
+            return "done"
+
+        global_train_steps = get_positive_int_setting(settings_state, TRAIN_STEPS_KEY, DEFAULT_TRAIN_STEPS)
+        target_steps = get_positive_int_setting(job, "train_steps", global_train_steps)
+        progress_step, has_resume_data = job_resume_progress(job)
+        if has_resume_data and progress_step >= target_steps:
+            return "done"
+
+        if hold:
+            return "paused"
+
+        status = job.get("status", "queued").strip().lower()
+        if status == "running":
+            return "running" if run_in_progress else "queued"
+        if status == "cancelled":
+            return "resume"
+        if has_resume_data:
+            return "resume"
+        if status in {"queued", "failed", "resume"}:
+            return status
+        return "queued"
+
+    def persist_queue_state() -> None:
+        for job in job_queue:
+            save_job_to_disk(job)
+        save_job_order()
+
+    def load_job_queue_from_disk() -> None:
+        ensure_jobs_storage()
+        job_queue.clear()
+
+        loaded_jobs: dict[str, dict[str, str]] = {}
+        for child in sorted(jobs_storage_dir().iterdir(), key=lambda p: p.name.lower()):
+            if not child.is_dir():
+                continue
+            training_name = child.name.strip()
+            if training_name.lower() in {"logs", "__pycache__"}:
+                continue
+
+            settings_path = child / JOB_SETTINGS_FILE_NAME
+            if settings_path.exists() and settings_path.is_file():
+                try:
+                    raw = json.loads(settings_path.read_text(encoding="utf-8"))
+                except Exception:
+                    raw = None
+                if not isinstance(raw, dict):
+                    raw = None
+            else:
+                raw = None
+
+            if raw is None:
+                if not (
+                    (child / "dataset.toml").exists()
+                    or (child / "output").is_dir()
+                    or (child / "cache").is_dir()
+                    or (child / "logs").is_dir()
+                ):
+                    continue
+                normalized = build_recovered_job_from_training_dir(child)
+            else:
+                normalized = {str(k): str(v) for k, v in raw.items()}
+
+            job_id = normalized.get("id", "").strip() or make_job_id()
+            normalized["id"] = job_id
+            normalized["training_name"] = training_name
+            normalized["training_dir"] = str(child)
+            normalized["output_dir"] = str((child / "output").expanduser())
+            if not normalized.get("job_name", "").strip():
+                normalized["job_name"] = training_name
+            if not normalized.get("dataset_name", "").strip():
+                normalized["dataset_name"] = infer_dataset_name_from_training_dir(child).strip() or training_name
+            normalized["status"] = detect_job_status(normalized)
+            loaded_jobs[job_id] = normalized
+
+        order: list[str] = []
+        order_path = jobs_order_file_path()
+        if order_path.exists():
+            try:
+                raw_order = json.loads(order_path.read_text(encoding="utf-8"))
+                if isinstance(raw_order, list):
+                    order = [str(item) for item in raw_order]
+            except Exception:
+                order = []
+
+        for job_id in order:
+            job = loaded_jobs.pop(job_id, None)
+            if job is not None:
+                job_queue.append(job)
+
+        for job_id in sorted(loaded_jobs.keys()):
+            job_queue.append(loaded_jobs[job_id])
+
+        persist_queue_state()
+
+    def selected_dataset_names() -> list[str]:
+        return [name for name, var in vars_by_name.items() if var.get()]
+
+    def selected_queue_index() -> int | None:
+        selection = queue_list.selection()
+        if not selection:
+            return None
+        try:
+            index = int(selection[0])
+        except (TypeError, ValueError):
+            return None
+        if index < 0 or index >= len(job_queue):
+            return None
+        return index
+
+    def set_queue_selection(index: int) -> None:
+        if index < 0 or index >= len(job_queue):
+            return
+        item_id = str(index)
+        queue_list.selection_set(item_id)
+        queue_list.focus(item_id)
+        queue_list.see(item_id)
+
+    def refresh_job_queue_list() -> None:
+        queue_list.delete(*queue_list.get_children())
+        queue_thumb_by_item.clear()
+        for index, job in enumerate(job_queue):
+            status = detect_job_status(job)
+            if job.get("status", "") != status:
+                job["status"] = status
+                save_job_to_disk(job)
+            hold = flag_to_bool(job.get("hold", "0"))
+            if hold:
+                row_tags: list[str] = ["row_even_disabled" if index % 2 == 0 else "row_odd_disabled", "status_paused"]
+            else:
+                if status == "running":
+                    row_tags = ["row_running", "status_running"]
+                else:
+                    row_tags = ["row_even" if index % 2 == 0 else "row_odd"]
+                if status == "done":
+                    row_tags.append("status_done")
+                elif status == "failed":
+                    row_tags.append("status_failed")
+                elif status == "resume":
+                    row_tags.append("status_resume")
+                elif status == "paused":
+                    row_tags.append("status_paused")
+            if status == "running":
+                queue_thumb_state = "in_progress"
+            elif status == "done":
+                queue_thumb_state = "done"
+            else:
+                queue_thumb_state = "pending"
+            queue_thumb = make_thumbnail(first_image_path(job.get("dataset_name", "").strip()), queue_thumb_state, 40)
+            item_id = str(index)
+            queue_thumb_by_item[item_id] = queue_thumb
+            queue_list.insert(
+                "",
+                "end",
+                iid=item_id,
+                text="",
+                values=(
+                    "",
+                    "   " + job.get("job_name", "unnamed"),
+                    "   " + job.get("dataset_name", "?"),
+                    (
+                        "IN PROGRESS"
+                        if status == "running"
+                        else ("RESUME" if status == "resume" else status.upper())
+                    ),
+                    "",
+                ),
+                tags=tuple(row_tags),
+            )
+        build_queue_row_checkbox_labels()
+        build_queue_row_thumb_labels()
+        build_queue_row_action_buttons()
+        build_queue_row_dividers()
+        build_queue_col_dividers()
+
+    def move_selected_queue_item(direction: int) -> None:
+        idx = selected_queue_index()
+        if idx is None:
+            return
+        new_idx = idx + direction
+        if new_idx < 0 or new_idx >= len(job_queue):
+            return
+        job_queue.insert(new_idx, job_queue.pop(idx))
+        refresh_job_queue_list()
+        set_queue_selection(new_idx)
+        save_job_order()
+        update_start_button_state()
+
+    def toggle_hold_job(index: int) -> None:
+        idx = index
+        if idx < 0 or idx >= len(job_queue):
+            return
+        current = flag_to_bool(job_queue[idx].get("hold", "0"))
+        next_hold = not current
+        job_queue[idx]["hold"] = bool_to_flag(next_hold)
+        if next_hold and job_queue[idx].get("status", "") in {"queued", "failed", "running", "resume"}:
+            job_queue[idx]["status"] = "paused"
+        elif (not next_hold) and job_queue[idx].get("status", "") == "paused":
+            job_queue[idx]["status"] = "queued"
+        save_job_to_disk(job_queue[idx])
+        refresh_job_queue_list()
+        set_queue_selection(idx)
+        update_start_button_state()
+
+    def toggle_hold_selected_job() -> None:
+        idx = selected_queue_index()
+        if idx is None:
+            return
+        toggle_hold_job(idx)
+
+    def remove_selected_job() -> None:
+        idx = selected_queue_index()
+        if idx is None:
+            return
+        delete_job_with_confirmation(idx)
+
+    def clear_queue() -> None:
+        if not job_queue:
+            return
+        if not messagebox.askyesno("Clear queue", "Remove all queued jobs?", parent=root):
+            return
+        for job in job_queue:
+            remove_job_from_disk(job)
+        job_queue.clear()
+        save_job_order()
+        refresh_job_queue_list()
+        update_start_button_state()
+
+    def show_queue_context_menu(event: tk.Event) -> str:
+        clicked_item = queue_list.identify_row(event.y)
+        if not clicked_item:
+            return "break"
+        try:
+            clicked = int(clicked_item)
+        except ValueError:
+            return "break"
+        if clicked < 0 or clicked >= len(job_queue):
+            return "break"
+        set_queue_selection(clicked)
+
+        menu = tk.Menu(root, tearoff=0)
+        menu.add_command(label="Open Output Folder", command=lambda: open_job_output_folder(clicked))
+        menu.add_command(label="LoRA Post-Hoc EMA Merge", command=lambda: merge_job_output_loras(clicked))
+        menu.add_command(label="Duplicate Job", command=lambda: duplicate_job(clicked))
+        menu.add_command(label="Edit Job", command=lambda: open_create_job_dialog(existing_job=job_queue[clicked]))
+        menu.add_separator()
+        menu.add_command(label="Delete Job", command=lambda: delete_job_with_confirmation(clicked))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def open_job_output_folder(index: int | None = None) -> None:
+        idx = selected_queue_index() if index is None else index
+        if idx is None or idx < 0 or idx >= len(job_queue):
+            return
+        output_dir = Path(job_queue[idx].get("output_dir", "")).expanduser()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(output_dir))
+        except OSError as exc:
+            messagebox.showerror("Open output failed", f"Could not open output folder:\n{exc}", parent=root)
+
+    def merge_job_output_loras(index: int | None = None) -> None:
+        idx = selected_queue_index() if index is None else index
+        if idx is None or idx < 0 or idx >= len(job_queue):
+            return
+        job = job_queue[idx]
+        job_name = job.get("job_name", "job")
+        output_dir = Path(job.get("output_dir", "")).expanduser()
+        lora_post_hoc_ema_merge_for_output(job_name, output_dir)
+
+    def duplicate_job(index: int | None = None) -> None:
+        idx = selected_queue_index() if index is None else index
+        if idx is None or idx < 0 or idx >= len(job_queue):
+            return
+        source = dict(job_queue[idx])
+        source_name = source.get("job_name", "job")
+        source_dataset = source.get("dataset_name", "").strip()
+        new_name = unique_job_name(f"{source_name}_copy")
+        if not source_dataset:
+            messagebox.showerror("Duplicate failed", "Source job has no dataset assigned.", parent=root)
+            return
+
+        resolution_value = get_positive_int_setting(source, "resolution", DEFAULT_RESOLUTION, minimum=64)
+        try:
+            training_dir_path, output_dir_path, created_captions = ensure_training_job_structure(
+                training_name=new_name,
+                dataset_name=source_dataset,
+                resolution=resolution_value,
+                default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+            )
+        except Exception as exc:
+            messagebox.showerror("Duplicate failed", str(exc), parent=root)
+            return
+
+        duplicate = {
+            **source,
+            "id": make_job_id(),
+            "job_name": new_name,
+            "training_name": new_name,
+            "training_dir": str(training_dir_path),
+            "output_dir": str(output_dir_path),
+            "status": "queued",
+            "hold": "0",
+        }
+        insert_at = idx + 1
+        job_queue.insert(insert_at, duplicate)
+        save_job_to_disk(duplicate)
+        save_job_order()
+        refresh_job_queue_list()
+        set_queue_selection(insert_at)
+        update_start_button_state()
+        log(
+            f"[Queue] Duplicated job: {source_name} -> {new_name} (source dataset: {source_dataset}, captions added: {created_captions})"
+        )
+
+    def delete_job_with_confirmation(index: int | None = None) -> None:
+        idx = selected_queue_index() if index is None else index
+        if idx is None or idx < 0 or idx >= len(job_queue):
+            return
+        job = job_queue[idx]
+        job_name = job.get("job_name", "unnamed")
+        training_name = job.get("training_name", "").strip() or job_name
+        training_dir = Path(job.get("training_dir", "")).expanduser()
+        if not training_dir.exists() and training_name:
+            training_dir = training_job_dir_path(training_name).expanduser()
+
+        if not messagebox.askyesno(
+            "Delete job",
+            (
+                f"Delete job '{job_name}'?\n\n"
+                "This will remove it from the queue and delete its job folder "
+                "(output/cache/logs/config) if it exists."
+            ),
+            parent=root,
+        ):
+            return
+
+        removed = job_queue.pop(idx)
+        remove_job_from_disk(removed)
+        save_job_order()
+
+        if training_dir.exists() and training_dir.is_dir():
+            try:
+                shutil.rmtree(training_dir)
+            except OSError as exc:
+                messagebox.showerror("Delete job folder failed", f"Could not delete job folder:\n{exc}", parent=root)
+
+        refresh_job_queue_list()
+        update_start_button_state()
+        log(f"[Queue] Deleted job: {job_name}")
+
+    def on_queue_press(event: tk.Event) -> None:
+        nonlocal queue_drag_index, queue_drag_moved, queue_drag_allowed
+        if len(job_queue) == 0:
+            queue_drag_index = None
+            queue_drag_moved = False
+            queue_drag_allowed = False
+            return
+        clicked_item = queue_list.identify_row(event.y)
+        if not clicked_item:
+            queue_drag_index = None
+            queue_drag_moved = False
+            queue_drag_allowed = False
+            return
+        try:
+            clicked = int(clicked_item)
+        except ValueError:
+            queue_drag_index = None
+            queue_drag_moved = False
+            queue_drag_allowed = False
+            return
+        if clicked < 0 or clicked >= len(job_queue):
+            queue_drag_index = None
+            queue_drag_moved = False
+            queue_drag_allowed = False
+            return
+
+        set_queue_selection(clicked)
+
+        clicked_col = queue_list.identify_column(event.x)
+        if clicked_col == "#0":
+            toggle_hold_job(clicked)
+            queue_drag_index = None
+            queue_drag_moved = False
+            queue_drag_allowed = False
+            return
+
+        queue_drag_allowed = clicked_col in {"#2", "#3", "#4"}
+        queue_drag_index = clicked if queue_drag_allowed else None
+        queue_drag_moved = False
+
+    def on_queue_motion(event: tk.Event) -> None:
+        nonlocal queue_drag_index, queue_drag_moved, queue_drag_allowed
+        if not queue_drag_allowed:
+            return
+        if queue_drag_index is None:
+            return
+        if len(job_queue) <= 1:
+            return
+        target_item = queue_list.identify_row(event.y)
+        if not target_item:
+            return
+        try:
+            target = int(target_item)
+        except ValueError:
+            return
+        if target < 0 or target >= len(job_queue) or target == queue_drag_index:
+            return
+        job_queue.insert(target, job_queue.pop(queue_drag_index))
+        queue_drag_index = target
+        queue_drag_moved = True
+        refresh_job_queue_list()
+        set_queue_selection(target)
+
+    def on_queue_release(_event: tk.Event) -> None:
+        nonlocal queue_drag_index, queue_drag_moved, queue_drag_allowed
+        if queue_drag_moved:
+            save_job_order()
+            update_start_button_state()
+        queue_drag_index = None
+        queue_drag_moved = False
+        queue_drag_allowed = False
+
+    def open_create_job_dialog(existing_job: dict[str, str] | None = None) -> None:
+        if existing_job is None:
+            selected = selected_dataset_names()
+            if not selected:
+                messagebox.showinfo("No source dataset selected", "Select one source dataset card first.", parent=root)
+                return
+            if len(selected) > 1:
+                messagebox.showinfo("Select one source dataset", "Select exactly one source dataset to create a job.", parent=root)
+                return
+            dataset_name = selected[0]
+        else:
+            dataset_name = existing_job.get("dataset_name", "").strip()
+            if not dataset_name:
+                messagebox.showerror("Invalid job", "Job has no dataset name.", parent=root)
+                return
+
+        effective = effective_train_settings_for_dataset(dataset_name)
+
+        dialog = tk.Toplevel(root)
+        dialog.title("Edit Job" if existing_job is not None else "Create Job")
+        dialog.transient(root)
+        dialog.grab_set()
+        dialog.configure(bg=bg_panel)
+        dialog.resizable(False, False)
+        set_dark_title_bar(dialog)
+
+        frame = ttk.Frame(dialog, padding=10)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(1, weight=1)
+
+        default_job_name = f"{dataset_name}_Klein"
+        if existing_job is not None:
+            default_job_name = existing_job.get("job_name", default_job_name)
+        job_name_var = tk.StringVar(value=default_job_name)
+        model_var = tk.StringVar(value=(existing_job or {}).get("model", "Klein"))
+        train_optimizer_var = tk.StringVar(value=(existing_job or {}).get("optimizer_type", get_train_optimizer_setting(effective)))
+        train_learning_rate_var = tk.StringVar(
+            value=(existing_job or {}).get("learning_rate", effective.get(TRAIN_LEARNING_RATE_KEY, DEFAULT_LEARNING_RATE))
+        )
+        train_steps_var = tk.StringVar(value=(existing_job or {}).get("train_steps", effective.get(TRAIN_STEPS_KEY, str(DEFAULT_TRAIN_STEPS))))
+        train_resolution_var = tk.StringVar(
+            value=(existing_job or {}).get("resolution", effective.get(TRAIN_RESOLUTION_KEY, str(DEFAULT_RESOLUTION)))
+        )
+        train_network_dim_var = tk.StringVar(
+            value=(existing_job or {}).get("network_dim", effective.get(TRAIN_NETWORK_DIM_KEY, str(DEFAULT_NETWORK_DIM)))
+        )
+        train_network_alpha_var = tk.StringVar(
+            value=(existing_job or {}).get("network_alpha", effective.get(TRAIN_NETWORK_ALPHA_KEY, str(DEFAULT_NETWORK_ALPHA)))
+        )
+
+        compile_var = tk.BooleanVar(
+            value=flag_to_bool((existing_job or {}).get("enable_compile", bool_to_flag(is_truthy(settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY), default=False))))
+        )
+        tf32_var = tk.BooleanVar(
+            value=flag_to_bool((existing_job or {}).get("enable_tf32", bool_to_flag(is_truthy(settings_state.get(ENABLE_CUDA_ALLOW_TF32_KEY), default=True))))
+        )
+        cudnn_var = tk.BooleanVar(
+            value=flag_to_bool((existing_job or {}).get("enable_cudnn", bool_to_flag(is_truthy(settings_state.get(ENABLE_CUDA_CUDNN_BENCHMARK_KEY), default=True))))
+        )
+        fp8_var = tk.BooleanVar(
+            value=flag_to_bool((existing_job or {}).get("enable_fp8", bool_to_flag(is_truthy(settings_state.get(ENABLE_FP8_DIT_KEY), default=False))))
+        )
+        gc_var = tk.BooleanVar(
+            value=flag_to_bool((existing_job or {}).get("enable_gc", bool_to_flag(is_truthy(settings_state.get(ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY), default=False))))
+        )
+        ttk.Label(frame, text="Source dataset:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(frame, text=dataset_name, style="PathDisplay.TLabel", anchor="w", padding=(6, 4)).grid(
+            row=0,
+            column=1,
+            sticky="ew",
+        )
+
+        ttk.Label(frame, text="Model:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Combobox(frame, textvariable=model_var, values=("Klein",), state="readonly", width=14).grid(
+            row=1,
+            column=1,
+            sticky="w",
+            pady=(8, 0),
+        )
+
+        ttk.Label(frame, text="LoRA name:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Entry(frame, textvariable=job_name_var, style="Flat.TEntry").grid(row=2, column=1, sticky="ew", pady=(8, 0))
+
+        options = ttk.LabelFrame(frame, text="Training settings", padding=8)
+        options.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        options.columnconfigure(1, weight=1)
+        options.columnconfigure(3, weight=1)
+
+        ttk.Label(options, text="Optimizer type:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        train_optimizer_combo = ttk.Combobox(
+            options,
+            textvariable=train_optimizer_var,
+            values=("adamw8bit", "prodigy"),
+            state="readonly",
+        )
+        train_optimizer_combo.grid(
+            row=0,
+            column=1,
+            sticky="ew",
+        )
+        ttk.Label(options, text="Training steps:").grid(row=0, column=2, sticky="w", padx=(12, 8))
+        ttk.Entry(options, textvariable=train_steps_var, style="Flat.TEntry").grid(row=0, column=3, sticky="ew")
+
+        ttk.Label(options, text="Learning rate:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        train_learning_rate_entry = ttk.Entry(options, textvariable=train_learning_rate_var, style="Flat.TEntry")
+        train_learning_rate_entry.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        ttk.Label(options, text="LoRA network dim:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        ttk.Combobox(options, textvariable=train_network_dim_var, values=TRAIN_DIM_ALPHA_CHOICES, state="readonly").grid(
+            row=1,
+            column=3,
+            sticky="ew",
+            pady=(6, 0),
+        )
+        ttk.Label(options, text="Dataset resolution:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Entry(options, textvariable=train_resolution_var, style="Flat.TEntry").grid(row=2, column=1, sticky="ew", pady=(6, 0))
+        ttk.Label(options, text="LoRA network alpha:").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        ttk.Combobox(options, textvariable=train_network_alpha_var, values=TRAIN_DIM_ALPHA_CHOICES, state="readonly").grid(
+            row=2,
+            column=3,
+            sticky="ew",
+            pady=(6, 0),
+        )
+
+        flags = ttk.LabelFrame(options, text="Advanced flags", padding=8)
+        flags.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        ttk.Checkbutton(flags, text="Enable Torch Compile", variable=compile_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(flags, text="Enable Allow TF32", variable=tf32_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Checkbutton(flags, text="Enable cuDNN Benchmark", variable=cudnn_var).grid(row=0, column=2, sticky="w", padx=(12, 0))
+        ttk.Checkbutton(flags, text="Enable FP8 (Low VRAM)", variable=fp8_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(flags, text="Enable CPU Gradient Checkpointing (Low RAM)", variable=gc_var).grid(
+            row=1,
+            column=1,
+            columnspan=2,
+            sticky="w",
+            padx=(12, 0),
+            pady=(6, 0),
+        )
+
+        def sync_optimizer_controls() -> None:
+            if train_optimizer_var.get().strip().lower() == "prodigy":
+                train_learning_rate_var.set("1")
+                train_learning_rate_entry.configure(state="disabled")
+            else:
+                train_learning_rate_entry.configure(state="normal")
+
+        train_optimizer_var.trace_add("write", lambda *_args: sync_optimizer_controls())
+        sync_optimizer_controls()
+
+        def create_job() -> None:
+            job_name = job_name_var.get().strip()
+            if not job_name:
+                messagebox.showerror("Missing value", "LoRA name is required.", parent=dialog)
+                return
+            if not DATASET_NAME_PATTERN.fullmatch(job_name):
+                messagebox.showerror(
+                    "Invalid name",
+                    "Use only letters, numbers, '_' or '-' for LoRA name.",
+                    parent=dialog,
+                )
+                return
+
+            try:
+                _ = int(train_steps_var.get().strip())
+                _ = int(train_resolution_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Invalid value", "Steps and Resolution must be numeric.", parent=dialog)
+                return
+
+            train_optimizer = train_optimizer_var.get().strip().lower()
+            if train_optimizer not in {"adamw8bit", "prodigy"}:
+                messagebox.showerror("Invalid value", "Optimizer type must be adamw8bit or prodigy.", parent=dialog)
+                return
+
+            train_learning_rate = train_learning_rate_var.get().strip()
+            if train_optimizer == "prodigy":
+                train_learning_rate = "1"
+                train_learning_rate_var.set("1")
+            if not train_learning_rate:
+                messagebox.showerror("Invalid value", "Learning rate is required.", parent=dialog)
+                return
+            try:
+                learning_rate_number = float(train_learning_rate)
+            except ValueError:
+                messagebox.showerror("Invalid value", "Learning rate must be numeric (example: 1e-4).", parent=dialog)
+                return
+            if learning_rate_number <= 0:
+                messagebox.showerror("Invalid value", "Learning rate must be greater than 0.", parent=dialog)
+                return
+
+            existing_index: int | None = None
+            if existing_job is not None:
+                try:
+                    existing_index = job_queue.index(existing_job)
+                except ValueError:
+                    existing_index = None
+
+            for idx, queued_job in enumerate(job_queue):
+                if existing_index is not None and idx == existing_index:
+                    continue
+                if queued_job.get("job_name", "").strip().lower() == job_name.lower():
+                    messagebox.showerror("Duplicate name", "LoRA name already exists in queue.", parent=dialog)
+                    return
+
+            if existing_job is None:
+                training_name = job_name
+            else:
+                training_name = (existing_job or {}).get("training_name", "").strip() or job_name
+
+            try:
+                resolution_value = get_positive_int_setting({"resolution": train_resolution_var.get().strip()}, "resolution", DEFAULT_RESOLUTION, minimum=64)
+                training_dir_path, output_root, created_captions = ensure_training_job_structure(
+                    training_name=training_name,
+                    dataset_name=dataset_name,
+                    resolution=resolution_value,
+                    default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+                )
+            except Exception as exc:
+                messagebox.showerror("Create job failed", str(exc), parent=dialog)
+                return
+
+            tracker_name = settings_state.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip() or job_name
+
+            new_job = {
+                "id": (existing_job or {}).get("id", "") or make_job_id(),
+                "dataset_name": dataset_name,
+                "training_name": training_name,
+                "training_dir": str(training_dir_path),
+                "job_name": job_name,
+                "model": model_var.get().strip() or "Klein",
+                "output_dir": str(output_root),
+                "resolution": train_resolution_var.get().strip(),
+                "network_dim": train_network_dim_var.get().strip(),
+                "network_alpha": train_network_alpha_var.get().strip(),
+                "optimizer_type": train_optimizer,
+                "learning_rate": train_learning_rate,
+                "train_steps": train_steps_var.get().strip(),
+                "enable_compile": bool_to_flag(compile_var.get()),
+                "enable_tf32": bool_to_flag(tf32_var.get()),
+                "enable_cudnn": bool_to_flag(cudnn_var.get()),
+                "enable_fp8": bool_to_flag(fp8_var.get()),
+                "enable_gc": bool_to_flag(gc_var.get()),
+                "enable_logging": bool_to_flag(is_truthy(settings_state.get(TRAIN_ENABLE_LOGGING_KEY), default=True)),
+                "tracker_name": tracker_name,
+                "stream_output": bool_to_flag(is_truthy(settings_state.get(TRAIN_STREAM_TO_LOGGER_KEY), default=False)),
+                "auto_cleanup": bool_to_flag(is_truthy(settings_state.get(TRAIN_AUTO_CLEANUP_STATES_KEY), default=True)),
+                "hold": (existing_job or {}).get("hold", "0"),
+                "status": "queued" if existing_job is None else detect_job_status({**(existing_job or {}), "job_name": job_name, "output_dir": str(output_root)}),
+            }
+
+            if existing_job is None:
+                job_queue.append(new_job)
+            else:
+                if existing_index is None:
+                    job_queue.append(new_job)
+                else:
+                    job_queue[existing_index] = new_job
+
+            save_job_to_disk(new_job)
+            save_job_order()
+            refresh_job_queue_list()
+            update_start_button_state()
+            if existing_job is None:
+                log(
+                    f"[Queue] Created job: {job_name} (source dataset: {dataset_name}, training: {training_name}, captions added: {created_captions})"
+                )
+            else:
+                log(
+                    f"[Queue] Updated job: {job_name} (source dataset: {dataset_name}, training: {training_name}, captions added: {created_captions})"
+                )
+            dialog.destroy()
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(buttons, text="Save" if existing_job is not None else "Create Job", command=create_job).grid(row=0, column=1)
+
+        dialog.update_idletasks()
+        center_window(dialog)
+        root.wait_window(dialog)
+
     def first_image_path(dataset_name: str) -> Path | None:
         cached = first_image_cache.get(dataset_name)
         if dataset_name in first_image_cache:
             return cached
 
-        images_dir = runtime_config.training_dir / dataset_name / "images"
-        if not images_dir.exists():
-            first_image_cache[dataset_name] = None
-            return None
-
-        image_candidates = sorted(
-            [p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTENSIONS]
-        )
+        image_candidates = dataset_image_files(datasets_root_dir(), dataset_name)
         chosen = image_candidates[0] if image_candidates else None
         first_image_cache[dataset_name] = chosen
         return chosen
@@ -3348,8 +4491,10 @@ def launch_ui() -> int:
     def toggle_dataset(name: str) -> None:
         if run_state_by_name.get(name) == "done":
             return
-        current = vars_by_name[name].get()
-        vars_by_name[name].set(not current)
+        should_select = not vars_by_name[name].get()
+        for dataset_name, var in vars_by_name.items():
+            var.set(dataset_name == name and should_select)
+            apply_card_style(dataset_name)
 
     def apply_card_style(name: str) -> None:
         card = card_frame_by_name.get(name)
@@ -3377,34 +4522,8 @@ def launch_ui() -> int:
         drag_start_y = root.winfo_pointery()
 
     def on_card_motion() -> None:
-        nonlocal drag_moved, drag_hover_dataset_name
-        if drag_dataset_name is not None:
-            if not drag_moved:
-                current_x = root.winfo_pointerx()
-                current_y = root.winfo_pointery()
-                start_x = current_x if drag_start_x is None else drag_start_x
-                start_y = current_y if drag_start_y is None else drag_start_y
-                distance = math.hypot(current_x - start_x, current_y - start_y)
-                if distance < DRAG_START_THRESHOLD_PX:
-                    return
-
-                drag_moved = True
-                show_drag_preview(drag_dataset_name)
-                apply_card_style(drag_dataset_name)
-
-            move_drag_preview()
-
-            hovered_widget = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
-            hover_name = dataset_name_from_widget(hovered_widget)
-            if hover_name == drag_dataset_name:
-                hover_name = None
-            if hover_name != drag_hover_dataset_name:
-                previous_hover = drag_hover_dataset_name
-                drag_hover_dataset_name = hover_name
-                if previous_hover is not None:
-                    apply_card_style(previous_hover)
-                if drag_hover_dataset_name is not None:
-                    apply_card_style(drag_hover_dataset_name)
+        # Dataset drag reorder is intentionally disabled; queue supports drag ordering.
+        return
 
     def dataset_name_from_widget(widget: tk.Misc | None) -> str | None:
         current: tk.Misc | None = widget
@@ -3422,7 +4541,7 @@ def launch_ui() -> int:
         return None
 
     def on_card_release(target_name: str) -> str:
-        nonlocal drag_dataset_name, drag_hover_dataset_name, drag_moved, drag_start_x, drag_start_y, dataset_order
+        nonlocal drag_dataset_name, drag_hover_dataset_name, drag_moved, drag_start_x, drag_start_y
         if drag_dataset_name is None:
             return "break"
 
@@ -3440,14 +4559,6 @@ def launch_ui() -> int:
             apply_card_style(hovered_name)
 
         if moved:
-            hovered_widget = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
-            drop_target = dataset_name_from_widget(hovered_widget) or target_name
-            if source_name != drop_target and source_name in dataset_order and drop_target in dataset_order:
-                source_idx = dataset_order.index(source_name)
-                target_idx = dataset_order.index(drop_target)
-                dataset_order.insert(target_idx, dataset_order.pop(source_idx))
-                persist_dataset_order()
-                rebuild_folder_list(force=True)
             return "break"
 
         toggle_dataset(source_name)
@@ -3516,15 +4627,9 @@ def launch_ui() -> int:
         card_frame_by_name.clear()
         card_thumb_by_name.clear()
 
-        scanned_names = scan_training_folders(runtime_config.training_dir)
-        existing = [name for name in dataset_order if name in scanned_names]
-        new_names = [name for name in scanned_names if name not in existing]
-        normalized_order = new_names + existing
-        if normalized_order != dataset_order:
-            dataset_order = normalized_order
-            persist_dataset_order()
-
-        names = dataset_order
+        ensure_datasets_root_dir()
+        names = sorted(scan_training_folders(datasets_root_dir()), key=str.casefold)
+        dataset_order = list(names)
         stale_names = [name for name in list(first_image_cache.keys()) if name not in names]
         for stale_name in stale_names:
             first_image_cache.pop(stale_name, None)
@@ -3532,7 +4637,7 @@ def launch_ui() -> int:
             dataset_train_settings_cache.pop(stale_name, None)
 
         if not names:
-            empty_label = ttk.Label(inner, text="No folders found.")
+            empty_label = ttk.Label(inner, text="No datasets found.")
             empty_label.grid(row=0, column=0, sticky="w")
             card_widgets.append(empty_label)
             update_start_button_state()
@@ -3556,24 +4661,12 @@ def launch_ui() -> int:
             inner.columnconfigure(col, minsize=card_width + gap, weight=0)
 
         for idx, name in enumerate(names):
-            checkpoint_info = checkpoint_cache.get(name)
-            if checkpoint_info is None:
-                checkpoint_info = latest_checkpoint_for_dataset(runtime_config.training_dir, name)
-                checkpoint_cache[name] = checkpoint_info
-            checkpoint_path, checkpoint_step = checkpoint_info
             effective_train = effective_train_settings_for_dataset(name)
             has_train_override = dataset_has_train_override(name)
-            train_steps_target = get_positive_int_setting(
-                effective_train,
-                TRAIN_STEPS_KEY,
-                DEFAULT_TRAIN_STEPS,
-            )
-            train_state = (
-                "done" if checkpoint_step >= train_steps_target else ("in_progress" if checkpoint_step > 0 else "pending")
-            )
+            train_state = "pending"
             run_state_by_name[name] = train_state
 
-            var = tk.BooleanVar(value=(name in selected_before) and train_state != "done")
+            var = tk.BooleanVar(value=(name in selected_before))
             vars_by_name[name] = var
 
             card_style = "DoneCard.TFrame" if train_state == "done" else ("SelectedCard.TFrame" if var.get() else "Card.TFrame")
@@ -3597,13 +4690,9 @@ def launch_ui() -> int:
 
             title_label = ttk.Label(card, text=name, style=title_style, anchor="center")
             title_label.grid(row=1, column=0, sticky="ew", pady=(6, 0))
-            status_text = ""
-            if train_state == "done":
-                status_text = "COMPLETED"
-            elif train_state == "in_progress" and checkpoint_path is not None:
-                status_text = f"RESUME {checkpoint_step}/{train_steps_target}"
-            else:
-                status_text = "START"
+            image_count = len(dataset_image_files(datasets_root_dir(), name))
+            resolution_text = effective_train.get(TRAIN_RESOLUTION_KEY, str(DEFAULT_RESOLUTION))
+            status_text = f"{image_count} IMG / {resolution_text}px"
             status_label = ttk.Label(card, text=status_text, style=meta_style, anchor="center")
             status_label.grid(row=2, column=0, sticky="ew", pady=(2, 8))
 
@@ -3614,7 +4703,6 @@ def launch_ui() -> int:
                 clickable.bind("<B1-Motion>", lambda _e: on_card_motion())
                 clickable.bind("<ButtonRelease-1>", lambda _e, n=name: on_card_release(n))
                 clickable.bind("<Button-3>", lambda e, n=name: show_thumbnail_context_menu(e, n))
-                clickable.bind("<Double-Button-1>", lambda _e, n=name: open_dataset_config_dialog(n))
 
             card_widgets.append(card)
 
@@ -3675,62 +4763,96 @@ def launch_ui() -> int:
     root.bind_all("<Button-4>", on_mousewheel_linux_up)
     root.bind_all("<Button-5>", on_mousewheel_linux_down)
 
-    def selected_names() -> list[str]:
-        return [name for name, var in vars_by_name.items() if var.get()]
-
     def update_start_button_state() -> None:
         if run_in_progress:
             if run_cancel_event is not None and run_cancel_event.is_set():
                 run_button.configure(text="Cancelling...", style="StartDisabled.TButton")
                 run_button.state(["disabled"])
             else:
-                run_button.configure(text="In Progress (Press to Cancel)", style="StartInProgress.TButton")
+                run_button.configure(text="Queue In Progress (Press to Cancel)", style="StartInProgress.TButton")
                 run_button.state(["!disabled"])
             return
 
-        run_button.configure(text="START")
-        has_selection = bool(selected_names())
-        if has_selection:
+        run_button.configure(text="START QUEUE")
+        has_runnable_jobs = any(
+            (not flag_to_bool(job.get("hold", "0"))) and job.get("status", "queued") in {"queued", "failed", "resume"}
+            for job in job_queue
+        )
+        if has_runnable_jobs:
             run_button.configure(style="StartEnabled.TButton")
             run_button.state(["!disabled"])
         else:
             run_button.configure(style="StartDisabled.TButton")
             run_button.state(["disabled"])
 
-    def select_all() -> None:
-        for name, var in vars_by_name.items():
-            var.set(run_state_by_name.get(name) != "done")
-            apply_card_style(name)
-        update_start_button_state()
-
-    def clear_selection() -> None:
-        for name, var in vars_by_name.items():
-            var.set(False)
-            apply_card_style(name)
-        update_start_button_state()
-
-    def run_selected() -> None:
+    def run_queue() -> None:
         nonlocal run_in_progress, run_cancel_event
         if run_in_progress:
             if run_cancel_event is not None and not run_cancel_event.is_set():
                 should_cancel = messagebox.askyesno(
-                    "Cancel Training",
-                    "Stop current training and cancel all remaining models?",
+                    "Cancel Queue",
+                    "Stop current job and cancel all remaining queued jobs?",
                 )
                 if should_cancel:
                     run_cancel_event.set()
-                    log("Cancellation requested. Stopping all remaining models...")
+                    log("Cancellation requested. Stopping remaining queued jobs...")
                     update_start_button_state()
             return
 
-        names = selected_names()
-        if not names:
-            messagebox.showinfo("Nothing selected", "Select at least one folder.")
+        runnable_indices = [
+            idx
+            for idx, job in enumerate(job_queue)
+            if (not flag_to_bool(job.get("hold", "0"))) and job.get("status", "queued") in {"queued", "failed", "paused", "resume"}
+        ]
+        if not runnable_indices:
+            messagebox.showinfo("Queue is empty", "Add jobs and ensure at least one job is not on hold.", parent=root)
             return
 
         run_cancel_event = threading.Event()
         run_in_progress = True
         update_start_button_state()
+        model_error_popup_shown = False
+
+        def friendly_model_config_error(details: str) -> tuple[str, str] | None:
+            text = (details or "").strip()
+            lowered = text.lower()
+
+            if "memoryerror" in lowered or "out of memory" in lowered:
+                return (
+                    "Text Encoder Load Failed",
+                    "Failed to load Klein Text Encoder due to insufficient memory or a corrupted checkpoint shard.\n\n"
+                    "This can also happen if this Musubi build is given a .safetensors.index.json path instead of a shard file.\n\n"
+                    "Verify Klein > Text Encoder is correct, and if needed reduce memory pressure before running again.\n"
+                    "Tip: close other GPU/RAM-heavy apps and retry.",
+                )
+
+            if (
+                "klein text encoder" in lowered
+                or "model.embed_tokens.weight" in lowered
+                or "flux_2_cache_text_encoder_outputs.py" in lowered
+            ):
+                return (
+                    "Invalid Text Encoder",
+                    "Selected Klein Text Encoder is invalid or incompatible.\n\n"
+                    "Open Settings and set Klein > Text Encoder to the correct file, typically:\n"
+                    "Models/klein/text_encoder/model.safetensors.index.json"
+                )
+
+            if "klein vae" in lowered or "flux_2_cache_latents.py" in lowered:
+                return (
+                    "Invalid VAE",
+                    "Selected Klein VAE is invalid or incompatible.\n\n"
+                    "Open Settings and verify Klein > VAE points to the correct Klein VAE checkpoint."
+                )
+
+            if "training launch failed due to invalid or incompatible klein model files" in lowered or "klein model" in lowered:
+                return (
+                    "Invalid Model Configuration",
+                    "Selected Klein model files are invalid or incompatible.\n\n"
+                    "Open Settings and verify Klein > Model, VAE, and Text Encoder paths."
+                )
+
+            return None
 
         def refresh_ui_now_from_worker() -> None:
             done = threading.Event()
@@ -3751,102 +4873,139 @@ def launch_ui() -> int:
             done.wait(timeout=10)
 
         def background_train() -> None:
+            nonlocal model_error_popup_shown
             try:
                 log("")
-                log("Training is in progress...")
-                failed_models: list[str] = []
-                for index, dataset_name in enumerate(names, start=1):
+                log("Queue is in progress...")
+                failed_jobs: list[str] = []
+                for queue_index in runnable_indices:
                     if run_cancel_event is not None and run_cancel_event.is_set():
                         break
 
-                    effective_train = effective_train_settings_for_dataset(dataset_name)
-                    use_global = is_truthy(effective_train.get(DATASET_USE_GLOBAL_TRAIN_KEY), default=True)
-                    mode_label = "global" if use_global else "dataset override"
-                    log(f"[{dataset_name}] train settings source: {mode_label}")
+                    job = job_queue[queue_index]
+                    job_name = job.get("job_name", f"job_{queue_index + 1}")
+                    dataset_name = job.get("dataset_name", "")
 
-                    exit_code = train_models(
-                        runtime_config,
-                        [dataset_name],
-                        default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
-                        resolution=get_positive_int_setting(
-                            effective_train,
-                            TRAIN_RESOLUTION_KEY,
-                            DEFAULT_RESOLUTION,
-                            minimum=64,
-                        ),
-                        network_dim=get_positive_int_setting(
-                            effective_train,
-                            TRAIN_NETWORK_DIM_KEY,
-                            DEFAULT_NETWORK_DIM,
-                        ),
-                        network_alpha=get_positive_int_setting(
-                            effective_train,
-                            TRAIN_NETWORK_ALPHA_KEY,
-                            DEFAULT_NETWORK_ALPHA,
-                        ),
-                        optimizer_type=get_train_optimizer_setting(effective_train),
-                        learning_rate=effective_train.get(TRAIN_LEARNING_RATE_KEY, DEFAULT_LEARNING_RATE),
-                        train_steps=get_positive_int_setting(
-                            effective_train,
-                            TRAIN_STEPS_KEY,
-                            DEFAULT_TRAIN_STEPS,
-                        ),
-                        enable_compile_optimizations=(
-                            settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0").strip().lower()
-                            in {"1", "true", "yes", "on"}
-                        ),
-                        enable_cuda_allow_tf32=(
-                            settings_state.get(ENABLE_CUDA_ALLOW_TF32_KEY, "1").strip().lower()
-                            in {"1", "true", "yes", "on"}
-                        ),
-                        enable_cuda_cudnn_benchmark=(
-                            settings_state.get(ENABLE_CUDA_CUDNN_BENCHMARK_KEY, "1").strip().lower()
-                            in {"1", "true", "yes", "on"}
-                        ),
-                        enable_fp8_dit=(
-                            settings_state.get(ENABLE_FP8_DIT_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
-                        ),
-                        enable_gradient_checkpointing_cpu_offload=(
-                            settings_state.get(ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY, "0").strip().lower()
-                            in {"1", "true", "yes", "on"}
-                        ),
-                        enable_training_logging=(
-                            settings_state.get(TRAIN_ENABLE_LOGGING_KEY, "1").strip().lower()
-                            in {"1", "true", "yes", "on"}
-                        ),
-                        training_log_backend=get_train_log_backend_setting(settings_state),
-                        training_log_tracker_name=settings_state.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip(),
-                        stream_training_output=(
-                            settings_state.get(TRAIN_STREAM_TO_LOGGER_KEY, "0").strip().lower()
-                            in {"1", "true", "yes", "on"}
-                        ),
-                        auto_cleanup_states=(
-                            settings_state.get(TRAIN_AUTO_CLEANUP_STATES_KEY, "1").strip().lower()
-                            in {"1", "true", "yes", "on"}
-                        ),
-                        logger=log,
-                        do_prep_dataset=True,
-                        do_cache_latents=True,
-                        do_cache_text=True,
-                        do_train=True,
-                        cancel_requested=(lambda: run_cancel_event is not None and run_cancel_event.is_set()),
-                    )
-                    if exit_code != 0 and not (run_cancel_event is not None and run_cancel_event.is_set()):
-                        failed_models.append(dataset_name)
+                    def mark_running() -> None:
+                        if queue_index < len(job_queue):
+                            job_queue[queue_index]["status"] = "running"
+                            save_job_to_disk(job_queue[queue_index])
+                            refresh_job_queue_list()
 
-                    has_next = index < len(names)
-                    if has_next and not (run_cancel_event is not None and run_cancel_event.is_set()):
-                        log("Refreshing dataset list before next model...")
+                    root.after(0, mark_running)
+
+                    if job.get("model", "Klein") != "Klein":
+                        log(f"[Queue] Unsupported model '{job.get('model')}' for job {job_name}.")
+                        exit_code = 1
+                    else:
+                        training_name = job.get("training_name", "").strip() or job_name
+                        dataset_source_name = job.get("dataset_name", "").strip()
+                        resolution_value = get_positive_int_setting(job, "resolution", DEFAULT_RESOLUTION, minimum=64)
+                        job_error_details = ""
+
+                        try:
+                            _training_dir, output_dir, captions_added = ensure_training_job_structure(
+                                training_name=training_name,
+                                dataset_name=dataset_source_name,
+                                resolution=resolution_value,
+                                default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+                            )
+                            if captions_added > 0:
+                                log(f"[Queue] Added {captions_added} missing caption file(s) for source dataset '{dataset_source_name}'.")
+                        except Exception as exc:
+                            log(f"[Queue] Job setup failed for {job_name}: {exc}")
+                            exit_code = 1
+                            output_dir = Path(job.get("output_dir", str(training_job_dir_path(training_name) / "output"))).expanduser()
+                        else:
+                            job["training_name"] = training_name
+                            job["training_dir"] = str(training_job_dir_path(training_name))
+                            job["output_dir"] = str(output_dir)
+                            save_job_to_disk(job)
+
+                            def capture_job_error(message: str) -> None:
+                                nonlocal job_error_details
+                                job_error_details = message
+
+                            exit_code = run_job(
+                                runtime_config,
+                                dataset_name=training_name,
+                                output_name=job_name,
+                                output_dir=output_dir,
+                                default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+                                resolution=resolution_value,
+                                network_dim=get_positive_int_setting(job, "network_dim", DEFAULT_NETWORK_DIM),
+                                network_alpha=get_positive_int_setting(job, "network_alpha", DEFAULT_NETWORK_ALPHA),
+                                optimizer_type=job.get("optimizer_type", "prodigy"),
+                                learning_rate=job.get("learning_rate", DEFAULT_LEARNING_RATE),
+                                train_steps=get_positive_int_setting(job, "train_steps", DEFAULT_TRAIN_STEPS),
+                                enable_compile_optimizations=flag_to_bool(job.get("enable_compile", "0")),
+                                enable_cuda_allow_tf32=flag_to_bool(job.get("enable_tf32", "1")),
+                                enable_cuda_cudnn_benchmark=flag_to_bool(job.get("enable_cudnn", "1")),
+                                enable_fp8_dit=flag_to_bool(job.get("enable_fp8", "0")),
+                                enable_gradient_checkpointing_cpu_offload=flag_to_bool(job.get("enable_gc", "0")),
+                                enable_training_logging=is_truthy(settings_state.get(TRAIN_ENABLE_LOGGING_KEY), default=True),
+                                training_log_backend=get_train_log_backend_setting(settings_state),
+                                training_log_tracker_name=settings_state.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip(),
+                                stream_training_output=is_truthy(settings_state.get(TRAIN_STREAM_TO_LOGGER_KEY), default=False),
+                                auto_cleanup_states=is_truthy(settings_state.get(TRAIN_AUTO_CLEANUP_STATES_KEY), default=True),
+                                logger=log,
+                                do_prep_dataset=True,
+                                do_cache_latents=True,
+                                do_cache_text=True,
+                                do_train=True,
+                                cancel_requested=(lambda: run_cancel_event is not None and run_cancel_event.is_set()),
+                                on_error=capture_job_error,
+                            )
+
+                            if (
+                                exit_code != 0
+                                and not (run_cancel_event is not None and run_cancel_event.is_set())
+                                and not model_error_popup_shown
+                            ):
+                                popup_payload = friendly_model_config_error(job_error_details)
+                                if popup_payload is not None:
+                                    popup_title, popup_message = popup_payload
+                                    model_error_popup_shown = True
+
+                                    def show_model_error_popup() -> None:
+                                        if root.winfo_exists():
+                                            messagebox.showerror(popup_title, popup_message, parent=root)
+
+                                    root.after(0, show_model_error_popup)
+
+                    def mark_done() -> None:
+                        if queue_index < len(job_queue):
+                            if exit_code == JOB_EXIT_SUCCESS:
+                                next_status = "done"
+                            elif exit_code == JOB_EXIT_CANCELLED:
+                                next_status = "resume"
+                            else:
+                                next_status = "failed"
+                            job_queue[queue_index]["status"] = next_status
+                            save_job_to_disk(job_queue[queue_index])
+                            refresh_job_queue_list()
+                            update_start_button_state()
+
+                    root.after(0, mark_done)
+
+                    if (
+                        exit_code not in {JOB_EXIT_SUCCESS, JOB_EXIT_CANCELLED}
+                        and not (run_cancel_event is not None and run_cancel_event.is_set())
+                    ):
+                        failed_jobs.append(job_name)
+
+                    if not (run_cancel_event is not None and run_cancel_event.is_set()):
                         refresh_ui_now_from_worker()
 
                 if run_cancel_event is not None and run_cancel_event.is_set():
-                    log("Training cancelled by user.")
-                elif failed_models:
-                    log(f"Training completed with failures: {', '.join(failed_models)}")
+                    log("Queue cancelled by user.")
+                elif failed_jobs:
+                    log(f"Queue completed with failures: {', '.join(failed_jobs)}")
                 else:
-                    log("Training completed.")
+                    log("Queue completed.")
             except Exception as exc:
-                log(f"Training failed unexpectedly: {exc}")
+                log(f"Queue failed unexpectedly: {exc}")
+                log(traceback.format_exc())
             finally:
                 def finish_ui() -> None:
                     nonlocal run_in_progress, run_cancel_event
@@ -3855,28 +5014,309 @@ def launch_ui() -> int:
                     rebuild_folder_list(force=True)
                     run_in_progress = False
                     run_cancel_event = None
+                    refresh_job_queue_list()
                     update_start_button_state()
 
                 root.after(0, finish_ui)
 
         threading.Thread(target=background_train, daemon=True).start()
 
-    refresh_button = ttk.Button(controls, text="Refresh", command=lambda: rebuild_folder_list(force=True))
-    select_all_button = ttk.Button(controls, text="Select All", command=select_all)
-    clear_button = ttk.Button(controls, text="Clear", command=clear_selection)
+    scan_button = ttk.Button(controls, text="Scan Datasets", command=lambda: rebuild_folder_list(force=True))
     create_dataset_button = ttk.Button(controls, text="Create Dataset", command=create_dataset)
     metrics_viewer_button = ttk.Button(controls, text="TensorBoard", command=open_metrics_viewer_dialog)
     lora_merge_tool_button = ttk.Button(controls, text="LoRA Post-Hoc EMA Merge", command=open_lora_merge_tool_dialog)
     settings_button = ttk.Button(controls, text="Settings", command=apply_settings_from_dialog)
-    run_button = ttk.Button(start_bar, text="START", command=run_selected, style="StartDisabled.TButton")
+    create_job_large_button = ttk.Button(dataset_actions_bar, text="Create Job", command=open_create_job_dialog)
+    run_button = ttk.Button(start_bar, text="START QUEUE", command=run_queue, style="StartDisabled.TButton")
 
-    refresh_button.grid(row=0, column=0, padx=(0, 8), sticky="w")
-    select_all_button.grid(row=0, column=1, padx=(0, 8), sticky="w")
-    clear_button.grid(row=0, column=2, padx=(0, 8), sticky="w")
-    create_dataset_button.grid(row=0, column=4, padx=(0, 8), sticky="e")
-    metrics_viewer_button.grid(row=0, column=5, padx=(0, 8), sticky="e")
-    lora_merge_tool_button.grid(row=0, column=6, padx=(0, 8), sticky="e")
-    settings_button.grid(row=0, column=7, sticky="e")
+    scan_button.grid(row=0, column=0, padx=(0, 8), sticky="w")
+    create_dataset_button.grid(row=0, column=2, padx=(0, 8), sticky="e")
+    metrics_viewer_button.grid(row=0, column=3, padx=(0, 8), sticky="e")
+    lora_merge_tool_button.grid(row=0, column=4, padx=(0, 8), sticky="e")
+    settings_button.grid(row=0, column=5, sticky="e")
+
+    create_job_large_button.configure(style="TButton")
+    create_job_large_button.grid(row=0, column=0, sticky="ew")
+
+    queue_list.bind("<Button-3>", show_queue_context_menu)
+    queue_list.bind("<ButtonPress-1>", on_queue_press)
+    queue_list.bind("<B1-Motion>", on_queue_motion)
+    queue_list.bind("<ButtonRelease-1>", on_queue_release)
+
+    def row_background_for_item(item_id: str) -> str:
+        if item_id in queue_list.selection():
+            return "#1e4a7a"
+        tags = set(queue_list.item(item_id, "tags"))
+        if "row_running" in tags:
+            return "#163326"
+        if "row_even_disabled" in tags:
+            return "#191e28"
+        if "row_odd_disabled" in tags:
+            return "#141923"
+        if "row_even" in tags:
+            return "#1c2534"
+        return "#17202e"
+
+    def clear_queue_row_checkbox_labels() -> None:
+        for label in queue_row_checkbox_labels.values():
+            label.destroy()
+        queue_row_checkbox_labels.clear()
+
+    def place_queue_row_checkbox_labels() -> None:
+        for item_id, cb_label in queue_row_checkbox_labels.items():
+            cell_bbox = queue_list.bbox(item_id, "#0")
+            if not cell_bbox:
+                cb_label.place_forget()
+                continue
+            x, y, width, height = cell_bbox
+            if width <= 0 or height <= 0:
+                cb_label.place_forget()
+                continue
+            row_bg = row_background_for_item(item_id)
+            cb_label.configure(bg=row_bg)
+            cb_label.place(x=x, y=y, width=width, height=height)
+
+    def build_queue_row_checkbox_labels() -> None:
+        clear_queue_row_checkbox_labels()
+        for item_id in queue_list.get_children():
+            try:
+                index = int(item_id)
+            except (TypeError, ValueError):
+                continue
+            if index < 0 or index >= len(job_queue):
+                continue
+            job = job_queue[index]
+            hold = flag_to_bool(job.get("hold", "0"))
+            row_bg = row_background_for_item(item_id)
+            cb_text = "☐" if hold else "☑"
+            cb_fg = "#4a6a8a" if hold else "#5eead4"
+            cb_label = tk.Label(
+                queue_list,
+                text=cb_text,
+                font=("Segoe UI", 17),
+                fg=cb_fg,
+                bg=row_bg,
+                bd=0,
+                padx=0,
+                pady=0,
+                relief="flat",
+                highlightthickness=0,
+                cursor="hand2",
+                anchor="center",
+            )
+            cb_label.bind("<Button-1>", lambda _e, idx=index: toggle_hold_job(idx))
+            queue_row_checkbox_labels[item_id] = cb_label
+        place_queue_row_checkbox_labels()
+
+    def clear_queue_row_dividers() -> None:
+        for div in queue_row_dividers.values():
+            div.destroy()
+        queue_row_dividers.clear()
+
+    def place_queue_row_dividers() -> None:
+        total_width = queue_list.winfo_width() - 4
+        if total_width <= 0:
+            return
+        for item_id, div in queue_row_dividers.items():
+            cell_bbox = queue_list.bbox(item_id, "#0")
+            if not cell_bbox:
+                div.place_forget()
+                continue
+            _, y, _, height = cell_bbox
+            if height <= 0:
+                div.place_forget()
+                continue
+            div.place(x=0, y=y + height - 1, width=total_width, height=1)
+
+    def build_queue_row_dividers() -> None:
+        clear_queue_row_dividers()
+        for item_id in queue_list.get_children():
+            div = tk.Frame(queue_list, bg="#2e4466", bd=0, highlightthickness=0)
+            queue_row_dividers[item_id] = div
+        place_queue_row_dividers()
+
+    def place_queue_col_dividers() -> None:
+        if not queue_col_dividers:
+            return
+        children = queue_list.get_children()
+        first_visible = next(
+            (iid for iid in children if queue_list.bbox(iid, "thumb")), None
+        )
+        if not first_visible:
+            for div in queue_col_dividers:
+                div.place_forget()
+            return
+        min_y: int | None = None
+        max_y: int | None = None
+        for iid in children:
+            bb = queue_list.bbox(iid, "thumb")
+            if bb:
+                if min_y is None or bb[1] < min_y:
+                    min_y = bb[1]
+                if max_y is None or bb[1] + bb[3] > max_y:
+                    max_y = bb[1] + bb[3]
+        if min_y is None or max_y is None:
+            for div in queue_col_dividers:
+                div.place_forget()
+            return
+        total_h = max_y - min_y
+        for div, col in zip(queue_col_dividers, ["thumb", "name", "source", "status", "actions"]):
+            bb = queue_list.bbox(first_visible, col)
+            if not bb:
+                div.place_forget()
+                continue
+            div.place(x=bb[0], y=0, width=1, height=max_y)
+            div.lift()
+
+    def build_queue_col_dividers() -> None:
+        nonlocal queue_col_dividers
+        for div in queue_col_dividers:
+            div.destroy()
+        queue_col_dividers = [
+            tk.Frame(queue_list, bg="#2e4466", bd=0, highlightthickness=0)
+            for _ in range(5)
+        ]
+        place_queue_col_dividers()
+
+    def clear_queue_row_thumb_labels() -> None:
+        for thumb_label in queue_row_thumb_labels.values():
+            thumb_label.destroy()
+        queue_row_thumb_labels.clear()
+
+    def place_queue_row_thumb_labels() -> None:
+        for item_id, thumb_label in queue_row_thumb_labels.items():
+            cell_bbox = queue_list.bbox(item_id, "thumb")
+            if not cell_bbox:
+                thumb_label.place_forget()
+                continue
+
+            x, y, width, height = cell_bbox
+            if width <= 0 or height <= 0:
+                thumb_label.place_forget()
+                continue
+
+            thumb_width = 40
+            thumb_height = 40
+            start_x = x + max(0, (width - thumb_width) // 2)
+            start_y = y + max(0, (height - thumb_height) // 2)
+            thumb_label.place(x=start_x, y=start_y, width=thumb_width, height=thumb_height)
+
+    def build_queue_row_thumb_labels() -> None:
+        clear_queue_row_thumb_labels()
+
+        for item_id in queue_list.get_children():
+            thumb_image = queue_thumb_by_item.get(item_id)
+            if thumb_image is None:
+                continue
+            row_bg = row_background_for_item(item_id)
+            thumb_label = tk.Label(
+                queue_list,
+                image=thumb_image,
+                bd=0,
+                relief="flat",
+                highlightthickness=0,
+                bg=row_bg,
+            )
+            queue_row_thumb_labels[item_id] = thumb_label
+
+        place_queue_row_thumb_labels()
+
+    def clear_queue_row_action_buttons() -> None:
+        for delete_button in queue_row_action_buttons.values():
+            delete_button.destroy()
+        queue_row_action_buttons.clear()
+
+    def place_queue_row_action_buttons() -> None:
+        for item_id, delete_button in queue_row_action_buttons.items():
+            cell_bbox = queue_list.bbox(item_id, "actions")
+            if not cell_bbox:
+                delete_button.place_forget()
+                continue
+
+            x, y, width, height = cell_bbox
+            if width <= 0 or height <= 0:
+                delete_button.place_forget()
+                continue
+
+            row_bg = row_background_for_item(item_id)
+            delete_button.configure(bg=row_bg)
+
+            button_height = max(20, height - 10)
+            delete_width = 24
+            total_width = delete_width
+            start_x = x + max(2, (width - total_width) // 2)
+            start_y = y + max(2, (height - button_height) // 2)
+
+            delete_button.place(x=start_x, y=start_y, width=delete_width, height=button_height)
+
+    def build_queue_row_action_buttons() -> None:
+        clear_queue_row_action_buttons()
+
+        for item_id in queue_list.get_children():
+            try:
+                index = int(item_id)
+            except (TypeError, ValueError):
+                continue
+
+            delete_button = tk.Label(
+                queue_list,
+                text="✕",
+                font=("Segoe UI", 13, "bold"),
+                bd=0,
+                padx=0,
+                pady=0,
+                relief="flat",
+                highlightthickness=0,
+                cursor="hand2",
+                fg="#e05252",
+                bg="#1c2534",
+            )
+            delete_button.bind("<Button-1>", lambda _event, idx=index: delete_job_with_confirmation(idx))
+            queue_row_action_buttons[item_id] = delete_button
+
+        place_queue_row_action_buttons()
+
+    def sync_all_row_overlays() -> None:
+        place_queue_row_checkbox_labels()
+        place_queue_row_thumb_labels()
+        place_queue_row_action_buttons()
+        place_queue_row_dividers()
+        place_queue_col_dividers()
+
+    def sync_queue_row_action_buttons(_event: tk.Event | None = None) -> None:
+        sync_all_row_overlays()
+
+    def on_queue_yscroll(first: str, last: str) -> None:
+        queue_scroll.set(first, last)
+        root.after_idle(sync_all_row_overlays)
+
+    def on_queue_double_click(event: tk.Event) -> str:
+        clicked_item = queue_list.identify_row(event.y)
+        if not clicked_item:
+            return "break"
+        clicked_col = queue_list.identify_column(event.x)
+        if clicked_col in {"#0", "#5"}:
+            return "break"
+        try:
+            clicked = int(clicked_item)
+        except ValueError:
+            return "break"
+        if clicked < 0 or clicked >= len(job_queue):
+            return "break"
+        set_queue_selection(clicked)
+        open_create_job_dialog(existing_job=job_queue[clicked])
+        return "break"
+
+    def on_queue_click(event: tk.Event) -> None:
+        if not queue_list.identify_row(event.y):
+            queue_list.selection_set([])
+            root.after_idle(sync_all_row_overlays)
+
+    queue_list.configure(yscrollcommand=on_queue_yscroll)
+    queue_list.bind("<<TreeviewSelect>>", sync_queue_row_action_buttons)
+    queue_list.bind("<Button-1>", on_queue_click)
+    queue_list.bind("<Double-1>", on_queue_double_click)
+    queue_list.bind("<Configure>", lambda _event: root.after_idle(sync_all_row_overlays))
     run_button.grid(row=0, column=0, sticky="ew")
 
     def on_canvas_configure(event: tk.Event) -> None:
@@ -3885,7 +5325,10 @@ def launch_ui() -> int:
 
     canvas.bind("<Configure>", on_canvas_configure)
 
+    load_job_queue_from_disk()
     rebuild_folder_list(force=True)
+    refresh_job_queue_list()
+    sync_queue_row_action_buttons()
     update_start_button_state()
     update_scrollbar_visibility()
     root.mainloop()
