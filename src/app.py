@@ -696,6 +696,7 @@ def launch_ui() -> int:
     queue_drag_index: int | None = None
     queue_drag_moved = False
     queue_drag_allowed = False
+    queue_row_drag_handles: dict[str, tk.Label] = {}
     queue_row_action_buttons: dict[str, tk.Label] = {}
     queue_row_thumb_labels: dict[str, tk.Label] = {}
     queue_row_checkbox_labels: dict[str, tk.Label] = {}
@@ -3369,19 +3370,21 @@ def launch_ui() -> int:
 
     queue_list = ttk.Treeview(
         queue_table_border,
-        columns=("thumb", "name", "source", "status", "actions"),
+        columns=("run", "thumb", "name", "source", "status", "actions"),
         show="tree headings",
         selectmode="browse",
         height=6,
         style="Queue.Treeview",
     )
     queue_list.heading("#0", text="", anchor="center")
+    queue_list.heading("run", text="", anchor="center")
     queue_list.heading("thumb", text="", anchor="center")
     queue_list.heading("name", text="   LoRA Name", anchor="w")
     queue_list.heading("source", text="   Source Dataset", anchor="w")
     queue_list.heading("status", text="Status", anchor="center")
     queue_list.heading("actions", text="", anchor="center")
-    queue_list.column("#0", width=44, minwidth=42, stretch=False, anchor="center")
+    queue_list.column("#0", width=28, minwidth=26, stretch=False, anchor="center")
+    queue_list.column("run", width=40, minwidth=38, stretch=False, anchor="center")
     queue_list.column("thumb", width=76, minwidth=68, stretch=False, anchor="center")
     queue_list.column("name", width=156, minwidth=120, stretch=True, anchor="w")
     queue_list.column("source", width=118, minwidth=90, stretch=True, anchor="w")
@@ -3839,6 +3842,7 @@ def launch_ui() -> int:
                 text="",
                 values=(
                     "",
+                    "",
                     "   " + job.get("job_name", "unnamed"),
                     "   " + job.get("dataset_name", "?"),
                     (
@@ -3850,6 +3854,7 @@ def launch_ui() -> int:
                 ),
                 tags=tuple(row_tags),
             )
+        build_queue_row_drag_handles()
         build_queue_row_checkbox_labels()
         build_queue_row_thumb_labels()
         build_queue_row_action_buttons()
@@ -4044,6 +4049,8 @@ def launch_ui() -> int:
             return
         clicked_item = queue_list.identify_row(event.y)
         if not clicked_item:
+            queue_list.selection_set([])
+            root.after_idle(sync_all_row_overlays)
             queue_drag_index = None
             queue_drag_moved = False
             queue_drag_allowed = False
@@ -4064,14 +4071,14 @@ def launch_ui() -> int:
         set_queue_selection(clicked)
 
         clicked_col = queue_list.identify_column(event.x)
-        if clicked_col == "#0":
+        if clicked_col == "#1":
             toggle_hold_job(clicked)
             queue_drag_index = None
             queue_drag_moved = False
             queue_drag_allowed = False
             return
 
-        queue_drag_allowed = clicked_col in {"#2", "#3", "#4"}
+        queue_drag_allowed = clicked_col in {"#0", "#2", "#3", "#4", "#5"}
         queue_drag_index = clicked if queue_drag_allowed else None
         queue_drag_moved = False
 
@@ -5057,6 +5064,59 @@ def launch_ui() -> int:
             return "#1c2534"
         return "#17202e"
 
+    def clear_queue_row_drag_handles() -> None:
+        for handle_label in queue_row_drag_handles.values():
+            handle_label.destroy()
+        queue_row_drag_handles.clear()
+
+    def place_queue_row_drag_handles() -> None:
+        for item_id, handle_label in queue_row_drag_handles.items():
+            cell_bbox = queue_list.bbox(item_id, "#0")
+            if not cell_bbox:
+                handle_label.place_forget()
+                continue
+            x, y, width, height = cell_bbox
+            if width <= 0 or height <= 0:
+                handle_label.place_forget()
+                continue
+            row_bg = row_background_for_item(item_id)
+            handle_label.configure(bg=row_bg)
+            handle_label.place(x=x, y=y, width=width, height=height)
+
+    def build_queue_row_drag_handles() -> None:
+        clear_queue_row_drag_handles()
+        for item_id in queue_list.get_children():
+            handle_label = tk.Label(
+                queue_list,
+                text="☰",
+                font=("Segoe UI", 10, "bold"),
+                fg="#8aa6c8",
+                bg="#1c2534",
+                bd=0,
+                padx=0,
+                pady=0,
+                relief="flat",
+                highlightthickness=0,
+                cursor="fleur",
+                anchor="center",
+            )
+            bind_thumb_overlay_events(handle_label)
+            queue_row_drag_handles[item_id] = handle_label
+        place_queue_row_drag_handles()
+
+    def forward_overlay_mouse_event(event: tk.Event, sequence: str) -> str:
+        widget = event.widget
+        x = widget.winfo_x() + event.x
+        y = widget.winfo_y() + event.y
+        queue_list.event_generate(sequence, x=x, y=y)
+        return "break"
+
+    def bind_thumb_overlay_events(widget: tk.Widget) -> None:
+        widget.bind("<ButtonPress-1>", lambda e: forward_overlay_mouse_event(e, "<ButtonPress-1>"))
+        widget.bind("<B1-Motion>", lambda e: forward_overlay_mouse_event(e, "<B1-Motion>"))
+        widget.bind("<ButtonRelease-1>", lambda e: forward_overlay_mouse_event(e, "<ButtonRelease-1>"))
+        widget.bind("<Double-1>", lambda e: forward_overlay_mouse_event(e, "<Double-1>"))
+
     def clear_queue_row_checkbox_labels() -> None:
         for label in queue_row_checkbox_labels.values():
             label.destroy()
@@ -5064,7 +5124,7 @@ def launch_ui() -> int:
 
     def place_queue_row_checkbox_labels() -> None:
         for item_id, cb_label in queue_row_checkbox_labels.items():
-            cell_bbox = queue_list.bbox(item_id, "#0")
+            cell_bbox = queue_list.bbox(item_id, "run")
             if not cell_bbox:
                 cb_label.place_forget()
                 continue
@@ -5160,7 +5220,7 @@ def launch_ui() -> int:
                 div.place_forget()
             return
         total_h = max_y - min_y
-        for div, col in zip(queue_col_dividers, ["thumb", "name", "source", "status", "actions"]):
+        for div, col in zip(queue_col_dividers, ["run", "thumb", "name", "source", "status", "actions"]):
             bb = queue_list.bbox(first_visible, col)
             if not bb:
                 div.place_forget()
@@ -5174,7 +5234,7 @@ def launch_ui() -> int:
             div.destroy()
         queue_col_dividers = [
             tk.Frame(queue_list, bg="#2e4466", bd=0, highlightthickness=0)
-            for _ in range(5)
+            for _ in range(6)
         ]
         place_queue_col_dividers()
 
@@ -5216,7 +5276,9 @@ def launch_ui() -> int:
                 relief="flat",
                 highlightthickness=0,
                 bg=row_bg,
+                cursor="fleur",
             )
+            bind_thumb_overlay_events(thumb_label)
             queue_row_thumb_labels[item_id] = thumb_label
 
         place_queue_row_thumb_labels()
@@ -5277,6 +5339,7 @@ def launch_ui() -> int:
         place_queue_row_action_buttons()
 
     def sync_all_row_overlays() -> None:
+        place_queue_row_drag_handles()
         place_queue_row_checkbox_labels()
         place_queue_row_thumb_labels()
         place_queue_row_action_buttons()
@@ -5295,7 +5358,7 @@ def launch_ui() -> int:
         if not clicked_item:
             return "break"
         clicked_col = queue_list.identify_column(event.x)
-        if clicked_col in {"#0", "#5"}:
+        if clicked_col in {"#0", "#1", "#6"}:
             return "break"
         try:
             clicked = int(clicked_item)
@@ -5307,14 +5370,8 @@ def launch_ui() -> int:
         open_create_job_dialog(existing_job=job_queue[clicked])
         return "break"
 
-    def on_queue_click(event: tk.Event) -> None:
-        if not queue_list.identify_row(event.y):
-            queue_list.selection_set([])
-            root.after_idle(sync_all_row_overlays)
-
     queue_list.configure(yscrollcommand=on_queue_yscroll)
     queue_list.bind("<<TreeviewSelect>>", sync_queue_row_action_buttons)
-    queue_list.bind("<Button-1>", on_queue_click)
     queue_list.bind("<Double-1>", on_queue_double_click)
     queue_list.bind("<Configure>", lambda _event: root.after_idle(sync_all_row_overlays))
     run_button.grid(row=0, column=0, sticky="ew")
