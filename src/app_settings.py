@@ -6,6 +6,7 @@ WINDOW_X_KEY = "window_x"
 WINDOW_Y_KEY = "window_y"
 WINDOW_WIDTH_KEY = "window_width"
 WINDOW_HEIGHT_KEY = "window_height"
+SASH_POSITION_KEY = "sash_position"
 MUSUBI_DIR_KEY = "musubi_dir"
 MUSUBI_PYTHON_KEY = "musubi_python"
 

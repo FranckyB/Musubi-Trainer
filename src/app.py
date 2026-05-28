@@ -49,6 +49,7 @@ from .app_settings import (
     WINDOW_WIDTH_KEY,
     WINDOW_X_KEY,
     WINDOW_Y_KEY,
+    SASH_POSITION_KEY,
     load_settings,
     parse_int_setting,
     load_window_size,
@@ -308,7 +309,6 @@ def launch_ui() -> int:
         if sys.platform != "win32":
             return
         try:
-            window.update_idletasks()
             hwnd = window.winfo_id()
             value = ctypes.c_int(1)
             # DWMWA_USE_IMMERSIVE_DARK_MODE = 20 (Win10 1809+)
@@ -330,8 +330,10 @@ def launch_ui() -> int:
         root = TkinterDnD.Tk()
     else:
         root = tk.Tk()
+    root.withdraw()
     root.title("Musubi Training Launcher")
     root.geometry(f"{ui_config['window_width']}x{ui_config['window_height']}")
+    root.resizable(False, True)
     root.minsize(ui_config["min_window_width"], ui_config["min_window_height"])
     root.configure(bg=bg_root)
     ico_path = Path(__file__).resolve().parent / "icons" / "logo.ico"
@@ -357,11 +359,11 @@ def launch_ui() -> int:
         saved_size = load_window_size(settings_state)
         if saved_size is None:
             width = max(root.winfo_width(), min_width)
-            height = max(root.winfo_height(), min_height)
+            height = max(root.winfo_height(), min_height, ui_config["min_window_height"])
         else:
             saved_width, saved_height = saved_size
             width = max(min_width, saved_width)
-            height = max(min_height, saved_height)
+            height = max(min_height, ui_config["min_window_height"], saved_height)
 
         screen_w = root.winfo_screenwidth()
         screen_h = root.winfo_screenheight()
@@ -379,7 +381,22 @@ def launch_ui() -> int:
         target_x = min(max(0, target_x), max(0, screen_w - width))
         target_y = min(max(0, target_y), max(0, screen_h - height))
         root.geometry(f"{width}x{height}+{target_x}+{target_y}")
+        root.deiconify()
         window_position_applied = True
+
+        def restore_sash() -> None:
+            saved_sash = parse_int_setting(settings_state, SASH_POSITION_KEY)
+            if saved_sash is not None and saved_sash > 0:
+                try:
+                    paned.sashpos(0, saved_sash)
+                except Exception:
+                    pass
+            else:
+                try:
+                    paned.sashpos(0, int(paned.winfo_height() * 3 / 5))
+                except Exception:
+                    pass
+        root.after(50, restore_sash)
 
     def save_main_window_position_now() -> None:
         nonlocal settings_state
@@ -389,14 +406,23 @@ def launch_ui() -> int:
         settings_state[WINDOW_Y_KEY] = str(root.winfo_y())
         settings_state[WINDOW_WIDTH_KEY] = str(root.winfo_width())
         settings_state[WINDOW_HEIGHT_KEY] = str(root.winfo_height())
+        try:
+            settings_state[SASH_POSITION_KEY] = str(paned.sashpos(0))
+        except Exception:
+            pass
         save_settings(settings_state)
 
+    _save_after_id: str | None = None
+
     def schedule_main_window_position_save(_event: tk.Event) -> None:
+        nonlocal _save_after_id
         if not window_position_applied:
             return
         if root.state() != "normal":
             return
-        save_main_window_position_now()
+        if _save_after_id is not None:
+            root.after_cancel(_save_after_id)
+        _save_after_id = root.after(300, save_main_window_position_now)
 
     def on_root_close() -> None:
         if (not settings_reset_requested) and window_position_applied and root.winfo_exists():
@@ -688,6 +714,13 @@ def launch_ui() -> int:
         background=[("active", color_start_in_progress), ("disabled", color_start_in_progress)],
         foreground=[("active", "#ffffff"), ("disabled", "#ffffff")],
     )
+    style.configure(
+        "Sash",
+        sashthickness=6,
+        sashrelief="flat",
+        background="#2e2e2e",
+    )
+    style.configure("TPanedwindow", background="#2e2e2e")
 
     vars_by_name: dict[str, tk.BooleanVar] = {}
     card_widgets: list[tk.Widget] = []
@@ -1122,6 +1155,7 @@ def launch_ui() -> int:
 
         result: KleinRuntimeConfig | None = None
         dialog = tk.Toplevel(root)
+        dialog.withdraw()
         dialog.title("Settings")
         dialog.transient(root)
         dialog.grab_set()
@@ -1832,6 +1866,7 @@ def launch_ui() -> int:
         dialog.geometry(f"{win_w}x{win_h}")
         settings_canvas.yview_moveto(0.0)
         center_window(dialog)
+        dialog.deiconify()
         dialog.focus_set()
         root.wait_window(dialog)
 
@@ -1856,11 +1891,8 @@ def launch_ui() -> int:
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=0)
     root.rowconfigure(1, weight=0)
-    root.rowconfigure(2, weight=5, minsize=360)
-    root.rowconfigure(3, weight=0)
-    root.rowconfigure(4, weight=0)
-    root.rowconfigure(5, weight=0)
-    root.rowconfigure(6, weight=2)
+    root.rowconfigure(2, weight=1, minsize=360)
+    root.rowconfigure(3, weight=0, minsize=158)
 
     header = ttk.Frame(root, padding=8)
     header.grid(row=0, column=0, sticky="ew")
@@ -2160,11 +2192,12 @@ def launch_ui() -> int:
             return
 
         dialog = tk.Toplevel(root)
+        dialog.withdraw()
         dialog.title(f"Edit Dataset: {dataset_name}")
         dialog.transient(root)
         dialog.grab_set()
         dialog.configure(bg=bg_panel)
-        dialog.resizable(True, True)
+        dialog.resizable(False, True)
         set_dark_title_bar(dialog)
         dialog.minsize(dialog_width_px, 760)
         dialog.geometry(f"{dialog_width_px}x920")
@@ -2390,7 +2423,6 @@ def launch_ui() -> int:
         ttk.Button(actions, text="Close", command=close_editor).grid(row=0, column=0)
 
         editor_inner.bind("<Configure>", on_editor_inner_configure)
-        editor_canvas.bind("<Configure>", on_editor_canvas_configure)
         editor_canvas.bind("<MouseWheel>", on_editor_mousewheel)
         editor_canvas.bind("<Button-4>", on_editor_linux_up)
         editor_canvas.bind("<Button-5>", on_editor_linux_down)
@@ -2399,8 +2431,8 @@ def launch_ui() -> int:
         editor_inner.bind("<Button-5>", on_editor_linux_down)
         dialog.protocol("WM_DELETE_WINDOW", close_editor)
 
-        dialog.update_idletasks()
         center_window(dialog)
+        dialog.deiconify()
         root.wait_window(dialog)
 
     def open_dataset_config_dialog(dataset_name: str) -> None:
@@ -2409,6 +2441,7 @@ def launch_ui() -> int:
         image_count = len(dataset_image_files(datasets_root_dir(), dataset_name))
 
         dialog = tk.Toplevel(root)
+        dialog.withdraw()
         dialog.title(f"Dataset Configure - {dataset_name}")
         dialog.transient(root)
         dialog.grab_set()
@@ -2627,6 +2660,7 @@ def launch_ui() -> int:
         dialog.update_idletasks()
         dialog.geometry(f"{max(740, dialog.winfo_reqwidth())}x{dialog.winfo_reqheight()}")
         center_window(dialog)
+        dialog.deiconify()
         dialog.focus_set()
         root.wait_window(dialog)
 
@@ -2773,6 +2807,7 @@ def launch_ui() -> int:
         available_loras: list[Path],
     ) -> tuple[list[str], list[tuple[str, str, list[str], str]]] | None:
         dialog = tk.Toplevel(root)
+        dialog.withdraw()
         dialog.title("LoRA Post-Hoc EMA Merge")
         dialog.transient(root)
         dialog.grab_set()
@@ -2929,6 +2964,7 @@ def launch_ui() -> int:
         requested_height = max(500, dialog.winfo_reqheight())
         dialog.geometry(f"{requested_width}x{requested_height}")
         center_window(dialog)
+        dialog.deiconify()
         dialog.focus_set()
         selected_list.focus_set()
         root.wait_window(dialog)
@@ -3076,6 +3112,7 @@ def launch_ui() -> int:
             return
 
         dialog = tk.Toplevel(root)
+        dialog.withdraw()
         dialog.title("LoRA Post-Hoc EMA Merge")
         dialog.transient(root)
         dialog.grab_set()
@@ -3588,9 +3625,9 @@ def launch_ui() -> int:
         ttk.Button(actions, text="Close", command=dialog.destroy).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(actions, text="Go", command=run_merge).grid(row=0, column=2)
 
-        dialog.update_idletasks()
         dialog.geometry("820x620")
         center_window(dialog)
+        dialog.deiconify()
         root.wait_window(dialog)
 
     def show_thumbnail_context_menu(event: tk.Event, dataset_name: str) -> str:
@@ -3604,8 +3641,19 @@ def launch_ui() -> int:
             menu.grab_release()
         return "break"
 
-    list_container = ttk.LabelFrame(root, text="Datasets (click thumbnail to select)", padding=8)
-    list_container.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 0))
+    paned = ttk.PanedWindow(root, orient="vertical")
+    paned.grid(row=2, column=0, sticky="nsew", padx=8)
+    paned.bind("<Configure>", schedule_main_window_position_save)
+    paned.bind("<ButtonRelease-1>", schedule_main_window_position_save)
+
+    top_pane = ttk.Frame(paned)
+    top_pane.columnconfigure(0, weight=1)
+    top_pane.rowconfigure(0, weight=1)
+    top_pane.rowconfigure(1, weight=0)
+    paned.add(top_pane, weight=3)
+
+    list_container = ttk.LabelFrame(top_pane, text="Datasets (click thumbnail to select)", padding=8)
+    list_container.grid(row=0, column=0, sticky="nsew")
     list_container.columnconfigure(0, weight=1)
     list_container.columnconfigure(1, weight=0, minsize=12)
     list_container.rowconfigure(0, weight=1)
@@ -3635,16 +3683,21 @@ def launch_ui() -> int:
     canvas.grid(row=0, column=0, sticky="nsew")
     scrollbar.grid(row=0, column=1, sticky="ns")
 
-    dataset_actions_bar = ttk.Frame(root, padding=(8, 8, 8, 0))
-    dataset_actions_bar.grid(row=3, column=0, sticky="ew")
+    dataset_actions_bar = ttk.Frame(top_pane, padding=(0, 8, 0, 10))
+    dataset_actions_bar.grid(row=1, column=0, sticky="ew")
     dataset_actions_bar.columnconfigure(0, weight=1)
 
-    start_bar = ttk.Frame(root, padding=(8, 0, 8, 8))
-    start_bar.grid(row=5, column=0, sticky="ew")
+    bottom_pane = ttk.Frame(paned)
+    bottom_pane.columnconfigure(0, weight=1)
+    bottom_pane.rowconfigure(0, weight=1)
+    paned.add(bottom_pane, weight=2)
+
+    start_bar = ttk.Frame(bottom_pane, padding=(0, 0, 0, 8))
+    start_bar.grid(row=1, column=0, sticky="ew")
     start_bar.columnconfigure(0, weight=1)
 
-    queue_container = ttk.LabelFrame(root, text="", padding=8)
-    queue_container.grid(row=4, column=0, sticky="ew", padx=8, pady=(8, 0))
+    queue_container = ttk.LabelFrame(bottom_pane, text="", padding=8)
+    queue_container.grid(row=0, column=0, sticky="nsew", pady=(0, 0))
     queue_container.columnconfigure(0, weight=1)
     queue_container.rowconfigure(1, weight=1)
 
@@ -3712,8 +3765,9 @@ def launch_ui() -> int:
     queue_scroll.grid(row=0, column=1, sticky="ns", pady=1, padx=(0, 1))
     queue_list.configure(yscrollcommand=queue_scroll.set)
 
-    log_container = ttk.Frame(root)
-    log_container.grid(row=6, column=0, sticky="nsew", padx=8, pady=(0, 8))
+    log_container = ttk.Frame(root, height=150)
+    log_container.grid(row=3, column=0, sticky="nsew", padx=8, pady=(0, 8))
+    log_container.grid_propagate(False)
     log_container.columnconfigure(0, weight=1)
     log_container.rowconfigure(0, weight=1)
 
@@ -4633,6 +4687,7 @@ def launch_ui() -> int:
         effective = effective_train_settings_for_dataset(dataset_name)
 
         dialog = tk.Toplevel(root)
+        dialog.withdraw()
         dialog.title("Edit Job" if existing_job is not None else "Create Job")
         dialog.transient(root)
         dialog.grab_set()
@@ -4943,6 +4998,7 @@ def launch_ui() -> int:
 
         dialog.update_idletasks()
         center_window(dialog)
+        dialog.deiconify()
         root.wait_window(dialog)
 
     def first_image_path(dataset_name: str) -> Path | None:
@@ -5201,17 +5257,11 @@ def launch_ui() -> int:
             update_start_button_state()
             return
 
-        canvas_width = canvas.winfo_width()
-        if canvas_width <= 1:
-            canvas_width = max(1, list_container.winfo_width() - 12)
-        if canvas_width <= 1:
-            return
-
         gap = ui_config["card_gap"]
         card_width = ui_config["card_width"]
         thumb_px = ui_config["thumbnail_size"]
         card_height = ui_config["card_height"]
-        columns = max(1, (canvas_width - gap) // (card_width + gap))
+        columns = 4
 
         for col in range(max(1, len(names))):
             inner.columnconfigure(col, minsize=0, weight=0)
@@ -5935,8 +5985,7 @@ def launch_ui() -> int:
     queue_list.bind("<Configure>", lambda _event: root.after_idle(sync_all_row_overlays))
     run_button.grid(row=0, column=0, sticky="ew")
 
-    def on_canvas_configure(event: tk.Event) -> None:
-        request_relayout(event.width)
+    def on_canvas_configure(_event: tk.Event) -> None:
         update_scrollbar_visibility()
 
     canvas.bind("<Configure>", on_canvas_configure)
