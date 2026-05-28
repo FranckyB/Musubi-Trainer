@@ -24,6 +24,7 @@ JOB_EXIT_CANCELLED = 2
 VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 LATENT_SUFFIX = "f2k9b"
 SHARDED_SAFETENSORS_NAME_RE = re.compile(r".+-\d{5}-of-\d{5}\.safetensors$", re.IGNORECASE)
+JOB_PROGRESS_FILE_NAME = "progress.json"
 
 
 def centralized_logs_root(training_dir: Path) -> Path:
@@ -63,10 +64,15 @@ class TrainingCancelledError(RuntimeError):
 
 def latest_checkpoint_for_dataset(training_dir: Path, dataset_name: str) -> tuple[Path | None, int]:
     output_dir = training_dir / dataset_name / "output"
+    output_name = f"{dataset_name}_Klein"
+    return latest_checkpoint_for_output(output_dir, output_name)
+
+
+def latest_checkpoint_for_output(output_dir: Path, output_name: str) -> tuple[Path | None, int]:
     if not output_dir.exists():
         return None, 0
 
-    pattern = re.compile(rf"^{re.escape(dataset_name)}_Klein-step(\d+)\.safetensors$", re.IGNORECASE)
+    pattern = re.compile(rf"^{re.escape(output_name)}-step(\d+)\.safetensors$", re.IGNORECASE)
     latest_step = 0
     latest_path: Path | None = None
 
@@ -82,12 +88,55 @@ def latest_checkpoint_for_dataset(training_dir: Path, dataset_name: str) -> tupl
     return latest_path, latest_step
 
 
+def progress_metadata_path_for_output(output_dir: Path) -> Path:
+    return output_dir.parent / JOB_PROGRESS_FILE_NAME
+
+
+def read_recorded_completed_steps(output_dir: Path, output_name: str) -> int:
+    metadata_path = progress_metadata_path_for_output(output_dir)
+    if not metadata_path.exists() or not metadata_path.is_file():
+        return 0
+
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+
+    if not isinstance(payload, dict):
+        return 0
+
+    raw_value = payload.get("completed_step", 0)
+    try:
+        completed_step = int(raw_value)
+    except (TypeError, ValueError):
+        return 0
+
+    return completed_step if completed_step > 0 else 0
+
+
+def write_recorded_completed_steps(output_dir: Path, output_name: str, completed_step: int, target_steps: int) -> None:
+    metadata_path = progress_metadata_path_for_output(output_dir)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "output_name": output_name,
+        "completed_step": int(max(0, completed_step)),
+        "target_steps": int(max(0, target_steps)),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def finished_checkpoint_for_dataset(training_dir: Path, dataset_name: str) -> Path | None:
     output_dir = training_dir / dataset_name / "output"
+    output_name = f"{dataset_name}_Klein"
+    return finished_checkpoint_for_output(output_dir, output_name)
+
+
+def finished_checkpoint_for_output(output_dir: Path, output_name: str) -> Path | None:
     if not output_dir.exists():
         return None
 
-    finished_path = output_dir / f"{dataset_name}_Klein.safetensors"
+    finished_path = output_dir / f"{output_name}.safetensors"
     if finished_path.is_file():
         return finished_path
 
@@ -96,10 +145,13 @@ def finished_checkpoint_for_dataset(training_dir: Path, dataset_name: str) -> Pa
 
 def latest_resume_state_for_dataset(training_dir: Path, dataset_name: str, checkpoint_step: int) -> tuple[Path | None, int]:
     output_dir = training_dir / dataset_name / "output"
+    output_name = f"{dataset_name}_Klein"
+    return latest_resume_state_for_output(output_dir, output_name, checkpoint_step)
+
+
+def latest_resume_state_for_output(output_dir: Path, output_name: str, checkpoint_step: int) -> tuple[Path | None, int]:
     if not output_dir.exists():
         return None, 0
-
-    output_name = f"{dataset_name}_Klein"
 
     # Preferred: step-aligned state dir for the latest known checkpoint step.
     if checkpoint_step > 0:
@@ -287,14 +339,23 @@ def remap_resume_artifacts_to_continued_steps(
     resume_step_offset: int,
     logger: Callable[[str], None],
 ) -> None:
+    output_dir = training_dir / dataset_name / "output"
+    base_output_name = f"{dataset_name}_Klein"
+    remap_resume_artifacts_for_output(output_dir, base_output_name, resume_step_offset, logger)
+
+
+def remap_resume_artifacts_for_output(
+    output_dir: Path,
+    base_output_name: str,
+    resume_step_offset: int,
+    logger: Callable[[str], None],
+) -> None:
     if resume_step_offset <= 0:
         return
 
-    output_dir = training_dir / dataset_name / "output"
     if not output_dir.exists() or not output_dir.is_dir():
         return
 
-    base_output_name = f"{dataset_name}_Klein"
     resume_output_name = f"{base_output_name}-resume"
 
     ckpt_pattern = re.compile(rf"^{re.escape(resume_output_name)}-step(\d{{8}})\.safetensors$", re.IGNORECASE)
@@ -396,11 +457,15 @@ def _step_state_dirs(output_dir: Path, output_name: str) -> list[tuple[Path, int
 def cleanup_step_states_for_cancel(training_dir: Path, dataset_name: str, logger: Callable[[str], None]) -> None:
     output_dir = training_dir / dataset_name / "output"
     output_name = f"{dataset_name}_Klein"
+    cleanup_step_states_for_cancel_output(output_dir, output_name, logger)
+
+
+def cleanup_step_states_for_cancel_output(output_dir: Path, output_name: str, logger: Callable[[str], None]) -> None:
     step_state_dirs = _step_state_dirs(output_dir, output_name)
     if not step_state_dirs:
         return
 
-    _latest_ckpt, latest_step = latest_checkpoint_for_dataset(training_dir, dataset_name)
+    _latest_ckpt, latest_step = latest_checkpoint_for_output(output_dir, output_name)
     keep_dir: Path | None = None
 
     if latest_step > 0:
@@ -429,6 +494,10 @@ def cleanup_step_states_for_cancel(training_dir: Path, dataset_name: str, logger
 def cleanup_step_states_for_completed_run(training_dir: Path, dataset_name: str, logger: Callable[[str], None]) -> None:
     output_dir = training_dir / dataset_name / "output"
     output_name = f"{dataset_name}_Klein"
+    cleanup_step_states_for_completed_output(output_dir, output_name, logger)
+
+
+def cleanup_step_states_for_completed_output(output_dir: Path, output_name: str, logger: Callable[[str], None]) -> None:
     last_state_dir = output_dir / f"{output_name}-state"
     if not last_state_dir.is_dir():
         logger(f"  cleanup skipped: final state folder not found ({last_state_dir.name})")
@@ -1227,6 +1296,54 @@ def run_job(
             on_error(message)
         return 1
 
+    output_name_resolved = output_name.strip()
+    output_dir_resolved = output_dir.resolve()
+    resume_checkpoint, resume_step = latest_checkpoint_for_output(output_dir_resolved, output_name_resolved)
+    finished_checkpoint = finished_checkpoint_for_output(output_dir_resolved, output_name_resolved)
+    resume_state_dir, resume_state_step = latest_resume_state_for_output(
+        output_dir_resolved,
+        output_name_resolved,
+        resume_step,
+    )
+    recorded_completed_step = read_recorded_completed_steps(output_dir_resolved, output_name_resolved)
+    progress_step = max(resume_step, resume_state_step, recorded_completed_step)
+    effective_resume_state: Path | None = None
+    resume_step_offset = 0
+    effective_warmstart_checkpoint: Path | None = None
+    train_steps_override: int | None = None
+
+    if progress_step >= train_steps:
+        logger(f"Job already complete at step {progress_step}; nothing to run.")
+        if auto_cleanup_states:
+            cleanup_step_states_for_completed_output(output_dir_resolved, output_name_resolved, logger)
+        write_recorded_completed_steps(output_dir_resolved, output_name_resolved, progress_step, train_steps)
+        return JOB_EXIT_SUCCESS
+
+    if resume_state_dir is not None and resume_state_step >= resume_step:
+        effective_resume_state = resume_state_dir
+        if finished_checkpoint is not None:
+            effective_warmstart_checkpoint = finished_checkpoint
+        known_progress_step = max(resume_step, resume_state_step)
+        resume_step_offset = known_progress_step
+        if known_progress_step > 0:
+            train_steps_override = max(1, train_steps - known_progress_step)
+        if resume_state_step > 0:
+            logger(
+                f"  resuming optimizer state from {resume_state_dir.name} (step {resume_state_step}), "
+                f"remaining steps {train_steps_override if train_steps_override is not None else train_steps}"
+            )
+        else:
+            logger(f"  resuming optimizer state from {resume_state_dir.name}")
+        if finished_checkpoint is not None:
+            logger(f"  using finished checkpoint weights: {finished_checkpoint.name}")
+    elif resume_checkpoint is not None and resume_step > 0:
+        effective_warmstart_checkpoint = resume_checkpoint
+        train_steps_override = max(1, train_steps - resume_step)
+        logger(
+            f"  warm-starting from {resume_checkpoint.name} (step {resume_step}) via --network_weights, "
+            f"remaining steps {train_steps_override}"
+        )
+
     try:
         run_steps_for_model(
             runtime_config,
@@ -1251,22 +1368,27 @@ def run_job(
             do_cache_latents=do_cache_latents,
             do_cache_text=do_cache_text,
             do_train=do_train,
-            resume_state_dir=None,
-            resume_step_offset=0,
-            warmstart_checkpoint=None,
-            train_steps_override=None,
+            resume_state_dir=effective_resume_state,
+            resume_step_offset=resume_step_offset,
+            warmstart_checkpoint=effective_warmstart_checkpoint,
+            train_steps_override=train_steps_override,
             output_name_override=output_name,
             output_dir_override=output_dir,
             logger=logger,
             cancel_requested=cancel_requested,
         )
+        if effective_resume_state is not None and resume_step_offset > 0:
+            remap_resume_artifacts_for_output(output_dir_resolved, output_name_resolved, resume_step_offset, logger)
         if auto_cleanup_states:
-            cleanup_step_states_for_completed_run(runtime_config.training_dir, dataset_name, logger)
+            cleanup_step_states_for_completed_output(output_dir_resolved, output_name_resolved, logger)
+        write_recorded_completed_steps(output_dir_resolved, output_name_resolved, train_steps, train_steps)
         logger(f"Job completed: {output_name}")
         return JOB_EXIT_SUCCESS
     except TrainingCancelledError:
+        if effective_resume_state is not None and resume_step_offset > 0:
+            remap_resume_artifacts_for_output(output_dir_resolved, output_name_resolved, resume_step_offset, logger)
         if auto_cleanup_states:
-            cleanup_step_states_for_cancel(runtime_config.training_dir, dataset_name, logger)
+            cleanup_step_states_for_cancel_output(output_dir_resolved, output_name_resolved, logger)
         logger("Job cancelled by user.")
         return JOB_EXIT_CANCELLED
     except Exception as exc:

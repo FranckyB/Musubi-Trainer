@@ -11,7 +11,6 @@ import subprocess
 import threading
 import time
 import traceback
-import uuid
 import webbrowser
 from pathlib import Path
 from typing import Callable
@@ -81,6 +80,13 @@ DATASET_USE_GLOBAL_TRAIN_KEY = "use_global_train_settings"
 TRAIN_DIM_ALPHA_CHOICES = ("16", "32", "64")
 JOB_SETTINGS_FILE_NAME = "settings.json"
 JOBS_ORDER_FILE_NAME = "_order.json"
+JOB_PROGRESS_FILE_NAME = "progress.json"
+INVALID_FOLDER_CHARS = set('<>:"/\\|?*')
+WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+}
 
 
 def get_positive_int_setting(settings: dict[str, str], key: str, fallback: int, minimum: int = 1) -> int:
@@ -109,6 +115,22 @@ def is_truthy(raw_value: str | None, default: bool = False) -> bool:
     if raw_value is None:
         return default
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_valid_folder_name(name: str) -> bool:
+    candidate = name.strip()
+    if not candidate or candidate in {".", ".."}:
+        return False
+    if candidate[-1] in {" ", "."}:
+        return False
+    if any(ord(ch) < 32 for ch in candidate):
+        return False
+    if any(ch in INVALID_FOLDER_CHARS for ch in candidate):
+        return False
+    base = candidate.split(".")[0].strip().upper()
+    if base in WINDOWS_RESERVED_NAMES:
+        return False
+    return True
 
 
 def load_ui_config(config_path: Path) -> dict[str, int]:
@@ -588,7 +610,6 @@ def launch_ui() -> int:
     style.map(
         "Queue.Treeview",
         background=[("selected", "#1e4a7a")],
-        foreground=[("selected", "#e8f4ff")],
     )
     style.configure(
         "Queue.Treeview.Heading",
@@ -3358,13 +3379,29 @@ def launch_ui() -> int:
     start_bar.grid(row=5, column=0, sticky="ew")
     start_bar.columnconfigure(0, weight=1)
 
-    queue_container = ttk.LabelFrame(root, text="Queue", padding=8)
+    queue_container = ttk.LabelFrame(root, text="", padding=8)
     queue_container.grid(row=4, column=0, sticky="ew", padx=8, pady=(8, 0))
     queue_container.columnconfigure(0, weight=1)
-    queue_container.rowconfigure(0, weight=1)
+    queue_container.rowconfigure(1, weight=1)
+
+    queue_header = ttk.Frame(queue_container)
+    queue_header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+    queue_header.columnconfigure(0, weight=1)
+    ttk.Label(queue_header, text="Queue:", style="TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Button(
+        queue_header,
+        text="Reload",
+        style="QueueAction.TButton",
+        command=lambda: (
+            load_job_queue_from_disk(),
+            refresh_job_queue_list(),
+            sync_queue_row_action_buttons(),
+            update_start_button_state(),
+        ),
+    ).grid(row=0, column=1, sticky="e")
 
     queue_table_border = tk.Frame(queue_container, bg="#2a4a72", bd=0, highlightthickness=0)
-    queue_table_border.grid(row=0, column=0, columnspan=2, sticky="nsew")
+    queue_table_border.grid(row=1, column=0, columnspan=2, sticky="nsew")
     queue_table_border.columnconfigure(0, weight=1)
     queue_table_border.rowconfigure(0, weight=1)
 
@@ -3491,17 +3528,15 @@ def launch_ui() -> int:
 
     def save_job_order() -> None:
         ensure_jobs_storage()
-        order = [job.get("id", "") for job in job_queue if job.get("id", "").strip()]
+        order = [job.get("training_name", "").strip() for job in job_queue if job.get("training_name", "").strip()]
         jobs_order_file_path().write_text(json.dumps(order, indent=2), encoding="utf-8")
 
     def save_job_to_disk(job: dict[str, str]) -> None:
         ensure_jobs_storage()
-        job_id = job.get("id", "").strip()
-        if not job_id:
-            return
         training_name = job.get("training_name", "").strip() or job.get("job_name", "").strip()
         if not training_name:
             return
+        job["id"] = training_name
         job["training_name"] = training_name
         job["training_dir"] = str(training_job_dir_path(training_name))
         job["output_dir"] = str((training_job_dir_path(training_name) / "output").expanduser())
@@ -3519,9 +3554,6 @@ def launch_ui() -> int:
                 path.unlink()
         except OSError:
             pass
-
-    def make_job_id() -> str:
-        return uuid.uuid4().hex[:12]
 
     def existing_job_names() -> set[str]:
         return {job.get("job_name", "").strip().lower() for job in job_queue if job.get("job_name", "").strip()}
@@ -3565,16 +3597,44 @@ def launch_ui() -> int:
         return {name for name in names if name}
 
     def job_resume_progress(job: dict[str, str]) -> tuple[int, bool]:
+        def _recorded_completed_step() -> int:
+            training_dir_raw = job.get("training_dir", "").strip()
+            if training_dir_raw:
+                metadata_path = Path(training_dir_raw).expanduser() / JOB_PROGRESS_FILE_NAME
+            else:
+                metadata_path = Path(job.get("output_dir", "")).expanduser().parent / JOB_PROGRESS_FILE_NAME
+
+            if not metadata_path.exists() or not metadata_path.is_file():
+                return 0
+
+            try:
+                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception:
+                return 0
+
+            if not isinstance(payload, dict):
+                return 0
+
+            raw_value = payload.get("completed_step", 0)
+            try:
+                completed_step = int(raw_value)
+            except (TypeError, ValueError):
+                return 0
+
+            return completed_step if completed_step > 0 else 0
+
         output_dir = Path(job.get("output_dir", "")).expanduser()
         if not output_dir.exists() or not output_dir.is_dir():
-            return 0, False
+            recorded_step = _recorded_completed_step()
+            return recorded_step, recorded_step > 0
 
         output_names = job_output_names(job)
         if not output_names:
-            return 0, False
+            recorded_step = _recorded_completed_step()
+            return recorded_step, recorded_step > 0
 
-        latest_step = 0
-        has_resume_state = False
+        latest_step = _recorded_completed_step()
+        has_resume_state = latest_step > 0
         ckpt_patterns = [
             re.compile(rf"^{re.escape(name)}(?:_Klein)?(?:-resume)?-step(\d+)\.safetensors$", re.IGNORECASE)
             for name in output_names
@@ -3626,6 +3686,104 @@ def launch_ui() -> int:
 
         return latest_step, has_resume_state
 
+    def _element_root_base_from_name(path: Path) -> str | None:
+        name = path.name
+        match = re.match(r"^(?P<base>.+?)(?:-resume)?-step\d{8}(?:-state)?(?:\.safetensors)?$", name, re.IGNORECASE)
+        if match is not None:
+            return match.group("base")
+
+        if path.is_file() and path.suffix.lower() == ".safetensors":
+            match = re.match(r"^(?P<base>.+?)(?:-resume)?\.safetensors$", name, re.IGNORECASE)
+            if match is not None:
+                return match.group("base")
+
+        if path.is_dir():
+            match = re.match(r"^(?P<base>.+?)(?:-resume)?-state$", name, re.IGNORECASE)
+            if match is not None:
+                return match.group("base")
+
+        return None
+
+    def detect_job_element_base_mismatch(job: dict[str, str]) -> tuple[bool, str | None]:
+        output_dir = Path(job.get("output_dir", "")).expanduser()
+        if not output_dir.exists() or not output_dir.is_dir():
+            return False, None
+
+        expected_base = (job.get("training_name", "").strip() or job.get("job_name", "").strip())
+        if not expected_base:
+            return False, None
+
+        base_counts: dict[str, int] = {}
+        expected_count = 0
+        for item in output_dir.iterdir():
+            base = _element_root_base_from_name(item)
+            if base is None:
+                continue
+            base_counts[base] = base_counts.get(base, 0) + 1
+            if base.lower() == expected_base.lower():
+                expected_count += 1
+
+        if not base_counts:
+            return False, None
+
+        # If expected training base artifacts exist, treat extra files (for example merged outputs)
+        # as non-breaking and keep this job healthy.
+        if expected_count > 0:
+            return False, None
+
+        non_target_bases = [(base, count) for base, count in base_counts.items() if base.lower() != expected_base.lower()]
+        if not non_target_bases:
+            return False, None
+
+        source_base = max(non_target_bases, key=lambda pair: pair[1])[0]
+        return True, source_base
+
+    def rename_job_elements_to_training_name(job: dict[str, str], source_base: str) -> tuple[int, int]:
+        output_dir = Path(job.get("output_dir", "")).expanduser()
+        if not output_dir.exists() or not output_dir.is_dir():
+            return 0, 0
+
+        target_base = (job.get("training_name", "").strip() or job.get("job_name", "").strip())
+        if not target_base:
+            return 0, 0
+
+        renamed = 0
+        conflicts = 0
+
+        for item in sorted(output_dir.iterdir(), key=lambda p: p.name.lower()):
+            old_name = item.name
+            new_name = old_name
+
+            replacements = [
+                (f"{source_base}-resume-step", f"{target_base}-resume-step"),
+                (f"{source_base}-step", f"{target_base}-step"),
+                (f"{source_base}-resume-state", f"{target_base}-resume-state"),
+                (f"{source_base}-state", f"{target_base}-state"),
+                (f"{source_base}-resume.safetensors", f"{target_base}-resume.safetensors"),
+                (f"{source_base}.safetensors", f"{target_base}.safetensors"),
+            ]
+
+            for old_prefix, new_prefix in replacements:
+                if old_name.startswith(old_prefix):
+                    new_name = new_prefix + old_name[len(old_prefix):]
+                    break
+
+            if new_name == old_name:
+                continue
+
+            target_path = output_dir / new_name
+            if target_path.exists():
+                conflicts += 1
+                continue
+
+            try:
+                item.rename(target_path)
+                renamed += 1
+            except OSError:
+                conflicts += 1
+
+        return renamed, conflicts
+
     def infer_dataset_name_from_training_dir(job_dir: Path) -> str:
         dataset_toml = job_dir / "dataset.toml"
         if dataset_toml.exists() and dataset_toml.is_file():
@@ -3653,7 +3811,7 @@ def launch_ui() -> int:
         dataset_name = infer_dataset_name_from_training_dir(job_dir).strip() or training_name
         output_dir = (job_dir / "output").expanduser()
         return {
-            "id": make_job_id(),
+            "id": training_name,
             "dataset_name": dataset_name,
             "training_name": training_name,
             "training_dir": str(job_dir),
@@ -3683,14 +3841,20 @@ def launch_ui() -> int:
         hold = flag_to_bool(job.get("hold", "0"))
         output_dir = Path(job.get("output_dir", "")).expanduser()
         output_names = job_output_names(job)
-        has_finished_output = any((output_dir / f"{name}.safetensors").exists() for name in output_names)
-        if has_finished_output:
-            return "done"
+        has_name_mismatch, _source_base = detect_job_element_base_mismatch(job)
+        if has_name_mismatch:
+            return "broken"
 
         global_train_steps = get_positive_int_setting(settings_state, TRAIN_STEPS_KEY, DEFAULT_TRAIN_STEPS)
         target_steps = get_positive_int_setting(job, "train_steps", global_train_steps)
         progress_step, has_resume_data = job_resume_progress(job)
+        has_finished_output = any((output_dir / f"{name}.safetensors").exists() for name in output_names)
+
+        # A final output file alone is not enough when the user increases target steps later.
+        # If we can see resume progress and it is below the new target, keep this resumable.
         if has_resume_data and progress_step >= target_steps:
+            return "done"
+        if has_finished_output and not has_resume_data:
             return "done"
 
         if hold:
@@ -3747,13 +3911,12 @@ def launch_ui() -> int:
             else:
                 normalized = {str(k): str(v) for k, v in raw.items()}
 
-            job_id = normalized.get("id", "").strip() or make_job_id()
-            normalized["id"] = job_id
+            job_id = training_name
+            normalized["id"] = training_name
             normalized["training_name"] = training_name
             normalized["training_dir"] = str(child)
             normalized["output_dir"] = str((child / "output").expanduser())
-            if not normalized.get("job_name", "").strip():
-                normalized["job_name"] = training_name
+            normalized["job_name"] = training_name
             if not normalized.get("dataset_name", "").strip():
                 normalized["dataset_name"] = infer_dataset_name_from_training_dir(child).strip() or training_name
             normalized["status"] = detect_job_status(normalized)
@@ -3822,6 +3985,8 @@ def launch_ui() -> int:
                     row_tags.append("status_done")
                 elif status == "failed":
                     row_tags.append("status_failed")
+                elif status == "broken":
+                    row_tags.append("status_failed")
                 elif status == "resume":
                     row_tags.append("status_resume")
                 elif status == "paused":
@@ -3848,7 +4013,7 @@ def launch_ui() -> int:
                     (
                         "IN PROGRESS"
                         if status == "running"
-                        else ("RESUME" if status == "resume" else status.upper())
+                        else ("RESUME" if status == "resume" else ("BROKEN" if status == "broken" else status.upper()))
                     ),
                     "",
                 ),
@@ -3877,6 +4042,8 @@ def launch_ui() -> int:
     def toggle_hold_job(index: int) -> None:
         idx = index
         if idx < 0 or idx >= len(job_queue):
+            return
+        if detect_job_status(job_queue[idx]) == "done":
             return
         current = flag_to_bool(job_queue[idx].get("hold", "0"))
         next_hold = not current
@@ -3926,11 +4093,17 @@ def launch_ui() -> int:
             return "break"
         set_queue_selection(clicked)
 
+        def fix_clicked_job_names() -> None:
+            fix_job_element_names(clicked)
+
+        clicked_status = detect_job_status(job_queue[clicked])
         menu = tk.Menu(root, tearoff=0)
         menu.add_command(label="Open Output Folder", command=lambda: open_job_output_folder(clicked))
         menu.add_command(label="LoRA Post-Hoc EMA Merge", command=lambda: merge_job_output_loras(clicked))
         menu.add_command(label="Duplicate Job", command=lambda: duplicate_job(clicked))
         menu.add_command(label="Edit Job", command=lambda: open_create_job_dialog(existing_job=job_queue[clicked]))
+        if clicked_status == "broken":
+            menu.add_command(label="Fix LoRA Names", command=fix_clicked_job_names)
         menu.add_separator()
         menu.add_command(label="Delete Job", command=lambda: delete_job_with_confirmation(clicked))
         try:
@@ -3957,7 +4130,70 @@ def launch_ui() -> int:
         job = job_queue[idx]
         job_name = job.get("job_name", "job")
         output_dir = Path(job.get("output_dir", "")).expanduser()
-        lora_post_hoc_ema_merge_for_output(job_name, output_dir)
+        merged_output_dir = output_dir / "merged"
+        merged_output_dir.mkdir(parents=True, exist_ok=True)
+        lora_post_hoc_ema_merge_for_output(job_name, merged_output_dir)
+
+    def fix_job_element_names(index: int | None = None) -> None:
+        idx = selected_queue_index() if index is None else index
+        if idx is None or idx < 0 or idx >= len(job_queue):
+            return
+        job = job_queue[idx]
+        has_mismatch, source_base = detect_job_element_base_mismatch(job)
+        if not has_mismatch or source_base is None:
+            messagebox.showinfo("Fix LoRA Names", "No naming mismatch detected for this job.", parent=root)
+            return
+
+        target_base = (job.get("training_name", "").strip() or job.get("job_name", "").strip())
+        if not target_base:
+            return
+
+        if not messagebox.askyesno(
+            "Fix LoRA Names",
+            (
+                "Detected output element names that do not match this job folder.\n\n"
+                f"From: {source_base}\n"
+                f"To:   {target_base}\n\n"
+                "Rename elements now?"
+            ),
+            parent=root,
+        ):
+            return
+
+        renamed = 0
+        conflicts = 0
+        for _attempt in range(5):
+            has_mismatch, next_source_base = detect_job_element_base_mismatch(job)
+            if not has_mismatch or next_source_base is None:
+                break
+            renamed_count, conflict_count = rename_job_elements_to_training_name(job, next_source_base)
+            renamed += renamed_count
+            conflicts += conflict_count
+            if renamed_count == 0:
+                break
+        refresh_job_queue_list()
+        sync_queue_row_action_buttons()
+        update_start_button_state()
+
+        if renamed > 0 and conflicts == 0:
+            messagebox.showinfo(
+                "Fix LoRA Names",
+                f"Renamed {renamed} element(s) to match '{target_base}'.",
+                parent=root,
+            )
+            return
+        if renamed > 0:
+            messagebox.showwarning(
+                "Fix LoRA Names",
+                f"Renamed {renamed} element(s), with {conflicts} conflict(s).",
+                parent=root,
+            )
+            return
+        messagebox.showwarning(
+            "Fix LoRA Names",
+            "No elements were renamed. Existing files may already use target names.",
+            parent=root,
+        )
 
     def duplicate_job(index: int | None = None) -> None:
         idx = selected_queue_index() if index is None else index
@@ -3985,7 +4221,7 @@ def launch_ui() -> int:
 
         duplicate = {
             **source,
-            "id": make_job_id(),
+            "id": new_name,
             "job_name": new_name,
             "training_name": new_name,
             "training_dir": str(training_dir_path),
@@ -4267,10 +4503,10 @@ def launch_ui() -> int:
             if not job_name:
                 messagebox.showerror("Missing value", "LoRA name is required.", parent=dialog)
                 return
-            if not DATASET_NAME_PATTERN.fullmatch(job_name):
+            if not is_valid_folder_name(job_name):
                 messagebox.showerror(
                     "Invalid name",
-                    "Use only letters, numbers, '_' or '-' for LoRA name.",
+                    "LoRA name must be a valid folder name. Spaces and '-' are allowed.",
                     parent=dialog,
                 )
                 return
@@ -4317,10 +4553,40 @@ def launch_ui() -> int:
                     messagebox.showerror("Duplicate name", "LoRA name already exists in queue.", parent=dialog)
                     return
 
-            if existing_job is None:
-                training_name = job_name
-            else:
-                training_name = (existing_job or {}).get("training_name", "").strip() or job_name
+            existing_training_name = ""
+            if existing_job is not None:
+                existing_training_name = (existing_job or {}).get("training_name", "").strip() or (existing_job or {}).get("job_name", "").strip()
+
+            training_name = job_name
+            renamed_training_folder = False
+
+            if existing_job is not None and existing_training_name and training_name != existing_training_name:
+                source_training_dir = training_job_dir_path(existing_training_name).expanduser()
+                target_training_dir = training_job_dir_path(training_name).expanduser()
+
+                if target_training_dir.exists():
+                    messagebox.showerror(
+                        "Duplicate name",
+                        (
+                            "A job folder with this LoRA name already exists:\n"
+                            f"{target_training_dir}\n\n"
+                            "Choose a different name."
+                        ),
+                        parent=dialog,
+                    )
+                    return
+
+                if source_training_dir.exists() and source_training_dir.is_dir():
+                    try:
+                        shutil.move(str(source_training_dir), str(target_training_dir))
+                        renamed_training_folder = True
+                    except OSError as exc:
+                        messagebox.showerror(
+                            "Rename failed",
+                            f"Could not rename job folder:\n{exc}",
+                            parent=dialog,
+                        )
+                        return
 
             try:
                 resolution_value = get_positive_int_setting({"resolution": train_resolution_var.get().strip()}, "resolution", DEFAULT_RESOLUTION, minimum=64)
@@ -4337,7 +4603,7 @@ def launch_ui() -> int:
             tracker_name = settings_state.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip() or job_name
 
             new_job = {
-                "id": (existing_job or {}).get("id", "") or make_job_id(),
+                "id": training_name,
                 "dataset_name": dataset_name,
                 "training_name": training_name,
                 "training_dir": str(training_dir_path),
@@ -4360,8 +4626,22 @@ def launch_ui() -> int:
                 "stream_output": bool_to_flag(is_truthy(settings_state.get(TRAIN_STREAM_TO_LOGGER_KEY), default=False)),
                 "auto_cleanup": bool_to_flag(is_truthy(settings_state.get(TRAIN_AUTO_CLEANUP_STATES_KEY), default=True)),
                 "hold": (existing_job or {}).get("hold", "0"),
-                "status": "queued" if existing_job is None else detect_job_status({**(existing_job or {}), "job_name": job_name, "output_dir": str(output_root)}),
+                "status": "queued",
             }
+
+            # Re-evaluate status from edited values and current outputs (for example, step changes).
+            new_job["status"] = detect_job_status(new_job)
+
+            auto_fixed_elements = 0
+            if existing_job is not None:
+                for _attempt in range(5):
+                    has_mismatch, source_base = detect_job_element_base_mismatch(new_job)
+                    if not has_mismatch or source_base is None:
+                        break
+                    renamed_count, _conflicts = rename_job_elements_to_training_name(new_job, source_base)
+                    auto_fixed_elements += renamed_count
+                    if renamed_count == 0:
+                        break
 
             if existing_job is None:
                 job_queue.append(new_job)
@@ -4373,6 +4653,8 @@ def launch_ui() -> int:
 
             save_job_to_disk(new_job)
             save_job_order()
+            if renamed_training_folder:
+                load_job_queue_from_disk()
             refresh_job_queue_list()
             update_start_button_state()
             if existing_job is None:
@@ -4380,9 +4662,14 @@ def launch_ui() -> int:
                     f"[Queue] Created job: {job_name} (source dataset: {dataset_name}, training: {training_name}, captions added: {created_captions})"
                 )
             else:
-                log(
-                    f"[Queue] Updated job: {job_name} (source dataset: {dataset_name}, training: {training_name}, captions added: {created_captions})"
-                )
+                if auto_fixed_elements > 0:
+                    log(
+                        f"[Queue] Updated job: {job_name} (source dataset: {dataset_name}, training: {training_name}, captions added: {created_captions}, renamed elements: {auto_fixed_elements})"
+                    )
+                else:
+                    log(
+                        f"[Queue] Updated job: {job_name} (source dataset: {dataset_name}, training: {training_name}, captions added: {created_captions})"
+                    )
             dialog.destroy()
 
         buttons = ttk.Frame(frame)
@@ -4454,10 +4741,6 @@ def launch_ui() -> int:
             width=1,
         )
         image = Image.alpha_composite(image_rgba, border_overlay).convert("RGB")
-
-        draw = ImageDraw.Draw(image)
-        if run_state == "in_progress":
-            draw.rectangle((1, 1, thumb_px - 2, thumb_px - 2), outline="#f5b301", width=2)
 
         # Composite badge icons directly onto the image so alpha works correctly.
         badge_size = max(18, thumb_px // 8)
@@ -4698,8 +4981,7 @@ def launch_ui() -> int:
             title_label = ttk.Label(card, text=name, style=title_style, anchor="center")
             title_label.grid(row=1, column=0, sticky="ew", pady=(6, 0))
             image_count = len(dataset_image_files(datasets_root_dir(), name))
-            resolution_text = effective_train.get(TRAIN_RESOLUTION_KEY, str(DEFAULT_RESOLUTION))
-            status_text = f"{image_count} IMG / {resolution_text}px"
+            status_text = f"{image_count} IMG"
             status_label = ttk.Label(card, text=status_text, style=meta_style, anchor="center")
             status_label.grid(row=2, column=0, sticky="ew", pady=(2, 8))
 
@@ -5146,10 +5428,17 @@ def launch_ui() -> int:
             if index < 0 or index >= len(job_queue):
                 continue
             job = job_queue[index]
+            status = detect_job_status(job)
             hold = flag_to_bool(job.get("hold", "0"))
             row_bg = row_background_for_item(item_id)
-            cb_text = "☐" if hold else "☑"
-            cb_fg = "#4a6a8a" if hold else "#5eead4"
+            if status == "done":
+                cb_text = "☒"
+                cb_fg = "#5a6474"
+                cb_cursor = "arrow"
+            else:
+                cb_text = "☐" if hold else "☑"
+                cb_fg = "#4a6a8a" if hold else "#5eead4"
+                cb_cursor = "hand2"
             cb_label = tk.Label(
                 queue_list,
                 text=cb_text,
@@ -5161,10 +5450,11 @@ def launch_ui() -> int:
                 pady=0,
                 relief="flat",
                 highlightthickness=0,
-                cursor="hand2",
+                cursor=cb_cursor,
                 anchor="center",
             )
-            cb_label.bind("<Button-1>", lambda _e, idx=index: toggle_hold_job(idx))
+            if status != "done":
+                cb_label.bind("<Button-1>", lambda _e, idx=index: toggle_hold_job(idx))
             queue_row_checkbox_labels[item_id] = cb_label
         place_queue_row_checkbox_labels()
 
