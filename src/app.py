@@ -62,6 +62,7 @@ from .klein_train import (
     DEFAULT_NETWORK_ALPHA,
     DEFAULT_NETWORK_DIM,
     DEFAULT_RESOLUTION,
+    DEFAULT_SAVE_EVERY_N_STEPS,
     DEFAULT_TRAIN_STEPS,
     JOB_EXIT_CANCELLED,
     JOB_EXIT_SUCCESS,
@@ -79,6 +80,7 @@ DATASET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 DATASET_SETTINGS_FILE_NAME = "settings.json"
 DATASET_USE_GLOBAL_TRAIN_KEY = "use_global_train_settings"
 TRAIN_DIM_ALPHA_CHOICES = ("16", "32", "64")
+RESOLUTION_CHOICES = (512, 768, 1024, 1280)
 JOB_SETTINGS_FILE_NAME = "settings.json"
 JOBS_ORDER_FILE_NAME = "_order.json"
 JOB_PROGRESS_FILE_NAME = "progress.json"
@@ -513,6 +515,25 @@ def launch_ui() -> int:
     style.configure("TCheckbutton", background=bg_panel, foreground=fg_text)
     style.map("TCheckbutton", background=[("active", bg_panel)], foreground=[("disabled", fg_muted)])
     style.configure(
+        "TNotebook",
+        background=bg_panel,
+        borderwidth=0,
+        tabmargins=(0, 0, 0, 0),
+    )
+    style.configure(
+        "TNotebook.Tab",
+        background="#1f1f1f",
+        foreground=fg_muted,
+        padding=(10, 5),
+        borderwidth=0,
+        focuscolor=bg_panel,
+    )
+    style.map(
+        "TNotebook.Tab",
+        background=[("selected", bg_panel), ("active", "#2e2e2e")],
+        foreground=[("selected", fg_text), ("active", fg_text)],
+    )
+    style.configure(
         "Card.TFrame",
         background=bg_card,
         relief="solid",
@@ -928,51 +949,66 @@ def launch_ui() -> int:
 
     def ensure_training_job_structure(
         training_name: str,
-        dataset_name: str,
-        resolution: int,
         default_caption_keyword: str,
+        datasets: list[dict] | None = None,
+        dataset_name: str = "",
+        resolution: int = DEFAULT_RESOLUTION,
+        batch_size: int = 1,
     ) -> tuple[Path, Path, int]:
-        dataset_dir = dataset_dir_path(dataset_name)
-        image_files = dataset_image_files(datasets_root_dir(), dataset_name)
-        if not image_files:
-            raise RuntimeError(f"Dataset images not found in: {dataset_dir}")
-        images_dir = image_files[0].parent
+        # Normalise: support legacy single-dataset callers via dataset_name=
+        if not datasets:
+            if dataset_name:
+                datasets = [{"name": dataset_name, "num_repeats": 1}]
+            else:
+                raise RuntimeError("No datasets specified for training job structure.")
 
         job_dir = training_job_dir_path(training_name)
-        cache_dir = job_dir / "cache"
         output_dir = job_dir / "output"
-        cache_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         created_captions = 0
         caption_text = default_caption_keyword.strip()
-        for image_path in image_files:
-            caption_path = image_path.with_suffix(".txt")
-            if caption_path.exists():
-                continue
-            caption_path.write_text(caption_text, encoding="utf-8")
-            created_captions += 1
+
+        toml_lines: list[str] = [
+            "[general]",
+            f"resolution = [{resolution}, {resolution}]",
+            'caption_extension = ".txt"',
+            f"batch_size = {batch_size}",
+            "enable_bucket = true",
+            "bucket_no_upscale = false",
+            "",
+        ]
+
+        for ds_idx, ds in enumerate(datasets):
+            ds_name = ds["name"]
+            num_repeats = int(ds.get("num_repeats", 1))
+
+            image_files = dataset_image_files(datasets_root_dir(), ds_name)
+            if not image_files:
+                raise RuntimeError(f"Dataset images not found for: {ds_name}")
+            images_dir = image_files[0].parent
+
+            for image_path in image_files:
+                caption_path = image_path.with_suffix(".txt")
+                if caption_path.exists():
+                    continue
+                caption_path.write_text(caption_text, encoding="utf-8")
+                created_captions += 1
+
+            # First dataset uses "cache" for backward compatibility; additional use "cache_{name}"
+            cache_dir = job_dir / "cache" if ds_idx == 0 else job_dir / f"cache_{ds_name}"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            toml_lines += [
+                "[[datasets]]",
+                f'image_directory = "{images_dir.resolve().as_posix()}"',
+                f'cache_directory = "{cache_dir.resolve().as_posix()}"',
+                f"num_repeats = {num_repeats}",
+                "",
+            ]
 
         dataset_toml_path = job_dir / "dataset.toml"
-        dataset_toml_path.write_text(
-            "\n".join(
-                [
-                    "[general]",
-                    f"resolution = [{resolution}, {resolution}]",
-                    'caption_extension = ".txt"',
-                    "batch_size = 1",
-                    "enable_bucket = true",
-                    "bucket_no_upscale = false",
-                    "",
-                    "[[datasets]]",
-                    f'image_directory = "{images_dir.resolve().as_posix()}"',
-                    f'cache_directory = "{cache_dir.resolve().as_posix()}"',
-                    "num_repeats = 1",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
-        )
+        dataset_toml_path.write_text("\n".join(toml_lines), encoding="utf-8")
 
         return job_dir, output_dir, created_captions
 
@@ -1902,7 +1938,7 @@ def launch_ui() -> int:
 
     controls = ttk.Frame(root, padding=(8, 0, 8, 8))
     controls.grid(row=1, column=0, sticky="ew")
-    controls.columnconfigure(1, weight=1)
+    controls.columnconfigure(3, weight=1)
 
     def apply_settings_from_dialog(required: bool = False) -> bool:
         nonlocal runtime_config, dataset_order
@@ -2974,7 +3010,9 @@ def launch_ui() -> int:
         output_dir = runtime_config.training_dir / dataset_name / "output"
         lora_post_hoc_ema_merge_for_output(dataset_name, output_dir)
 
-    def lora_post_hoc_ema_merge_for_output(target_name: str, output_dir: Path) -> None:
+    def lora_post_hoc_ema_merge_for_output(target_name: str, output_dir: Path, merge_output_dir: Path | None = None) -> None:
+        if merge_output_dir is None:
+            merge_output_dir = output_dir
         if not output_dir.exists() or not output_dir.is_dir():
             messagebox.showerror(
                 "Merge unavailable",
@@ -3028,7 +3066,7 @@ def launch_ui() -> int:
         for merge_mode_label, merge_mode_suffix, merge_mode_args, preset_name in selected_jobs:
             output_path = next_merged_output_path(
                 target_name,
-                output_dir,
+                merge_output_dir,
                 merge_mode_suffix,
                 preset_name,
                 selected_files,
@@ -3630,11 +3668,318 @@ def launch_ui() -> int:
         dialog.deiconify()
         root.wait_window(dialog)
 
+    def archive_root_dir() -> Path:
+        return datasets_root_dir().parent / "Archive"
+
+    def archive_dataset(dataset_name: str) -> None:
+        src = dataset_dir_path(dataset_name)
+        if not src.exists() or not src.is_dir():
+            messagebox.showerror("Archive failed", f"Dataset folder not found:\n{src}", parent=root)
+            return
+        dest_parent = archive_root_dir() / "Datasets"
+        dest = dest_parent / dataset_name
+        if not messagebox.askyesno(
+            "Archive dataset",
+            f"Move dataset '{dataset_name}' to Archive/Datasets?\n\nThe folder will be moved out of the Datasets directory.",
+            parent=root,
+        ):
+            return
+        try:
+            dest_parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists():
+                # Merge: copy every file from src into dest, overwriting same-named files.
+                # Files only in dest are kept untouched.
+                for src_file in src.iterdir():
+                    if src_file.is_file():
+                        dst_file = dest / src_file.name
+                        shutil.copy2(str(src_file), str(dst_file))
+                shutil.rmtree(src)
+            else:
+                shutil.move(str(src), str(dest))
+        except OSError as exc:
+            messagebox.showerror("Archive failed", f"Could not archive dataset folder:\n{exc}", parent=root)
+            return
+        rebuild_folder_list(force=True)
+        log(f"[Archive] Dataset '{dataset_name}' archived to: {dest}")
+
+    def archive_selected_datasets() -> None:
+        names = selected_dataset_names()
+        if not names:
+            messagebox.showinfo(
+                "Archive Datasets",
+                "No datasets are selected. Check the datasets you want to archive first.",
+                parent=root,
+            )
+            return
+        label = "\n".join(f"  • {n}" for n in names)
+        if not messagebox.askyesno(
+            "Archive Datasets",
+            f"Move {len(names)} dataset(s) to Archive/Datasets?\n\n{label}\n\nThe folders will be moved out of the Datasets directory.",
+            parent=root,
+        ):
+            return
+        dest_parent = archive_root_dir() / "Datasets"
+        errors: list[str] = []
+        for name in names:
+            src = dataset_dir_path(name)
+            if not src.exists() or not src.is_dir():
+                errors.append(f"{name}: folder not found")
+                continue
+            dest = dest_parent / name
+            try:
+                dest_parent.mkdir(parents=True, exist_ok=True)
+                if dest.exists():
+                    for src_file in src.iterdir():
+                        if src_file.is_file():
+                            shutil.copy2(str(src_file), str(dest / src_file.name))
+                    shutil.rmtree(src)
+                else:
+                    shutil.move(str(src), str(dest))
+                log(f"[Archive] Dataset '{name}' archived to: {dest}")
+            except OSError as exc:
+                errors.append(f"{name}: {exc}")
+        rebuild_folder_list(force=True)
+        if errors:
+            messagebox.showerror(
+                "Archive Datasets",
+                f"Some datasets could not be archived:\n" + "\n".join(errors),
+                parent=root,
+            )
+
+    def open_restore_datasets_dialog() -> None:
+        archive_datasets_dir = archive_root_dir() / "Datasets"
+        if not archive_datasets_dir.exists() or not archive_datasets_dir.is_dir():
+            messagebox.showinfo("Restore Datasets", "No archived datasets found.", parent=root)
+            return
+
+        archived_names = sorted(
+            child.name for child in archive_datasets_dir.iterdir() if child.is_dir()
+        )
+        if not archived_names:
+            messagebox.showinfo("Restore Datasets", "No archived datasets found.", parent=root)
+            return
+
+        THUMB_PX = 120
+        COLS = 4
+        selected_vars: dict[str, tk.BooleanVar] = {}
+        thumb_refs: list[ImageTk.PhotoImage] = []
+
+        dialog = tk.Toplevel(root)
+        dialog.withdraw()
+        dialog.title("Restore Archived Datasets")
+        dialog.transient(root)
+        dialog.grab_set()
+        dialog.configure(bg=bg_panel)
+        dialog.resizable(True, True)
+        set_dark_title_bar(dialog)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=0)
+
+        # ── scrollable grid host ──────────────────────────────────────────
+        scroll_host = ttk.Frame(dialog)
+        scroll_host.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 0))
+        scroll_host.columnconfigure(0, weight=1)
+        scroll_host.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(scroll_host, bg=bg_panel, bd=0, highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vscroll = ttk.Scrollbar(scroll_host, orient="vertical", command=canvas.yview, style="Dark.Vertical.TScrollbar")
+        vscroll.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=vscroll.set)
+
+        inner = ttk.Frame(canvas, padding=4)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _sync_scroll(_event: tk.Event | None = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_width(event: tk.Event) -> None:
+            canvas.itemconfigure(inner_id, width=event.width)
+
+        inner.bind("<Configure>", _sync_scroll)
+        canvas.bind("<Configure>", _sync_width)
+
+        def _on_mousewheel(event: tk.Event) -> str:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+
+        dialog.bind("<MouseWheel>", _on_mousewheel)
+
+        # ── build thumbnail grid ──────────────────────────────────────────
+        for idx_n, name in enumerate(archived_names):
+            col = idx_n % COLS
+            row = idx_n // COLS
+
+            archive_folder = archive_datasets_dir / name
+            images = sorted(
+                p for p in archive_folder.iterdir()
+                if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTENSIONS
+            ) if archive_folder.is_dir() else []
+            first_img = images[0] if images else None
+
+            # build thumbnail
+            try:
+                if first_img:
+                    img = Image.open(first_img).convert("RGB")
+                    img.thumbnail((THUMB_PX, THUMB_PX), Image.LANCZOS)
+                    bg_img = Image.new("RGB", (THUMB_PX, THUMB_PX), (45, 45, 45))
+                    offset = ((THUMB_PX - img.width) // 2, (THUMB_PX - img.height) // 2)
+                    bg_img.paste(img, offset)
+                    photo = ImageTk.PhotoImage(bg_img)
+                else:
+                    placeholder = Image.new("RGB", (THUMB_PX, THUMB_PX), (45, 45, 45))
+                    photo = ImageTk.PhotoImage(placeholder)
+            except Exception:
+                placeholder = Image.new("RGB", (THUMB_PX, THUMB_PX), (45, 45, 45))
+                photo = ImageTk.PhotoImage(placeholder)
+            thumb_refs.append(photo)
+
+            var = tk.BooleanVar(value=False)
+            selected_vars[name] = var
+
+            card = tk.Frame(inner, bg=bg_card, bd=1, relief="solid", cursor="hand2")
+            card.grid(row=row, column=col, padx=4, pady=4, sticky="n")
+
+            thumb_label = tk.Label(card, image=photo, bg=bg_card, cursor="hand2")
+            thumb_label.pack(padx=4, pady=(4, 2))
+
+            name_label = tk.Label(
+                card, text=name, fg=fg_text, bg=bg_card,
+                font=("Segoe UI", 8), wraplength=THUMB_PX + 8, justify="center", cursor="hand2",
+            )
+            name_label.pack(padx=4, pady=(0, 2))
+
+            count_text = f"{len(images)} image{'s' if len(images) != 1 else ''}"
+            tk.Label(
+                card, text=count_text, fg=fg_muted, bg=bg_card,
+                font=("Segoe UI", 7),
+            ).pack(padx=4, pady=(0, 4))
+
+            def _toggle(n: str = name, c: tk.Frame = card) -> None:
+                v = selected_vars[n]
+                v.set(not v.get())
+                c.configure(bg="#1e3a5a" if v.get() else bg_card)
+                for w in c.winfo_children():
+                    try:
+                        w.configure(bg="#1e3a5a" if v.get() else bg_card)
+                    except tk.TclError:
+                        pass
+
+            for widget in (card, thumb_label, name_label):
+                widget.bind("<Button-1>", lambda _e, n=name, c=card: _toggle(n, c))
+
+        # ── footer ────────────────────────────────────────────────────────
+        footer = ttk.Frame(dialog, padding=(10, 8, 10, 10))
+        footer.grid(row=1, column=0, sticky="ew")
+        footer.columnconfigure(0, weight=1)
+
+        sel_label_var = tk.StringVar(value="0 selected")
+
+        def _update_sel_label(*_: object) -> None:
+            count = sum(1 for v in selected_vars.values() if v.get())
+            sel_label_var.set(f"{count} selected")
+
+        for v in selected_vars.values():
+            v.trace_add("write", _update_sel_label)
+
+        ttk.Label(footer, textvariable=sel_label_var, foreground=fg_muted).grid(row=0, column=0, sticky="w")
+
+        def _apply() -> None:
+            to_restore = [n for n, v in selected_vars.items() if v.get()]
+            if not to_restore:
+                messagebox.showwarning("No selection", "Select at least one dataset to restore.", parent=dialog)
+                return
+
+            errors: list[str] = []
+            restored: list[str] = []
+            for name in to_restore:
+                src = archive_datasets_dir / name
+                dst = datasets_root_dir() / name
+                if dst.exists():
+                    errors.append(f"'{name}' — destination already exists, skipped.")
+                    continue
+                try:
+                    datasets_root_dir().mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src), str(dst))
+                    restored.append(name)
+                except OSError as exc:
+                    errors.append(f"'{name}' — {exc}")
+
+            if errors:
+                messagebox.showwarning(
+                    "Restore completed with errors",
+                    "Some datasets could not be restored:\n\n" + "\n".join(errors),
+                    parent=dialog,
+                )
+            dialog.destroy()
+            rebuild_folder_list(force=True)
+            if restored:
+                log(f"[Restore] Restored {len(restored)} dataset(s): {', '.join(restored)}")
+
+        btn_row = ttk.Frame(footer)
+        btn_row.grid(row=1, column=0, columnspan=2, sticky="e", pady=(6, 0))
+        ttk.Button(btn_row, text="Cancel", command=dialog.destroy).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(btn_row, text="Restore Selected", command=_apply).grid(row=0, column=1)
+
+        dialog.update_idletasks()
+        cols_w = COLS * (THUMB_PX + 24) + 44
+        win_w = max(cols_w, 420)
+        win_h = min(700, max(380, (len(archived_names) // COLS + 1) * (THUMB_PX + 60) + 120))
+        dialog.geometry(f"{win_w}x{win_h}")
+        center_window(dialog)
+        dialog.deiconify()
+        root.wait_window(dialog)
+
+    def archive_job(index: int | None = None) -> None:
+        idx = selected_queue_index() if index is None else index
+        if idx is None or idx < 0 or idx >= len(job_queue):
+            return
+        job = job_queue[idx]
+        job_name = job.get("job_name", "unnamed")
+        training_name = job.get("training_name", "").strip() or job_name
+        training_dir = Path(job.get("training_dir", "")).expanduser()
+        if not training_dir.exists() and training_name:
+            training_dir = training_job_dir_path(training_name).expanduser()
+        dest_parent = archive_root_dir() / "Jobs"
+        dest = dest_parent / training_dir.name
+        overwrite = False
+        if dest.exists():
+            overwrite = messagebox.askyesno(
+                "Archive job",
+                f"An archived job named '{training_dir.name}' already exists.\n\nOverwrite it?",
+                parent=root,
+            )
+            if not overwrite:
+                return
+        if not messagebox.askyesno(
+            "Archive job",
+            f"Move job '{job_name}' to Archive/Jobs?\n\nThe job will be removed from the queue and its folder moved to the archive.",
+            parent=root,
+        ):
+            return
+        removed = job_queue.pop(idx)
+        remove_job_from_disk(removed)
+        save_job_order()
+        if training_dir.exists() and training_dir.is_dir():
+            try:
+                dest_parent.mkdir(parents=True, exist_ok=True)
+                if overwrite and dest.exists():
+                    shutil.rmtree(dest)
+                shutil.move(str(training_dir), str(dest))
+            except OSError as exc:
+                messagebox.showerror("Archive failed", f"Could not move job folder:\n{exc}", parent=root)
+        refresh_job_queue_list()
+        update_start_button_state()
+        log(f"[Archive] Job '{job_name}' archived to: {dest}")
+
     def show_thumbnail_context_menu(event: tk.Event, dataset_name: str) -> str:
         menu = tk.Menu(root, tearoff=0)
         menu.add_command(label="Edit Dataset", command=lambda: open_edit_dataset_dialog(dataset_name))
         menu.add_command(label="Open Dataset", command=lambda: open_dataset_in_file_manager(dataset_name))
         menu.add_command(label="Add Images", command=lambda: add_images_to_dataset(dataset_name))
+        menu.add_separator()
+        menu.add_command(label="Archive Dataset", command=lambda: archive_dataset(dataset_name))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -4182,7 +4527,7 @@ def launch_ui() -> int:
         if status == "running":
             return "running" if run_in_progress else "queued"
         if status == "cancelled":
-            return "resume"
+            return "resume" if has_resume_data else "queued"
         if has_resume_data:
             return "resume"
         if status in {"queued", "failed", "resume"}:
@@ -4423,6 +4768,7 @@ def launch_ui() -> int:
         if clicked_status == "broken":
             menu.add_command(label="Fix LoRA Names", command=fix_clicked_job_names)
         menu.add_separator()
+        menu.add_command(label="Archive Job", command=lambda: archive_job(clicked))
         menu.add_command(label="Delete Job", command=lambda: delete_job_with_confirmation(clicked))
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -4450,7 +4796,7 @@ def launch_ui() -> int:
         output_dir = Path(job.get("output_dir", "")).expanduser()
         merged_output_dir = output_dir / "merged"
         merged_output_dir.mkdir(parents=True, exist_ok=True)
-        lora_post_hoc_ema_merge_for_output(job_name, merged_output_dir)
+        lora_post_hoc_ema_merge_for_output(job_name, output_dir, merged_output_dir)
 
     def fix_job_element_names(index: int | None = None) -> None:
         idx = selected_queue_index() if index is None else index
@@ -4526,10 +4872,18 @@ def launch_ui() -> int:
             return
 
         resolution_value = get_positive_int_setting(source, "resolution", DEFAULT_RESOLUTION, minimum=64)
+        raw_datasets = source.get("datasets_json", "")
+        if raw_datasets:
+            try:
+                dup_datasets: list[dict] = json.loads(raw_datasets)
+            except Exception:
+                dup_datasets = [{"name": source_dataset, "num_repeats": 1}]
+        else:
+            dup_datasets = [{"name": source_dataset, "num_repeats": 1}]
         try:
             training_dir_path, output_dir_path, created_captions = ensure_training_job_structure(
                 training_name=new_name,
-                dataset_name=source_dataset,
+                datasets=dup_datasets,
                 resolution=resolution_value,
                 default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
             )
@@ -4672,17 +5026,23 @@ def launch_ui() -> int:
         if existing_job is None:
             selected = selected_dataset_names()
             if not selected:
-                messagebox.showinfo("No source dataset selected", "Select one source dataset card first.", parent=root)
+                messagebox.showinfo("No source dataset selected", "Select at least one dataset card first.", parent=root)
                 return
-            if len(selected) > 1:
-                messagebox.showinfo("Select one source dataset", "Select exactly one source dataset to create a job.", parent=root)
-                return
+            initial_datasets: list[dict] = [{"name": n, "num_repeats": 1} for n in selected]
             dataset_name = selected[0]
         else:
             dataset_name = existing_job.get("dataset_name", "").strip()
             if not dataset_name:
                 messagebox.showerror("Invalid job", "Job has no dataset name.", parent=root)
                 return
+            raw_datasets = existing_job.get("datasets_json", "")
+            if raw_datasets:
+                try:
+                    initial_datasets = json.loads(raw_datasets)
+                except Exception:
+                    initial_datasets = [{"name": dataset_name, "num_repeats": 1}]
+            else:
+                initial_datasets = [{"name": dataset_name, "num_repeats": 1}]
 
         effective = effective_train_settings_for_dataset(dataset_name)
 
@@ -4695,22 +5055,51 @@ def launch_ui() -> int:
         dialog.resizable(False, False)
         set_dark_title_bar(dialog)
 
-        frame = ttk.Frame(dialog, padding=10)
-        frame.grid(row=0, column=0, sticky="nsew")
-        frame.columnconfigure(1, weight=1)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+
+        outer = ttk.Frame(dialog, padding=10)
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
+
+        # ── Header: LoRA name + model ──────────────────────────────────────
+        header_frame = ttk.Frame(outer)
+        header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header_frame.columnconfigure(1, weight=1)
 
         default_job_name = f"{dataset_name}_Klein"
         if existing_job is not None:
             default_job_name = existing_job.get("job_name", default_job_name)
         job_name_var = tk.StringVar(value=default_job_name)
         model_var = tk.StringVar(value=(existing_job or {}).get("model", "Klein"))
-        train_optimizer_var = tk.StringVar(value=(existing_job or {}).get("optimizer_type", get_train_optimizer_setting(effective)))
+
+        ttk.Label(header_frame, text="LoRA name:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(header_frame, textvariable=job_name_var, style="Flat.TEntry").grid(row=0, column=1, sticky="ew")
+        ttk.Label(header_frame, text="Model:").grid(row=0, column=2, sticky="w", padx=(12, 8))
+        ttk.Combobox(header_frame, textvariable=model_var, values=("Klein",), state="readonly", width=10).grid(row=0, column=3, sticky="w")
+
+        # ── Notebook ───────────────────────────────────────────────────────
+        notebook = ttk.Notebook(outer)
+        notebook.grid(row=1, column=0, sticky="nsew")
+
+        # ── Tab 1: Training ────────────────────────────────────────────────
+        training_tab = ttk.Frame(notebook, padding=10)
+        training_tab.columnconfigure(1, weight=1)
+        training_tab.columnconfigure(3, weight=1)
+        notebook.add(training_tab, text="  Training  ")
+
+        train_optimizer_var = tk.StringVar(
+            value=(existing_job or {}).get("optimizer_type", get_train_optimizer_setting(effective))
+        )
         train_learning_rate_var = tk.StringVar(
             value=(existing_job or {}).get("learning_rate", effective.get(TRAIN_LEARNING_RATE_KEY, DEFAULT_LEARNING_RATE))
         )
-        train_steps_var = tk.StringVar(value=(existing_job or {}).get("train_steps", effective.get(TRAIN_STEPS_KEY, str(DEFAULT_TRAIN_STEPS))))
-        train_resolution_var = tk.StringVar(
-            value=(existing_job or {}).get("resolution", effective.get(TRAIN_RESOLUTION_KEY, str(DEFAULT_RESOLUTION)))
+        train_steps_var = tk.StringVar(
+            value=(existing_job or {}).get("train_steps", effective.get(TRAIN_STEPS_KEY, str(DEFAULT_TRAIN_STEPS)))
+        )
+        train_save_every_var = tk.StringVar(
+            value=(existing_job or {}).get("save_every_n_steps", str(DEFAULT_SAVE_EVERY_N_STEPS))
         )
         train_network_dim_var = tk.StringVar(
             value=(existing_job or {}).get("network_dim", effective.get(TRAIN_NETWORK_DIM_KEY, str(DEFAULT_NETWORK_DIM)))
@@ -4718,7 +5107,6 @@ def launch_ui() -> int:
         train_network_alpha_var = tk.StringVar(
             value=(existing_job or {}).get("network_alpha", effective.get(TRAIN_NETWORK_ALPHA_KEY, str(DEFAULT_NETWORK_ALPHA)))
         )
-
         compile_var = tk.BooleanVar(
             value=flag_to_bool((existing_job or {}).get("enable_compile", bool_to_flag(is_truthy(settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY), default=False))))
         )
@@ -4734,41 +5122,17 @@ def launch_ui() -> int:
         gc_var = tk.BooleanVar(
             value=flag_to_bool((existing_job or {}).get("enable_gc", bool_to_flag(is_truthy(settings_state.get(ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY), default=False))))
         )
-        ttk.Label(frame, text="Source dataset:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Label(frame, text=dataset_name, style="PathDisplay.TLabel", anchor="w", padding=(6, 4)).grid(
-            row=0,
-            column=1,
-            sticky="ew",
-        )
 
-        ttk.Label(frame, text="Model:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Combobox(frame, textvariable=model_var, values=("Klein",), state="readonly", width=14).grid(
-            row=1,
-            column=1,
-            sticky="w",
-            pady=(8, 0),
-        )
-
-        ttk.Label(frame, text="LoRA name:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Entry(frame, textvariable=job_name_var, style="Flat.TEntry").grid(row=2, column=1, sticky="ew", pady=(8, 0))
-
-        options = ttk.LabelFrame(frame, text="Training settings", padding=8)
-        options.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        options = ttk.LabelFrame(training_tab, text="Training settings", padding=8)
+        options.grid(row=0, column=0, columnspan=4, sticky="ew")
         options.columnconfigure(1, weight=1)
         options.columnconfigure(3, weight=1)
 
         ttk.Label(options, text="Optimizer type:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         train_optimizer_combo = ttk.Combobox(
-            options,
-            textvariable=train_optimizer_var,
-            values=("adamw8bit", "prodigy"),
-            state="readonly",
+            options, textvariable=train_optimizer_var, values=("adamw8bit", "prodigy"), state="readonly"
         )
-        train_optimizer_combo.grid(
-            row=0,
-            column=1,
-            sticky="ew",
-        )
+        train_optimizer_combo.grid(row=0, column=1, sticky="ew")
         ttk.Label(options, text="Training steps:").grid(row=0, column=2, sticky="w", padx=(12, 8))
         ttk.Entry(options, textvariable=train_steps_var, style="Flat.TEntry").grid(row=0, column=3, sticky="ew")
 
@@ -4777,34 +5141,23 @@ def launch_ui() -> int:
         train_learning_rate_entry.grid(row=1, column=1, sticky="ew", pady=(6, 0))
         ttk.Label(options, text="LoRA network dim:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
         ttk.Combobox(options, textvariable=train_network_dim_var, values=TRAIN_DIM_ALPHA_CHOICES, state="readonly").grid(
-            row=1,
-            column=3,
-            sticky="ew",
-            pady=(6, 0),
+            row=1, column=3, sticky="ew", pady=(6, 0)
         )
-        ttk.Label(options, text="Dataset resolution:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Entry(options, textvariable=train_resolution_var, style="Flat.TEntry").grid(row=2, column=1, sticky="ew", pady=(6, 0))
+        ttk.Label(options, text="Save every N steps:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Entry(options, textvariable=train_save_every_var, style="Flat.TEntry").grid(row=2, column=1, sticky="ew", pady=(6, 0))
         ttk.Label(options, text="LoRA network alpha:").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
         ttk.Combobox(options, textvariable=train_network_alpha_var, values=TRAIN_DIM_ALPHA_CHOICES, state="readonly").grid(
-            row=2,
-            column=3,
-            sticky="ew",
-            pady=(6, 0),
+            row=2, column=3, sticky="ew", pady=(6, 0)
         )
 
-        flags = ttk.LabelFrame(options, text="Advanced flags", padding=8)
-        flags.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        flags = ttk.LabelFrame(training_tab, text="Advanced flags", padding=8)
+        flags.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         ttk.Checkbutton(flags, text="Enable Torch Compile", variable=compile_var).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(flags, text="Enable Allow TF32", variable=tf32_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
         ttk.Checkbutton(flags, text="Enable cuDNN Benchmark", variable=cudnn_var).grid(row=0, column=2, sticky="w", padx=(12, 0))
         ttk.Checkbutton(flags, text="Enable FP8 (Low VRAM)", variable=fp8_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Checkbutton(flags, text="Enable CPU Gradient Checkpointing (Low RAM)", variable=gc_var).grid(
-            row=1,
-            column=1,
-            columnspan=2,
-            sticky="w",
-            padx=(12, 0),
-            pady=(6, 0),
+            row=1, column=1, columnspan=2, sticky="w", padx=(12, 0), pady=(6, 0)
         )
 
         def sync_optimizer_controls() -> None:
@@ -4817,6 +5170,121 @@ def launch_ui() -> int:
         train_optimizer_var.trace_add("write", lambda *_args: sync_optimizer_controls())
         sync_optimizer_controls()
 
+        # ── Tab 2: Datasets ────────────────────────────────────────────────
+        datasets_tab = ttk.Frame(notebook, padding=10)
+        datasets_tab.columnconfigure(0, weight=1)
+        datasets_tab.rowconfigure(1, weight=1)
+        notebook.add(datasets_tab, text="  Datasets  ")
+
+        # Resolution + Batch row (both written to [general] section of dataset.toml)
+        res_row = ttk.Frame(datasets_tab)
+        res_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        _saved_res = int((existing_job or {}).get("resolution", effective.get(TRAIN_RESOLUTION_KEY, str(DEFAULT_RESOLUTION))))
+        _saved_res_str = str(_saved_res) if _saved_res in RESOLUTION_CHOICES else str(RESOLUTION_CHOICES[RESOLUTION_CHOICES.index(1024)])
+        train_resolution_var = tk.StringVar(value=_saved_res_str)
+        _saved_batch = (existing_job or {}).get("batch_size", "1")
+        train_batch_var = tk.StringVar(value=str(_saved_batch))
+        ttk.Label(res_row, text="Resolution:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Combobox(
+            res_row, textvariable=train_resolution_var,
+            values=[str(r) for r in RESOLUTION_CHOICES],
+            state="readonly", width=7,
+        ).grid(row=0, column=1, sticky="w")
+        ttk.Label(res_row, text="Batch size:").grid(row=0, column=2, sticky="w", padx=(16, 8))
+        ttk.Entry(res_row, textvariable=train_batch_var, style="Flat.TEntry", width=5).grid(row=0, column=3, sticky="w")
+
+        # Dataset list
+        list_host = ttk.LabelFrame(datasets_tab, text="Datasets", padding=8)
+        list_host.grid(row=1, column=0, sticky="nsew")
+        list_host.columnconfigure(0, weight=1)
+        list_host.rowconfigure(0, weight=1)
+
+        ds_canvas = tk.Canvas(list_host, bg=bg_panel, highlightthickness=0, height=120)
+        ds_canvas.grid(row=0, column=0, sticky="nsew")
+        ds_scrollbar = ttk.Scrollbar(list_host, orient="vertical", command=ds_canvas.yview, style="Dark.Vertical.TScrollbar")
+        ds_scrollbar.grid(row=0, column=1, sticky="ns")
+        ds_canvas.configure(yscrollcommand=ds_scrollbar.set)
+
+        ds_inner = ttk.Frame(ds_canvas)
+        ds_inner_id = ds_canvas.create_window((0, 0), window=ds_inner, anchor="nw")
+        ds_inner.columnconfigure(0, weight=1)
+
+        def _sync_ds_scroll(_e: object = None) -> None:
+            ds_canvas.configure(scrollregion=ds_canvas.bbox("all"))
+
+        def _sync_ds_canvas_width(e: tk.Event) -> None:
+            ds_canvas.itemconfigure(ds_inner_id, width=e.width)
+
+        ds_inner.bind("<Configure>", _sync_ds_scroll)
+        ds_canvas.bind("<Configure>", _sync_ds_canvas_width)
+
+        # dataset_entries: list of {"name", "num_repeats_var", "frame"}
+        dataset_entries: list[dict] = []
+
+        def _rebuild_ds_rows() -> None:
+            for child in ds_inner.winfo_children():
+                child.destroy()
+            for idx, entry in enumerate(dataset_entries):
+                row_frame = ttk.Frame(ds_inner, padding=(4, 3, 4, 3), style="Card.TFrame")
+                row_frame.grid(row=idx, column=0, sticky="ew", pady=2)
+                row_frame.columnconfigure(0, weight=1)
+                entry["frame"] = row_frame
+                ttk.Label(row_frame, text=entry["name"], style="CardTitle.TLabel").grid(
+                    row=0, column=0, sticky="w", padx=(4, 12)
+                )
+                ttk.Label(row_frame, text="Repeats:", style="CardMeta.TLabel").grid(
+                    row=0, column=1, sticky="e", padx=(0, 6)
+                )
+                ttk.Entry(row_frame, textvariable=entry["num_repeats_var"], style="Flat.TEntry", width=5).grid(
+                    row=0, column=2, sticky="e", padx=(0, 8)
+                )
+
+                def _make_remove(e: dict = entry) -> None:
+                    dataset_entries.remove(e)
+                    _rebuild_ds_rows()
+                    _refresh_add_combo()
+
+                ttk.Button(row_frame, text="✕", style="QueueAction.TButton", command=_make_remove, width=2).grid(
+                    row=0, column=3, sticky="e"
+                )
+
+        def _available_datasets() -> list[str]:
+            return sorted(scan_training_folders(datasets_root_dir()), key=str.casefold)
+
+        def _refresh_add_combo() -> None:
+            already = {e["name"] for e in dataset_entries}
+            available = [n for n in _available_datasets() if n not in already]
+            add_combo["values"] = available
+            if available and add_combo.get() not in available:
+                add_combo.set(available[0])
+            elif not available:
+                add_combo.set("")
+
+        # Populate from initial_datasets
+        for _ds in initial_datasets:
+            dataset_entries.append({"name": _ds["name"], "num_repeats_var": tk.StringVar(value=str(_ds.get("num_repeats", 1))), "frame": None})
+        _rebuild_ds_rows()
+
+        # Add dataset row
+        add_row = ttk.Frame(datasets_tab, padding=(0, 8, 0, 0))
+        add_row.grid(row=2, column=0, sticky="ew")
+        add_row.columnconfigure(1, weight=1)
+        ttk.Label(add_row, text="Add dataset:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        add_combo = ttk.Combobox(add_row, state="readonly", width=24)
+        add_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        _refresh_add_combo()
+
+        def _add_dataset() -> None:
+            name = add_combo.get().strip()
+            if not name or any(e["name"] == name for e in dataset_entries):
+                return
+            dataset_entries.append({"name": name, "num_repeats_var": tk.StringVar(value="1"), "frame": None})
+            _rebuild_ds_rows()
+            _refresh_add_combo()
+
+        ttk.Button(add_row, text="Add", command=_add_dataset).grid(row=0, column=2, sticky="w")
+
+        # ── create_job / save ──────────────────────────────────────────────
         def create_job() -> None:
             job_name = job_name_var.get().strip()
             if not job_name:
@@ -4829,12 +5297,32 @@ def launch_ui() -> int:
                     parent=dialog,
                 )
                 return
+            if not dataset_entries:
+                messagebox.showerror("No datasets", "Add at least one dataset in the Datasets tab.", parent=dialog)
+                return
+
+            resolution_value = int(train_resolution_var.get())
+
+            try:
+                batch_size_value = int(train_batch_var.get().strip())
+                if batch_size_value < 1:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Invalid value", "Batch size must be a positive integer.", parent=dialog)
+                return
 
             try:
                 _ = int(train_steps_var.get().strip())
-                _ = int(train_resolution_var.get().strip())
             except ValueError:
-                messagebox.showerror("Invalid value", "Steps and Resolution must be numeric.", parent=dialog)
+                messagebox.showerror("Invalid value", "Steps must be numeric.", parent=dialog)
+                return
+
+            try:
+                save_every_n_steps_value = int(train_save_every_var.get().strip())
+                if save_every_n_steps_value < 1:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Invalid value", "Save every N steps must be a positive integer.", parent=dialog)
                 return
 
             train_optimizer = train_optimizer_var.get().strip().lower()
@@ -4858,6 +5346,22 @@ def launch_ui() -> int:
                 messagebox.showerror("Invalid value", "Learning rate must be greater than 0.", parent=dialog)
                 return
 
+            # Validate and collect per-dataset config
+            datasets_config: list[dict] = []
+            for entry in dataset_entries:
+                try:
+                    repeats = int(entry["num_repeats_var"].get().strip())
+                    if repeats < 1:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showerror(
+                        "Invalid value",
+                        f"Repeats for '{entry['name']}' must be a positive integer.",
+                        parent=dialog,
+                    )
+                    return
+                datasets_config.append({"name": entry["name"], "num_repeats": repeats})
+
             existing_index: int | None = None
             if existing_job is not None:
                 try:
@@ -4874,7 +5378,10 @@ def launch_ui() -> int:
 
             existing_training_name = ""
             if existing_job is not None:
-                existing_training_name = (existing_job or {}).get("training_name", "").strip() or (existing_job or {}).get("job_name", "").strip()
+                existing_training_name = (
+                    (existing_job or {}).get("training_name", "").strip()
+                    or (existing_job or {}).get("job_name", "").strip()
+                )
 
             training_name = job_name
             renamed_training_folder = False
@@ -4908,28 +5415,32 @@ def launch_ui() -> int:
                         return
 
             try:
-                resolution_value = get_positive_int_setting({"resolution": train_resolution_var.get().strip()}, "resolution", DEFAULT_RESOLUTION, minimum=64)
                 training_dir_path, output_root, created_captions = ensure_training_job_structure(
                     training_name=training_name,
-                    dataset_name=dataset_name,
+                    datasets=datasets_config,
                     resolution=resolution_value,
+                    batch_size=batch_size_value,
                     default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
                 )
             except Exception as exc:
                 messagebox.showerror("Create job failed", str(exc), parent=dialog)
                 return
 
+            primary_dataset = datasets_config[0]["name"]
             tracker_name = settings_state.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip() or job_name
 
             new_job = {
                 "id": training_name,
-                "dataset_name": dataset_name,
+                "dataset_name": primary_dataset,
+                "datasets_json": json.dumps(datasets_config),
                 "training_name": training_name,
                 "training_dir": str(training_dir_path),
                 "job_name": job_name,
                 "model": model_var.get().strip() or "Klein",
                 "output_dir": str(output_root),
-                "resolution": train_resolution_var.get().strip(),
+                "resolution": str(resolution_value),
+                "batch_size": str(batch_size_value),
+                "save_every_n_steps": str(save_every_n_steps_value),
                 "network_dim": train_network_dim_var.get().strip(),
                 "network_alpha": train_network_alpha_var.get().strip(),
                 "optimizer_type": train_optimizer,
@@ -4948,7 +5459,6 @@ def launch_ui() -> int:
                 "status": "queued",
             }
 
-            # Re-evaluate status from edited values and current outputs (for example, step changes).
             new_job["status"] = detect_job_status(new_job)
 
             auto_fixed_elements = 0
@@ -4976,23 +5486,24 @@ def launch_ui() -> int:
                 load_job_queue_from_disk()
             refresh_job_queue_list()
             update_start_button_state()
+
+            ds_names = ", ".join(d["name"] for d in datasets_config)
             if existing_job is None:
-                log(
-                    f"[Queue] Created job: {job_name} (source dataset: {dataset_name}, training: {training_name}, captions added: {created_captions})"
-                )
+                log(f"[Queue] Created job: {job_name} (datasets: {ds_names}, training: {training_name}, captions added: {created_captions})")
+                for var in vars_by_name.values():
+                    var.set(False)
+                for name in list(card_frame_by_name.keys()):
+                    apply_card_style(name)
             else:
                 if auto_fixed_elements > 0:
-                    log(
-                        f"[Queue] Updated job: {job_name} (source dataset: {dataset_name}, training: {training_name}, captions added: {created_captions}, renamed elements: {auto_fixed_elements})"
-                    )
+                    log(f"[Queue] Updated job: {job_name} (datasets: {ds_names}, training: {training_name}, captions added: {created_captions}, renamed elements: {auto_fixed_elements})")
                 else:
-                    log(
-                        f"[Queue] Updated job: {job_name} (source dataset: {dataset_name}, training: {training_name}, captions added: {created_captions})"
-                    )
+                    log(f"[Queue] Updated job: {job_name} (datasets: {ds_names}, training: {training_name}, captions added: {created_captions})")
             dialog.destroy()
 
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        # ── Footer buttons ─────────────────────────────────────────────────
+        buttons = ttk.Frame(outer, padding=(0, 10, 0, 0))
+        buttons.grid(row=2, column=0, sticky="e")
         ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(buttons, text="Save" if existing_job is not None else "Create Job", command=create_job).grid(row=0, column=1)
 
@@ -5089,10 +5600,6 @@ def launch_ui() -> int:
             badge = _load_badge_pil("ok")
             if badge is not None:
                 image.paste(badge, (thumb_px - badge_margin - badge_size, badge_margin), badge)
-        elif run_state == "in_progress":
-            badge = _load_badge_pil("pause")
-            if badge is not None:
-                image.paste(badge, (thumb_px - badge_margin - badge_size, badge_margin), badge)
 
         photo = ImageTk.PhotoImage(image)
         thumbnail_cache[cache_key] = photo
@@ -5101,10 +5608,8 @@ def launch_ui() -> int:
     def toggle_dataset(name: str) -> None:
         if run_state_by_name.get(name) == "done":
             return
-        should_select = not vars_by_name[name].get()
-        for dataset_name, var in vars_by_name.items():
-            var.set(dataset_name == name and should_select)
-            apply_card_style(dataset_name)
+        vars_by_name[name].set(not vars_by_name[name].get())
+        apply_card_style(name)
 
     def apply_card_style(name: str) -> None:
         card = card_frame_by_name.get(name)
@@ -5416,6 +5921,23 @@ def launch_ui() -> int:
             messagebox.showinfo("Queue is empty", "Add jobs and ensure at least one job is not on hold.", parent=root)
             return
 
+        if runtime_config is None or runtime_config.dit is None or runtime_config.vae is None or runtime_config.text_encoder is None:
+            missing = []
+            if runtime_config is None or runtime_config.dit is None:
+                missing.append("Model (DiT)")
+            if runtime_config is None or runtime_config.vae is None:
+                missing.append("VAE")
+            if runtime_config is None or runtime_config.text_encoder is None:
+                missing.append("Text Encoder")
+            messagebox.showerror(
+                "Model paths not configured",
+                "The following model paths are not set:\n\n"
+                + "\n".join(f"  \u2022 {m}" for m in missing)
+                + "\n\nOpen Settings and configure the paths before starting training.",
+                parent=root,
+            )
+            return
+
         run_cancel_event = threading.Event()
         run_in_progress = True
         update_start_button_state()
@@ -5509,17 +6031,28 @@ def launch_ui() -> int:
                         training_name = job.get("training_name", "").strip() or job_name
                         dataset_source_name = job.get("dataset_name", "").strip()
                         resolution_value = get_positive_int_setting(job, "resolution", DEFAULT_RESOLUTION, minimum=64)
+                        batch_size_value = max(1, int(job.get("batch_size", "1") or "1"))
+                        raw_job_datasets = job.get("datasets_json", "")
+                        if raw_job_datasets:
+                            try:
+                                runner_datasets: list[dict] = json.loads(raw_job_datasets)
+                            except Exception:
+                                runner_datasets = [{"name": dataset_source_name, "num_repeats": 1}]
+                        else:
+                            runner_datasets = [{"name": dataset_source_name, "num_repeats": 1}]
                         job_error_details = ""
 
                         try:
                             _training_dir, output_dir, captions_added = ensure_training_job_structure(
                                 training_name=training_name,
-                                dataset_name=dataset_source_name,
+                                datasets=runner_datasets,
                                 resolution=resolution_value,
+                                batch_size=batch_size_value,
                                 default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
                             )
                             if captions_added > 0:
-                                log(f"[Queue] Added {captions_added} missing caption file(s) for source dataset '{dataset_source_name}'.")
+                                ds_label = ", ".join(d["name"] for d in runner_datasets)
+                                log(f"[Queue] Added {captions_added} missing caption file(s) for dataset(s): {ds_label}.")
                         except Exception as exc:
                             log(f"[Queue] Job setup failed for {job_name}: {exc}")
                             exit_code = 1
@@ -5546,6 +6079,7 @@ def launch_ui() -> int:
                                 optimizer_type=job.get("optimizer_type", "prodigy"),
                                 learning_rate=job.get("learning_rate", DEFAULT_LEARNING_RATE),
                                 train_steps=get_positive_int_setting(job, "train_steps", DEFAULT_TRAIN_STEPS),
+                                save_every_n_steps=get_positive_int_setting(job, "save_every_n_steps", DEFAULT_SAVE_EVERY_N_STEPS, minimum=1),
                                 enable_compile_optimizations=flag_to_bool(job.get("enable_compile", "0")),
                                 enable_cuda_allow_tf32=flag_to_bool(job.get("enable_tf32", "1")),
                                 enable_cuda_cudnn_benchmark=flag_to_bool(job.get("enable_cudnn", "1")),
@@ -5586,7 +6120,7 @@ def launch_ui() -> int:
                             if exit_code == JOB_EXIT_SUCCESS:
                                 next_status = "done"
                             elif exit_code == JOB_EXIT_CANCELLED:
-                                next_status = "resume"
+                                next_status = "cancelled"
                             else:
                                 next_status = "failed"
                             job_queue[queue_index]["status"] = next_status
@@ -5630,18 +6164,34 @@ def launch_ui() -> int:
         threading.Thread(target=background_train, daemon=True).start()
 
     scan_button = ttk.Button(controls, text="Scan Datasets", command=lambda: rebuild_folder_list(force=True))
+    restore_datasets_button = ttk.Button(controls, text="Restore Datasets", command=open_restore_datasets_dialog)
+    archive_datasets_button = ttk.Button(controls, text="Archive Datasets", command=archive_selected_datasets)
     create_dataset_button = ttk.Button(controls, text="Create Dataset", command=create_dataset)
     metrics_viewer_button = ttk.Button(controls, text="TensorBoard", command=open_metrics_viewer_dialog)
-    lora_merge_tool_button = ttk.Button(controls, text="LoRA Post-Hoc EMA Merge", command=open_lora_merge_tool_dialog)
-    settings_button = ttk.Button(controls, text="Settings", command=apply_settings_from_dialog)
+    lora_merge_tool_button = ttk.Button(controls, text="LoRA EMA Merge", command=open_lora_merge_tool_dialog)
+    _settings_icon_path = Path(__file__).resolve().parent / "icons" / "settings.png"
+    _settings_icon_img: ImageTk.PhotoImage | None = None
+    try:
+        _raw = Image.open(_settings_icon_path).convert("RGBA").resize((18, 18), Image.LANCZOS)
+        _settings_icon_img = ImageTk.PhotoImage(_raw)
+    except Exception:
+        pass
+    settings_button = ttk.Button(controls, command=apply_settings_from_dialog)
+    if _settings_icon_img is not None:
+        settings_button.configure(image=_settings_icon_img, padding=(4, 2))
+        settings_button._icon_ref = _settings_icon_img  # type: ignore[attr-defined]
+    else:
+        settings_button.configure(text="Settings")
     create_job_large_button = ttk.Button(dataset_actions_bar, text="Create Job", command=open_create_job_dialog)
     run_button = ttk.Button(start_bar, text="START QUEUE", command=run_queue, style="StartDisabled.TButton")
 
     scan_button.grid(row=0, column=0, padx=(0, 8), sticky="w")
-    create_dataset_button.grid(row=0, column=2, padx=(0, 8), sticky="e")
-    metrics_viewer_button.grid(row=0, column=3, padx=(0, 8), sticky="e")
-    lora_merge_tool_button.grid(row=0, column=4, padx=(0, 8), sticky="e")
-    settings_button.grid(row=0, column=5, sticky="e")
+    archive_datasets_button.grid(row=0, column=1, padx=(0, 8), sticky="w")
+    restore_datasets_button.grid(row=0, column=2, padx=(0, 8), sticky="w")
+    create_dataset_button.grid(row=0, column=4, padx=(0, 8), sticky="e")
+    metrics_viewer_button.grid(row=0, column=5, padx=(0, 8), sticky="e")
+    lora_merge_tool_button.grid(row=0, column=6, padx=(0, 8), sticky="e")
+    settings_button.grid(row=0, column=7, sticky="e")
 
     create_job_large_button.configure(style="TButton")
     create_job_large_button.grid(row=0, column=0, sticky="ew")

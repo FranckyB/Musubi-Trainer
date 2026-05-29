@@ -5,7 +5,9 @@ Jobs/*
 !Jobs/.gitkeep
 Datasets/*
 !Datasets/.gitkeep
-logs/*
+Archive/*
+!Archive/.gitkeep
+
 
 # Python bytecode and caches
 __pycache__/

@@ -17,6 +17,7 @@ DEFAULT_NETWORK_DIM = 32
 DEFAULT_NETWORK_ALPHA = 32
 DEFAULT_LEARNING_RATE = "1e-4"
 DEFAULT_TRAIN_STEPS = 3000
+DEFAULT_SAVE_EVERY_N_STEPS = 250
 JOB_EXIT_SUCCESS = 0
 JOB_EXIT_FAILED = 1
 JOB_EXIT_CANCELLED = 2
@@ -525,6 +526,7 @@ def run_command(
     logger: Callable[[str], None] | None = None,
     stream_to_logger: bool = False,
     stream_mode: str = "plain",
+    inherit_io: bool = False,
 ) -> None:
     process: subprocess.Popen | None = None
     log_path: Path | None = None
@@ -599,6 +601,29 @@ def run_command(
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startupinfo.wShowWindow = getattr(subprocess, "SW_MINIMIZE", 6)
             popen_kwargs["startupinfo"] = startupinfo
+
+        if inherit_io:
+            # Launch training in its own console window; don't touch its output.
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+            process = subprocess.Popen(list(args), **popen_kwargs)
+            while True:
+                if cancel_requested is not None and cancel_requested():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                    raise TrainingCancelledError("Cancelled by user.")
+                return_code = process.poll()
+                if return_code is not None:
+                    if return_code != 0:
+                        raise RuntimeError(
+                            f"Command failed with exit code {return_code}: {' '.join(str(a) for a in args)}"
+                        )
+                    return
+                time.sleep(0.2)
 
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", errors="replace", delete=False, suffix=".log") as log_file:
             log_path = Path(log_file.name)
@@ -695,6 +720,7 @@ def run_steps_for_model(
     optimizer_type: str,
     learning_rate: str,
     train_steps: int,
+    save_every_n_steps: int,
     enable_compile_optimizations: bool,
     enable_cuda_allow_tf32: bool,
     enable_cuda_cudnn_benchmark: bool,
@@ -1025,7 +1051,7 @@ def run_steps_for_model(
             f"gradient_checkpointing_cpu_offload = {'true' if enable_gradient_checkpointing_cpu_offload else 'false'}",
             "persistent_data_loader_workers = true",
             "max_data_loader_n_workers = 2",
-            "save_every_n_steps = 250",
+            f"save_every_n_steps = {save_every_n_steps}",
             "save_state = true",
             "save_state_on_train_end = true",
             "seed = 42",
@@ -1069,7 +1095,8 @@ def run_steps_for_model(
                 cancel_requested=cancel_requested,
                 logger=logger,
                 stream_to_logger=stream_training_output,
-                stream_mode="train_progress",
+                stream_mode="plain",
+                inherit_io=not stream_training_output,
             )
         except TrainingCancelledError:
             raise
@@ -1108,6 +1135,7 @@ def train_models(
     do_cache_latents: bool,
     do_cache_text: bool,
     do_train: bool,
+    save_every_n_steps: int = DEFAULT_SAVE_EVERY_N_STEPS,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> int:
     if not model_names:
@@ -1185,6 +1213,7 @@ def train_models(
                 optimizer_type=optimizer_type,
                 learning_rate=learning_rate,
                 train_steps=train_steps,
+                save_every_n_steps=save_every_n_steps,
                 enable_compile_optimizations=enable_compile_optimizations,
                 enable_cuda_allow_tf32=enable_cuda_allow_tf32,
                 enable_cuda_cudnn_benchmark=enable_cuda_cudnn_benchmark,
@@ -1272,6 +1301,7 @@ def run_job(
     do_cache_latents: bool,
     do_cache_text: bool,
     do_train: bool,
+    save_every_n_steps: int = DEFAULT_SAVE_EVERY_N_STEPS,
     cancel_requested: Callable[[], bool] | None = None,
     on_error: Callable[[str], None] | None = None,
 ) -> int:
@@ -1355,6 +1385,7 @@ def run_job(
             optimizer_type=optimizer_type,
             learning_rate=learning_rate,
             train_steps=train_steps,
+            save_every_n_steps=save_every_n_steps,
             enable_compile_optimizations=enable_compile_optimizations,
             enable_cuda_allow_tf32=enable_cuda_allow_tf32,
             enable_cuda_cudnn_benchmark=enable_cuda_cudnn_benchmark,
