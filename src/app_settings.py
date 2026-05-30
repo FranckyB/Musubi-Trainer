@@ -38,6 +38,8 @@ TRAIN_LOG_TRACKER_NAME_KEY = "train_log_tracker_name"
 TRAIN_STREAM_TO_LOGGER_KEY = "train_stream_to_logger"
 TRAIN_AUTO_START_TENSORBOARD_KEY = "train_auto_start_tensorboard"
 TRAIN_AUTO_CLEANUP_STATES_KEY = "train_auto_cleanup_states"
+MODEL_DOWNLOAD_LOCATION_KEY = "model_download_location"
+HF_TOKEN_KEY = "hf_token"
 
 
 def load_settings() -> dict[str, str]:

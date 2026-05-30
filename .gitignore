@@ -7,7 +7,7 @@ Datasets/*
 !Datasets/.gitkeep
 Archive/*
 !Archive/.gitkeep
-
+_activate_venv.bat
 
 # Python bytecode and caches
 __pycache__/

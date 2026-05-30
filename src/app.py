@@ -50,11 +50,21 @@ from .app_settings import (
     WINDOW_X_KEY,
     WINDOW_Y_KEY,
     SASH_POSITION_KEY,
+    MODEL_DOWNLOAD_LOCATION_KEY,
+    HF_TOKEN_KEY,
     load_settings,
     parse_int_setting,
     load_window_size,
     load_window_position,
     save_settings,
+)
+from .download_models import (
+    MODELS as DOWNLOAD_MODELS,
+    DOWNLOAD_LOCATIONS,
+    DOWNLOAD_LOCATION_MODELS_FOLDER,
+    find_component,
+    auto_resolve_klein,
+    workspace_root as download_workspace_root,
 )
 from .klein_runtime_config import KleinRuntimeConfig, klein_runtime_config_from_settings, resolve_musubi_python
 from .klein_train import (
@@ -1194,7 +1204,6 @@ def launch_ui() -> int:
         dialog.withdraw()
         dialog.title("Settings")
         dialog.transient(root)
-        dialog.grab_set()
         dialog.resizable(True, True)
         dialog.configure(bg=bg_panel)
         set_dark_title_bar(dialog)
@@ -1202,88 +1211,62 @@ def launch_ui() -> int:
         dialog.rowconfigure(0, weight=1)
         dialog.rowconfigure(1, weight=0)
 
-        scroll_host = ttk.Frame(dialog)
-        scroll_host.grid(row=0, column=0, sticky="nsew")
-        scroll_host.columnconfigure(0, weight=1)
-        scroll_host.rowconfigure(0, weight=1)
+        notebook = ttk.Notebook(dialog)
+        notebook.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 0))
 
-        settings_canvas = tk.Canvas(
-            scroll_host,
-            bg=bg_panel,
-            bd=0,
-            highlightthickness=0,
-            relief="flat",
-        )
-        settings_canvas.grid(row=0, column=0, sticky="nsew")
-        settings_scrollbar = ttk.Scrollbar(scroll_host, orient="vertical", command=settings_canvas.yview)
-        settings_scrollbar.grid(row=0, column=1, sticky="ns")
-        settings_canvas.configure(yscrollcommand=settings_scrollbar.set)
+        general_tab = ttk.Frame(notebook, padding=10)
+        general_tab.columnconfigure(0, weight=1)
+        notebook.add(general_tab, text="  General  ")
 
-        frame = ttk.Frame(settings_canvas, padding=10)
-        frame_window_id = settings_canvas.create_window((0, 0), window=frame, anchor="nw")
-        frame.columnconfigure(0, weight=1)
+        models_tab = ttk.Frame(notebook, padding=10)
+        models_tab.columnconfigure(0, weight=1)
+        notebook.add(models_tab, text="  Models  ")
 
         footer = ttk.Frame(dialog, padding=(10, 8, 10, 10))
         footer.grid(row=1, column=0, sticky="ew")
         footer.columnconfigure(0, weight=1)
 
-        def sync_settings_scrollregion(_event: tk.Event | None = None) -> None:
-            settings_canvas.configure(scrollregion=settings_canvas.bbox("all"))
-
-        def sync_settings_canvas_width(_event: tk.Event) -> None:
-            settings_canvas.itemconfigure(frame_window_id, width=_event.width)
-
-        def on_settings_mousewheel(event: tk.Event) -> str:
-            delta = int(-event.delta / 120)
-            if delta == 0:
-                delta = -1 if event.delta > 0 else 1
-            settings_canvas.yview_scroll(delta, "units")
-            return "break"
-
-        def on_settings_linux_up(_event: tk.Event) -> str:
-            settings_canvas.yview_scroll(-1, "units")
-            return "break"
-
-        def on_settings_linux_down(_event: tk.Event) -> str:
-            settings_canvas.yview_scroll(1, "units")
-            return "break"
-
-        frame.bind("<Configure>", sync_settings_scrollregion)
-        settings_canvas.bind("<Configure>", sync_settings_canvas_width)
-        dialog.bind("<MouseWheel>", on_settings_mousewheel)
-        dialog.bind("<Button-4>", on_settings_linux_up)
-        dialog.bind("<Button-5>", on_settings_linux_down)
-
-        musubi_section = ttk.LabelFrame(frame, text="Musubi-Tuner", padding=8)
+        musubi_section = ttk.LabelFrame(general_tab, text="Musubi-Tuner", padding=8)
         musubi_section.grid(row=0, column=0, sticky="ew")
         musubi_section.columnconfigure(1, weight=1)
 
-        klein_toggle_var = tk.BooleanVar(value=False)
-        klein_toggle = ttk.Checkbutton(frame, text="Show Klein settings", variable=klein_toggle_var)
-        klein_toggle.grid(row=1, column=0, sticky="w", pady=(10, 0))
-
-        klein_section = ttk.LabelFrame(frame, text="Klein", padding=8)
-        klein_section.grid(row=2, column=0, sticky="ew", pady=(6, 0))
-        klein_section.columnconfigure(1, weight=1)
-
-        ltx_toggle_var = tk.BooleanVar(value=False)
-        ltx_toggle = ttk.Checkbutton(frame, text="Show LTX settings", variable=ltx_toggle_var)
-        ltx_toggle.grid(row=3, column=0, sticky="w", pady=(10, 0))
-
-        ltx_section = ttk.LabelFrame(frame, text="LTX", padding=8)
-        ltx_section.grid(row=4, column=0, sticky="ew", pady=(6, 0))
-        ltx_section.columnconfigure(1, weight=1)
-
-        captions_section = ttk.LabelFrame(frame, text="Captions", padding=8)
-        captions_section.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        captions_section = ttk.LabelFrame(general_tab, text="Captions", padding=8)
+        captions_section.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         captions_section.columnconfigure(1, weight=1)
 
-        advanced_section = ttk.LabelFrame(frame, text="Training", padding=8)
-        advanced_section.grid(row=6, column=0, sticky="ew", pady=(10, 0))
+        advanced_section = ttk.LabelFrame(general_tab, text="Training", padding=8)
+        advanced_section.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         advanced_section.columnconfigure(0, weight=0)
         advanced_section.columnconfigure(1, weight=1)
         advanced_section.columnconfigure(2, weight=0)
         advanced_section.columnconfigure(3, weight=1)
+
+        # ── Models tab ────────────────────────────────────────────────────
+        model_loc_frame = ttk.Frame(models_tab)
+        model_loc_frame.grid(row=0, column=0, sticky="ew")
+        model_location_var = tk.StringVar(
+            value=settings_state.get(MODEL_DOWNLOAD_LOCATION_KEY, DOWNLOAD_LOCATION_MODELS_FOLDER)
+        )
+        ttk.Label(model_loc_frame, text="Download location:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Combobox(
+            model_loc_frame,
+            textvariable=model_location_var,
+            values=list(DOWNLOAD_LOCATIONS),
+            state="readonly",
+            width=22,
+        ).grid(row=0, column=1, sticky="w")
+        hf_token_var = tk.StringVar(value=settings_state.get(HF_TOKEN_KEY, ""))
+        ttk.Label(model_loc_frame, text="HuggingFace token:").grid(row=0, column=2, sticky="w", padx=(24, 8))
+        ttk.Entry(model_loc_frame, textvariable=hf_token_var, show="*", width=36, style="Flat.TEntry").grid(row=0, column=3, sticky="ew")
+        model_loc_frame.columnconfigure(3, weight=1)
+
+        klein_section = ttk.LabelFrame(models_tab, text="Klein", padding=8)
+        klein_section.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        klein_section.columnconfigure(1, weight=1)
+
+        ltx_section = ttk.LabelFrame(models_tab, text="LTX", padding=8)
+        ltx_section.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ltx_section.columnconfigure(1, weight=1)
 
         selected_musubi_path = current_dir
         selected_musubi_python = current_musubi_python
@@ -1493,6 +1476,7 @@ def launch_ui() -> int:
         ttk.Label(klein_section, text="Model version:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         klein_model_version_entry = ttk.Entry(klein_section, textvariable=klein_model_version_var, style="Flat.TEntry")
         klein_model_version_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Button(klein_section, text="Auto-download", command=lambda: auto_download_klein()).grid(row=0, column=2, padx=(8, 0))
 
         ttk.Label(klein_section, text="Model:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         klein_dit_display = ttk.Label(
@@ -1533,6 +1517,132 @@ def launch_ui() -> int:
             ltx_section, textvariable=ltx_text_encoder_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
         )
         ltx_text_encoder_display.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+
+        def auto_download_klein() -> None:
+            model_name = klein_model_version_var.get().strip() or "klein-base-9b"
+            if model_name not in DOWNLOAD_MODELS:
+                messagebox.showerror(
+                    "Unknown model",
+                    f"No download configuration for model version '{model_name}'.\n"
+                    f"Supported: {', '.join(DOWNLOAD_MODELS.keys())}",
+                    parent=dialog,
+                )
+                return
+
+            location = model_location_var.get()
+            ws_root = download_workspace_root()
+            hf_token = hf_token_var.get().strip() or None
+
+            # Check whether all files are already present anywhere.
+            dit_path = find_component(model_name, "dit", ws_root)
+            vae_path = find_component(model_name, "vae", ws_root)
+            te_path = find_component(model_name, "text_encoder", ws_root)
+
+            if dit_path and vae_path and te_path:
+                nonlocal selected_klein_dit, selected_klein_vae, selected_klein_text_encoder
+                selected_klein_dit = str(dit_path)
+                selected_klein_vae = str(vae_path)
+                selected_klein_text_encoder = str(te_path)
+                klein_dit_var.set(selected_klein_dit)
+                klein_vae_var.set(selected_klein_vae)
+                klein_text_encoder_var.set(selected_klein_text_encoder)
+                messagebox.showinfo(
+                    "Models found",
+                    f"All '{model_name}' files were found locally and paths have been set.",
+                    parent=dialog,
+                )
+                return
+
+            missing = []
+            if not dit_path:
+                missing.append("Model (DiT)")
+            if not vae_path:
+                missing.append("VAE")
+            if not te_path:
+                missing.append("Text Encoder")
+
+            confirmed = messagebox.askyesno(
+                "Download models",
+                f"The following files for '{model_name}' were not found:\n\n"
+                + "\n".join(f"  \u2022 {m}" for m in missing)
+                + f"\n\nDownload to: {location}?\n\nThis may take a while.",
+                parent=dialog,
+            )
+            if not confirmed:
+                return
+
+            # ── Progress window ──────────────────────────────────────────
+            progress_win = tk.Toplevel(dialog)
+            progress_win.title("Downloading models…")
+            progress_win.transient(dialog)
+            progress_win.grab_set()
+            progress_win.configure(bg=bg_panel)
+            progress_win.resizable(False, False)
+            set_dark_title_bar(progress_win)
+            progress_win.columnconfigure(0, weight=1)
+            ttk.Label(progress_win, text=f"Downloading '{model_name}' models…").grid(
+                row=0, column=0, padx=20, pady=(16, 4), sticky="w"
+            )
+            progress_status_var = tk.StringVar(value="Starting…")
+            ttk.Label(
+                progress_win, textvariable=progress_status_var, style="CardMeta.TLabel"
+            ).grid(row=1, column=0, padx=20, pady=(0, 16), sticky="w")
+            progress_win.update_idletasks()
+            center_window(progress_win)
+            progress_win.deiconify()
+
+            def _update_status(msg: str) -> None:
+                try:
+                    progress_status_var.set(msg)
+                    progress_win.update_idletasks()
+                except Exception:
+                    pass
+
+            error_holder: list[str] = []
+            result_holder: dict[str, object] = {}
+
+            def _do_download() -> None:
+                try:
+                    paths = auto_resolve_klein(
+                        model_name=model_name,
+                        location=location,
+                        ws_root=ws_root,
+                        progress=_update_status,
+                        download_if_missing=True,
+                        token=hf_token,
+                    )
+                    result_holder.update(paths)
+                except Exception as exc:
+                    error_holder.append(str(exc))
+                finally:
+                    dialog.after(0, _on_download_done)
+
+            def _on_download_done() -> None:
+                nonlocal selected_klein_dit, selected_klein_vae, selected_klein_text_encoder
+                try:
+                    progress_win.destroy()
+                except Exception:
+                    pass
+                if error_holder:
+                    messagebox.showerror("Download failed", error_holder[0], parent=dialog)
+                    return
+                from pathlib import Path as _Path
+                if result_holder.get("dit"):
+                    selected_klein_dit = str(result_holder["dit"])
+                    klein_dit_var.set(selected_klein_dit)
+                if result_holder.get("vae"):
+                    selected_klein_vae = str(result_holder["vae"])
+                    klein_vae_var.set(selected_klein_vae)
+                if result_holder.get("text_encoder"):
+                    selected_klein_text_encoder = str(result_holder["text_encoder"])
+                    klein_text_encoder_var.set(selected_klein_text_encoder)
+                messagebox.showinfo(
+                    "Download complete",
+                    f"All '{model_name}' files downloaded. Click Save to apply.",
+                    parent=dialog,
+                )
+
+            threading.Thread(target=_do_download, daemon=True).start()
 
         def browse_musubi() -> None:
             nonlocal selected_musubi_path, selected_musubi_python
@@ -1812,6 +1922,8 @@ def launch_ui() -> int:
             settings_state[TRAIN_STREAM_TO_LOGGER_KEY] = "1" if stream_to_logger_var.get() else "0"
             settings_state[TRAIN_AUTO_START_TENSORBOARD_KEY] = "1" if auto_start_tensorboard_var.get() else "0"
             settings_state[TRAIN_AUTO_CLEANUP_STATES_KEY] = "1" if auto_cleanup_states_var.get() else "0"
+            settings_state[MODEL_DOWNLOAD_LOCATION_KEY] = model_location_var.get()
+            settings_state[HF_TOKEN_KEY] = hf_token_var.get().strip()
             save_settings(settings_state)
             result = klein_runtime_config_from_settings(settings_state)
             dialog.destroy()
@@ -1858,8 +1970,8 @@ def launch_ui() -> int:
             row=3, column=2, padx=(8, 0), pady=(8, 0)
         )
 
-        ttk.Label(frame, text="LTX path is saved for future support.").grid(
-            row=7, column=0, sticky="w", pady=(10, 8)
+        ttk.Label(models_tab, text="LTX path is saved for future support.", foreground=fg_muted).grid(
+            row=3, column=0, sticky="w", pady=(10, 8)
         )
 
         button_row = ttk.Frame(footer)
@@ -1869,40 +1981,20 @@ def launch_ui() -> int:
         ttk.Button(button_row, text="Cancel", command=cancel_and_close).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(button_row, text="Save", command=save_and_close).grid(row=0, column=2)
 
-        def sync_model_sections() -> None:
-            if klein_toggle_var.get():
-                klein_section.grid()
-                klein_toggle.configure(text="Hide Klein settings")
-            else:
-                klein_section.grid_remove()
-                klein_toggle.configure(text="Show Klein settings")
-
-            if ltx_toggle_var.get():
-                ltx_section.grid()
-                ltx_toggle.configure(text="Hide LTX settings")
-            else:
-                ltx_section.grid_remove()
-                ltx_toggle.configure(text="Show LTX settings")
-
-        klein_toggle_var.trace_add("write", lambda *_args: sync_model_sections())
-        ltx_toggle_var.trace_add("write", lambda *_args: sync_model_sections())
-        sync_model_sections()
-
         dialog.protocol("WM_DELETE_WINDOW", cancel_and_close)
         dialog.update_idletasks()
-        sync_settings_scrollregion()
 
-        content_w = max(frame.winfo_reqwidth(), footer.winfo_reqwidth()) + 44
-        content_h = frame.winfo_reqheight() + 20
+        content_w = max(notebook.winfo_reqwidth(), footer.winfo_reqwidth()) + 44
+        content_h = notebook.winfo_reqheight() + footer.winfo_reqheight() + 20
         max_w = max(760, dialog.winfo_screenwidth() - 80)
         max_h = max(480, dialog.winfo_screenheight() - 80)
         win_w = max(780, min(1080, content_w))
         win_w = min(win_w, max_w)
         win_h = min(max(520, content_h), max_h)
         dialog.geometry(f"{win_w}x{win_h}")
-        settings_canvas.yview_moveto(0.0)
         center_window(dialog)
         dialog.deiconify()
+        dialog.grab_set()
         dialog.focus_set()
         root.wait_window(dialog)
 
