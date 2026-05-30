@@ -1410,12 +1410,12 @@ def launch_ui() -> int:
 
         ttk.Checkbutton(
             training_settings_section,
-            text="Enable FP8 (Low VRAM)",
+            text="Enable FP8 (Lower VRAM)",
             variable=fp8_dit_var,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(
             training_settings_section,
-            text="Enable CPU Gradient Checkpointing (Low RAM)",
+            text="Enable Gradient Checkpointing (Lower VRAM)",
             variable=gc_cpu_offload_var,
         ).grid(row=3, column=2, columnspan=2, sticky="w", pady=(8, 0))
 
