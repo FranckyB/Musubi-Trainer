@@ -3,7 +3,6 @@ import argparse
 import os
 import re
 import json
-import configparser
 import ctypes
 import socket
 import shutil
@@ -15,51 +14,7 @@ import webbrowser
 from pathlib import Path
 from typing import Callable
 
-from .app_settings import (
-    BACKENDS_ROOT_KEY,
-    DEFAULT_CAPTION_KEYWORD_KEY,
-    ENABLE_CUDA_ALLOW_TF32_KEY,
-    ENABLE_CUDA_CUDNN_BENCHMARK_KEY,
-    ENABLE_COMPILE_OPTIMIZATIONS_KEY,
-    ENABLE_FP8_DIT_KEY,
-    ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY,
-    KLEIN_DIT_KEY,
-    KLEIN_MODEL_VERSION_KEY,
-    KLEIN_TEXT_ENCODER_KEY,
-    KLEIN_VAE_KEY,
-    LTX_DIT_KEY,
-    LTX_MODEL_VERSION_KEY,
-    LTX_TEXT_ENCODER_KEY,
-    LTX_VAE_KEY,
-    MUSUBI_DIR_KEY,
-    MUSUBI_LTX_DIR_KEY,
-    MUSUBI_MAIN_DIR_KEY,
-    MUSUBI_PYTHON_KEY,
-    SD_SCRIPTS_DIR_KEY,
-    SETTINGS_FILE,
-    TRAIN_LOG_BACKEND_KEY,
-    TRAIN_LOG_TRACKER_NAME_KEY,
-    TRAIN_STREAM_TO_LOGGER_KEY,
-    TRAIN_AUTO_START_TENSORBOARD_KEY,
-    TRAIN_AUTO_CLEANUP_STATES_KEY,
-    TRAIN_SAVE_EVERY_N_STEPS_KEY,
-    TRAIN_ENABLE_LOGGING_KEY,
-    WINDOW_HEIGHT_KEY,
-    WINDOW_WIDTH_KEY,
-    WINDOW_X_KEY,
-    WINDOW_Y_KEY,
-    SASH_POSITION_KEY,
-    MODEL_DOWNLOAD_LOCATION_KEY,
-    HF_TOKEN_KEY,
-    MODEL_PATHS_KEY,
-    EXTRA_SEARCH_PATHS_KEY,
-    PREFERRED_PRESETS_BY_FAMILY_KEY,
-    load_settings,
-    parse_int_setting,
-    load_window_size,
-    load_window_position,
-    save_settings,
-)
+from . import app_settings
 from .download_models import (
     MODELS as DOWNLOAD_MODELS,
     MODEL_FAMILIES as DOWNLOAD_MODEL_FAMILIES,
@@ -90,6 +45,43 @@ from .train_ltx import run_job as _run_job_ltx
 from .train_wan import run_job as _run_job_wan
 from .train_zimage import run_job as _run_job_zimage
 from .train_qwen import run_job as _run_job_qwen
+from .lora_merge_utils import (
+    compact_merge_selection_token,
+    merge_preset_file_token,
+    merge_preset_tooltip_text,
+    merge_mode_tooltip_text,
+    next_merged_output_path,
+    post_hoc_ema_mode_args_for_preset,
+)
+from .launcher_shared import (
+    VALID_IMAGE_EXTENSIONS,
+    LATENT_SUFFIX,
+    DATASET_ORDER_KEY,
+    DRAG_START_THRESHOLD_PX,
+    DATASET_NAME_PATTERN,
+    TRAIN_DIM_ALPHA_CHOICES,
+    RESOLUTION_CHOICES,
+    OPTIMIZER_TYPE_CHOICES,
+    DEFAULT_PRODIGY_OPTIMIZER_ARGS,
+    JOB_SETTINGS_FILE_NAME,
+    JOBS_ORDER_FILE_NAME,
+    JOB_PRESET_FILE_SUFFIX,
+    JOB_PROGRESS_FILE_NAME,
+    get_positive_int_setting,
+    get_non_negative_int_setting,
+    get_train_log_backend_setting,
+    is_truthy,
+    is_valid_folder_name,
+    load_dataset_order,
+    save_dataset_order,
+    latest_checkpoint_for_dataset,
+    scan_training_folders,
+    dataset_image_files,
+    is_step1_ready,
+    is_step2_ready,
+    is_step3_ready,
+    dataset_status,
+)
 
 # Model name → run_job function
 _KLEIN_MODELS = {"flux2-dev", "klein-base-9b", "klein-9b", "klein-base-4b", "klein-4b"}
@@ -122,211 +114,18 @@ def _run_job_for_model(model_name: str):
     return None
 
 
-# Model files
-VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
-LATENT_SUFFIX = "f2k9b"
-DATASET_ORDER_KEY = "dataset_order"
-DRAG_START_THRESHOLD_PX = 20
-DATASET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
-TRAIN_DIM_ALPHA_CHOICES = ("16", "32", "64")
-RESOLUTION_CHOICES = (512, 768, 1024, 1280)
-OPTIMIZER_TYPE_CHOICES = (
-    "adamw8bit",
-    "prodigy",
-    "adamw",
-    "adafactor",
-    "pagedadamw8bit",
-    "pagedadam8bit",
-    "came8bit",
-)
-DEFAULT_PRODIGY_OPTIMIZER_ARGS = (
-    "safeguard_warmup=True use_bias_correction=True weight_decay=0.01 betas=(0.9,0.99)"
-)
-JOB_SETTINGS_FILE_NAME = "settings.json"
-JOBS_ORDER_FILE_NAME = "_order.json"
-JOB_PRESET_FILE_SUFFIX = ".preset.json"
-JOB_PROGRESS_FILE_NAME = "progress.json"
-INVALID_FOLDER_CHARS = set('<>:"/\\|?*')
-WINDOWS_RESERVED_NAMES = {
-    "CON", "PRN", "AUX", "NUL",
-    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-}
+class LauncherApplication:
+    """Phase-1 class wrapper for incremental migration from nested functions."""
 
-
-def get_positive_int_setting(settings: dict[str, str], key: str, fallback: int, minimum: int = 1) -> int:
-    value = parse_int_setting(settings, key)
-    if value is None or value < minimum:
-        return fallback
-    return value
-
-
-def get_non_negative_int_setting(settings: dict[str, str], key: str, fallback: int) -> int:
-    value = parse_int_setting(settings, key)
-    if value is None or value < 0:
-        return fallback
-    return value
-
-
-def get_train_log_backend_setting(settings: dict[str, str]) -> str:
-    _value = settings.get(TRAIN_LOG_BACKEND_KEY, "").strip().lower()
-    return "tensorboard"
-
-
-def is_truthy(raw_value: str | None, default: bool = False) -> bool:
-    if raw_value is None:
-        return default
-    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def is_valid_folder_name(name: str) -> bool:
-    candidate = name.strip()
-    if not candidate or candidate in {".", ".."}:
-        return False
-    if candidate[-1] in {" ", "."}:
-        return False
-    if any(ord(ch) < 32 for ch in candidate):
-        return False
-    if any(ch in INVALID_FOLDER_CHARS for ch in candidate):
-        return False
-    base = candidate.split(".")[0].strip().upper()
-    if base in WINDOWS_RESERVED_NAMES:
-        return False
-    return True
-
-
-def load_ui_config(config_path: Path) -> dict[str, int]:
-    defaults = {
-        "window_width": 780,
-        "window_height": 1000,
-        "min_window_width": 780,
-        "min_window_height": 1000,
-        "card_gap": 8,
-        "card_width": 172,
-        "thumbnail_size": 152,
-        "card_height": 212,
-        "relayout_debounce_ms": 120,
-    }
-
-    parser = configparser.ConfigParser()
-    try:
-        parser.read(config_path, encoding="utf-8")
-    except Exception:
-        return defaults
-
-    if "ui" not in parser:
-        return defaults
-
-    ui = parser["ui"]
-    resolved = defaults.copy()
-    for key, fallback in defaults.items():
-        try:
-            resolved[key] = max(1, ui.getint(key, fallback=fallback))
-        except (TypeError, ValueError):
-            resolved[key] = fallback
-    return resolved
-
-
-def load_dataset_order(settings: dict[str, str]) -> list[str]:
-    raw = settings.get(DATASET_ORDER_KEY, "").strip()
-    if not raw:
-        return []
-    return [name for name in raw.split("|") if name]
-
-
-def save_dataset_order(settings: dict[str, str], dataset_order: list[str]) -> None:
-    settings[DATASET_ORDER_KEY] = "|".join(dataset_order)
-
-
-def latest_checkpoint_for_dataset(training_dir: Path, dataset_name: str) -> tuple[Path | None, int]:
-    output_dir = training_dir / dataset_name / "output"
-    if not output_dir.exists():
-        return None, 0
-
-    pattern = re.compile(rf"^{re.escape(dataset_name)}_Klein-step(\d+)\.safetensors$", re.IGNORECASE)
-    latest_step = 0
-    latest_path: Path | None = None
-
-    for checkpoint_path in output_dir.glob("*.safetensors"):
-        match = pattern.match(checkpoint_path.name)
-        if not match:
-            continue
-        step = int(match.group(1))
-        if step > latest_step:
-            latest_step = step
-            latest_path = checkpoint_path
-
-    return latest_path, latest_step
-
-
-def scan_training_folders(training_dir: Path) -> list[str]:
-    if not training_dir.exists():
-        return []
-    return sorted([path.name for path in training_dir.iterdir() if path.is_dir()])
-
-
-def dataset_image_files(training_dir: Path, dataset_name: str) -> list[Path]:
-    dataset_dir = training_dir / dataset_name
-    if not dataset_dir.exists() or not dataset_dir.is_dir():
-        return []
-
-    return sorted([p for p in dataset_dir.iterdir() if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTENSIONS])
-
-
-def is_step1_ready(training_dir: Path, dataset_name: str) -> bool:
-    dataset_dir = training_dir / dataset_name
-    dataset_toml_exists = (dataset_dir / "dataset.toml").exists()
-    image_files = dataset_image_files(training_dir, dataset_name)
-
-    if not dataset_toml_exists or not image_files:
-        return False
-
-    return all(image_path.with_suffix(".txt").exists() for image_path in image_files)
-
-
-def is_step2_ready(training_dir: Path, dataset_name: str) -> bool:
-    image_files = dataset_image_files(training_dir, dataset_name)
-    cache_dir = training_dir / dataset_name / "cache"
-
-    if not image_files or not cache_dir.exists():
-        return False
-
-    for image_path in image_files:
-        pattern = f"{image_path.stem}_*_{LATENT_SUFFIX}.safetensors"
-        if not any(cache_dir.glob(pattern)):
-            return False
-
-    return True
-
-
-def is_step3_ready(training_dir: Path, dataset_name: str) -> bool:
-    image_files = dataset_image_files(training_dir, dataset_name)
-    cache_dir = training_dir / dataset_name / "cache"
-
-    if not image_files or not cache_dir.exists():
-        return False
-
-    for image_path in image_files:
-        expected = cache_dir / f"{image_path.stem}_{LATENT_SUFFIX}_te.safetensors"
-        if not expected.exists():
-            return False
-
-    return True
-
-
-def dataset_status(training_dir: Path, dataset_name: str) -> dict[str, bool]:
-    step1 = is_step1_ready(training_dir, dataset_name)
-    step2 = is_step2_ready(training_dir, dataset_name)
-    step3 = is_step3_ready(training_dir, dataset_name)
-    return {
-        "step1": step1,
-        "step2": step2,
-        "step3": step3,
-        "ready_to_train": step1 and step2 and step3,
-    }
+    def run(self) -> int:
+        return _launch_ui_impl()
 
 
 def launch_ui() -> int:
+    return LauncherApplication().run()
+
+
+def _launch_ui_impl() -> int:
     try:
         import tkinter as tk
         from tkinter import filedialog, messagebox, simpledialog
@@ -356,7 +155,6 @@ def launch_ui() -> int:
     color_start_disabled = "#3b3b3b"
     color_start_in_progress = "#ff8c00"
     workspace_dir = Path(__file__).resolve().parent.parent
-    ui_config = load_ui_config(Path(__file__).resolve().parent / "app.config")
     default_models_dir = workspace_dir / "Models"
     app_user_model_id = "MusubiTrainer.Launcher"
 
@@ -410,9 +208,9 @@ def launch_ui() -> int:
         root = tk.Tk()
     root.withdraw()
     root.title("Musubi Training Launcher")
-    root.geometry(f"{ui_config['window_width']}x{ui_config['window_height']}")
+    root.geometry("780x1000")
     root.resizable(False, True)
-    root.minsize(ui_config["min_window_width"], ui_config["min_window_height"])
+    root.minsize(780, 1000)
     root.configure(bg=bg_root)
     ico_path = Path(__file__).resolve().parent / "icons" / "logo.ico"
     if sys.platform == "win32" and ico_path.exists():
@@ -422,7 +220,7 @@ def launch_ui() -> int:
             pass
     set_dark_title_bar(root)
 
-    settings_state = load_settings()
+    settings_state = app_settings.load_settings()
     dataset_order: list[str] = load_dataset_order(settings_state)
     window_position_applied = False
     settings_reset_requested = False
@@ -441,7 +239,7 @@ def launch_ui() -> int:
         return root / kind
 
     def configured_backends_root() -> Path:
-        raw = settings_state.get(BACKENDS_ROOT_KEY, "").strip()
+        raw = settings_state.get(app_settings.BACKENDS_ROOT_KEY, "").strip()
         return Path(raw).expanduser() if raw else default_backends_root()
 
     def configured_backend_dir(setting_key: str, default_kind: str) -> Path:
@@ -451,11 +249,11 @@ def launch_ui() -> int:
         return configured_backends_root() / default_kind
 
     def has_any_backend_setting() -> bool:
-        keys = [MUSUBI_DIR_KEY, MUSUBI_MAIN_DIR_KEY, MUSUBI_LTX_DIR_KEY, SD_SCRIPTS_DIR_KEY]
+        keys = [app_settings.MUSUBI_DIR_KEY, app_settings.MUSUBI_MAIN_DIR_KEY, app_settings.MUSUBI_LTX_DIR_KEY, app_settings.SD_SCRIPTS_DIR_KEY]
         return any(settings_state.get(key, "").strip() for key in keys)
 
     def has_any_model_setting() -> bool:
-        raw_model_paths = settings_state.get(MODEL_PATHS_KEY, "").strip()
+        raw_model_paths = settings_state.get(app_settings.MODEL_PATHS_KEY, "").strip()
         if raw_model_paths:
             try:
                 payload = json.loads(raw_model_paths)
@@ -469,7 +267,7 @@ def launch_ui() -> int:
                         if str(path_value or "").strip():
                             return True
 
-        legacy_keys = [KLEIN_DIT_KEY, KLEIN_VAE_KEY, KLEIN_TEXT_ENCODER_KEY, LTX_DIT_KEY, LTX_VAE_KEY, LTX_TEXT_ENCODER_KEY]
+        legacy_keys = [app_settings.KLEIN_DIT_KEY, app_settings.KLEIN_VAE_KEY, app_settings.KLEIN_TEXT_ENCODER_KEY, app_settings.LTX_DIT_KEY, app_settings.LTX_VAE_KEY, app_settings.LTX_TEXT_ENCODER_KEY]
         return any(settings_state.get(key, "").strip() for key in legacy_keys)
 
     def is_first_launch_unconfigured() -> bool:
@@ -482,14 +280,14 @@ def launch_ui() -> int:
         min_width = root.winfo_reqwidth()
         min_height = root.winfo_reqheight()
 
-        saved_size = load_window_size(settings_state)
+        saved_size = app_settings.load_window_size(settings_state)
         if saved_size is None:
             width = max(root.winfo_width(), min_width)
-            height = max(root.winfo_height(), min_height, ui_config["min_window_height"])
+            height = max(root.winfo_height(), min_height, 1000)
         else:
             saved_width, saved_height = saved_size
             width = max(min_width, saved_width)
-            height = max(min_height, ui_config["min_window_height"], saved_height)
+            height = max(min_height, 1000, saved_height)
 
         screen_w = root.winfo_screenwidth()
         screen_h = root.winfo_screenheight()
@@ -497,7 +295,7 @@ def launch_ui() -> int:
         width = min(width, screen_w)
         height = min(height, screen_h)
 
-        saved_pos = load_window_position(settings_state)
+        saved_pos = app_settings.load_window_position(settings_state)
         if saved_pos is None:
             target_x = max(0, (screen_w - width) // 2)
             target_y = max(0, (screen_h - height) // 2)
@@ -511,7 +309,7 @@ def launch_ui() -> int:
         window_position_applied = True
 
         def restore_sash() -> None:
-            saved_sash = parse_int_setting(settings_state, SASH_POSITION_KEY)
+            saved_sash = app_settings.parse_int_setting(settings_state, app_settings.SASH_POSITION_KEY)
             if saved_sash is not None and saved_sash > 0:
                 try:
                     paned.sashpos(0, saved_sash)
@@ -528,15 +326,15 @@ def launch_ui() -> int:
         nonlocal settings_state
         if settings_reset_requested:
             return
-        settings_state[WINDOW_X_KEY] = str(root.winfo_x())
-        settings_state[WINDOW_Y_KEY] = str(root.winfo_y())
-        settings_state[WINDOW_WIDTH_KEY] = str(root.winfo_width())
-        settings_state[WINDOW_HEIGHT_KEY] = str(root.winfo_height())
+        settings_state[app_settings.WINDOW_X_KEY] = str(root.winfo_x())
+        settings_state[app_settings.WINDOW_Y_KEY] = str(root.winfo_y())
+        settings_state[app_settings.WINDOW_WIDTH_KEY] = str(root.winfo_width())
+        settings_state[app_settings.WINDOW_HEIGHT_KEY] = str(root.winfo_height())
         try:
-            settings_state[SASH_POSITION_KEY] = str(paned.sashpos(0))
+            settings_state[app_settings.SASH_POSITION_KEY] = str(paned.sashpos(0))
         except Exception:
             pass
-        save_settings(settings_state)
+        app_settings.save_settings(settings_state)
 
     _save_after_id: str | None = None
 
@@ -1052,7 +850,7 @@ def launch_ui() -> int:
     def maybe_autostart_tensorboard() -> None:
         if runtime_config is None:
             return
-        if settings_state.get(TRAIN_AUTO_START_TENSORBOARD_KEY, "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        if settings_state.get(app_settings.TRAIN_AUTO_START_TENSORBOARD_KEY, "0").strip().lower() not in {"1", "true", "yes", "on"}:
             return
         threading.Thread(target=launch_tensorboard_background, daemon=True).start()
 
@@ -1093,7 +891,7 @@ def launch_ui() -> int:
             (
                 "Musubi Main",
                 "musubi-main",
-                MUSUBI_MAIN_DIR_KEY,
+                app_settings.MUSUBI_MAIN_DIR_KEY,
                 str(default_backend_dir("musubi-main")),
                 MUSUBI_MAIN_REPO_URL,
                 "",
@@ -1101,7 +899,7 @@ def launch_ui() -> int:
             (
                 "Musubi LTX",
                 "musubi-ltx",
-                MUSUBI_LTX_DIR_KEY,
+                app_settings.MUSUBI_LTX_DIR_KEY,
                 str(default_backend_dir("musubi-ltx")),
                 MUSUBI_LTX_REPO_URL,
                 MUSUBI_LTX_REPO_BRANCH,
@@ -1109,7 +907,7 @@ def launch_ui() -> int:
             (
                 "sd-scripts",
                 "sd-scripts",
-                SD_SCRIPTS_DIR_KEY,
+                app_settings.SD_SCRIPTS_DIR_KEY,
                 str(default_backend_dir("sd-scripts")),
                 SD_SCRIPTS_REPO_URL,
                 "",
@@ -1118,11 +916,11 @@ def launch_ui() -> int:
 
     def configured_backend_dirs() -> dict[str, Path]:
         root = configured_backends_root()
-        main_raw = settings_state.get(MUSUBI_MAIN_DIR_KEY, "").strip()
-        ltx_raw = settings_state.get(MUSUBI_LTX_DIR_KEY, "").strip()
-        sd_raw = settings_state.get(SD_SCRIPTS_DIR_KEY, "").strip()
+        main_raw = settings_state.get(app_settings.MUSUBI_MAIN_DIR_KEY, "").strip()
+        ltx_raw = settings_state.get(app_settings.MUSUBI_LTX_DIR_KEY, "").strip()
+        sd_raw = settings_state.get(app_settings.SD_SCRIPTS_DIR_KEY, "").strip()
 
-        legacy_raw = settings_state.get(MUSUBI_DIR_KEY, "").strip()
+        legacy_raw = settings_state.get(app_settings.MUSUBI_DIR_KEY, "").strip()
         legacy_path = Path(legacy_raw).expanduser() if legacy_raw else None
 
         main_dir = Path(main_raw).expanduser() if main_raw else (legacy_path if legacy_path is not None else root / "musubi-main")
@@ -1148,11 +946,11 @@ def launch_ui() -> int:
         nonlocal runtime_config, settings_state
         if not is_valid_musubi_tuner_dir(musubi_dir):
             return False
-        settings_state[MUSUBI_DIR_KEY] = str(musubi_dir)
-        settings_state[MUSUBI_MAIN_DIR_KEY] = str(musubi_dir)
-        settings_state[MUSUBI_PYTHON_KEY] = ""
-        settings_state.setdefault(BACKENDS_ROOT_KEY, str(default_backends_root()))
-        save_settings(settings_state)
+        settings_state[app_settings.MUSUBI_DIR_KEY] = str(musubi_dir)
+        settings_state[app_settings.MUSUBI_MAIN_DIR_KEY] = str(musubi_dir)
+        settings_state[app_settings.MUSUBI_PYTHON_KEY] = ""
+        settings_state.setdefault(app_settings.BACKENDS_ROOT_KEY, str(default_backends_root()))
+        app_settings.save_settings(settings_state)
         runtime_config = runtime_config_from_settings(settings_state)
         return runtime_config is not None
 
@@ -1239,7 +1037,7 @@ def launch_ui() -> int:
     def persist_dataset_order() -> None:
         nonlocal settings_state
         save_dataset_order(settings_state, dataset_order)
-        save_settings(settings_state)
+        app_settings.save_settings(settings_state)
 
     def datasets_root_dir() -> Path:
         return runtime_config.training_dir.parent / "Datasets"
@@ -1330,1269 +1128,57 @@ def launch_ui() -> int:
 
         return job_dir, output_dir, created_captions
 
+    def _set_settings_reset_requested(value: bool) -> None:
+        nonlocal settings_reset_requested
+        settings_reset_requested = bool(value)
+
     def open_settings_dialog(required: bool) -> RuntimeConfig | None:
-        backend_dirs = configured_backend_dirs()
-        current_main_dir = str(backend_dirs["musubi-main"])
-        current_ltx_dir = str(backend_dirs["musubi-ltx"])
-        current_sd_scripts_dir = str(backend_dirs["sd-scripts"])
-        current_backends_root = str(configured_backends_root())
-        current_musubi_python_path = resolve_musubi_python(Path(current_main_dir).expanduser()) if current_main_dir else None
-        current_default_caption_keyword = settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, "")
-        current_compile_optimizations = settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
+        from .ui.windows import settings_window
+        dependencies = {
+            "DEFAULT_SAVE_EVERY_N_STEPS": DEFAULT_SAVE_EVERY_N_STEPS,
+            "DOWNLOAD_COMPONENT_FRIENDLY_NAMES": DOWNLOAD_COMPONENT_FRIENDLY_NAMES,
+            "DOWNLOAD_LOCATIONS": DOWNLOAD_LOCATIONS,
+            "DOWNLOAD_LOCATION_MODELS_FOLDER": DOWNLOAD_LOCATION_MODELS_FOLDER,
+            "DOWNLOAD_MODELS": DOWNLOAD_MODELS,
+            "DOWNLOAD_MODEL_DISPLAY_NAMES": DOWNLOAD_MODEL_DISPLAY_NAMES,
+            "DOWNLOAD_MODEL_FAMILIES": DOWNLOAD_MODEL_FAMILIES,
+            "JOB_PRESET_FILE_SUFFIX": JOB_PRESET_FILE_SUFFIX,
+            "Path": Path,
+            "app_settings": app_settings,
+            "backend_is_valid": backend_is_valid,
+            "backend_repo_rows": backend_repo_rows,
+            "bg_panel": bg_panel,
+            "center_window": center_window,
+            "clone_backend_repo": clone_backend_repo,
+            "configured_backend_dirs": configured_backend_dirs,
+            "configured_backends_root": configured_backends_root,
+            "default_backends_root": default_backends_root,
+            "default_models_dir": default_models_dir,
+            "download_cli_script_path": Path(__file__).resolve().parent / "download_cli.py",
+            "download_workspace_root": download_workspace_root,
+            "fg_muted": fg_muted,
+            "filedialog": filedialog,
+            "find_component": find_component,
+            "get_positive_int_setting": get_positive_int_setting,
+            "json": json,
+            "log": log,
+            "messagebox": messagebox,
+            "re": re,
+            "resolve_musubi_python": resolve_musubi_python,
+            "root": root,
+            "runtime_config_from_settings": runtime_config_from_settings,
+            "set_dark_title_bar": set_dark_title_bar,
+            "set_settings_reset_requested": _set_settings_reset_requested,
+            "settings_state": settings_state,
+            "shutil": shutil,
+            "subprocess": subprocess,
+            "threading": threading,
+            "tk": tk,
+            "ttk": ttk,
+            "update_backend_repo": update_backend_repo,
         }
-        current_cuda_allow_tf32 = settings_state.get(ENABLE_CUDA_ALLOW_TF32_KEY, "1").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        current_cuda_cudnn_benchmark = settings_state.get(ENABLE_CUDA_CUDNN_BENCHMARK_KEY, "1").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        current_fp8_dit = settings_state.get(ENABLE_FP8_DIT_KEY, "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        current_enable_training_logging = settings_state.get(
-            TRAIN_ENABLE_LOGGING_KEY,
-            "1",
-        ).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        current_train_log_tracker_name = settings_state.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip()
-        current_train_stream_to_logger = settings_state.get(
-            TRAIN_STREAM_TO_LOGGER_KEY,
-            "0",
-        ).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        current_auto_start_tensorboard = settings_state.get(
-            TRAIN_AUTO_START_TENSORBOARD_KEY,
-            "0",
-        ).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        current_auto_cleanup_states = settings_state.get(
-            TRAIN_AUTO_CLEANUP_STATES_KEY,
-            "1",
-        ).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        current_train_save_every_n_steps = str(
-            get_positive_int_setting(
-                settings_state,
-                TRAIN_SAVE_EVERY_N_STEPS_KEY,
-                DEFAULT_SAVE_EVERY_N_STEPS,
-                minimum=1,
-            )
-        )
-        current_gc_cpu_offload = settings_state.get(
-            ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY,
-            "0",
-        ).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        return settings_window.SettingsWindow(**dependencies).open(required)
 
-        def _settings_log(message: str) -> None:
-            msg = str(message)
-            try:
-                log(msg)  # type: ignore[name-defined]
-            except Exception:
-                print(msg)
-
-        result: RuntimeConfig | None = None
-        dialog = tk.Toplevel(root)
-        dialog.withdraw()
-        dialog.title("Settings")
-        dialog.transient(root)
-        dialog.resizable(True, True)
-        dialog.configure(bg=bg_panel)
-        set_dark_title_bar(dialog)
-        dialog.columnconfigure(0, weight=1)
-        dialog.rowconfigure(0, weight=1)
-        dialog.rowconfigure(1, weight=0)
-
-        notebook = ttk.Notebook(dialog)
-        notebook.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 0))
-
-        general_tab = ttk.Frame(notebook, padding=10)
-        general_tab.columnconfigure(0, weight=1)
-        notebook.add(general_tab, text="  General  ")
-
-        models_tab = ttk.Frame(notebook, padding=10)
-        models_tab.columnconfigure(0, weight=1)
-        notebook.add(models_tab, text="  Models  ")
-
-        footer = ttk.Frame(dialog, padding=(10, 8, 10, 10))
-        footer.grid(row=1, column=0, sticky="ew")
-        footer.columnconfigure(0, weight=1)
-
-        backends_section = ttk.LabelFrame(general_tab, text="Backends", padding=8)
-        backends_section.grid(row=0, column=0, sticky="ew")
-        backends_section.columnconfigure(1, weight=1)
-
-        captions_section = ttk.LabelFrame(general_tab, text="Captions", padding=8)
-        captions_section.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        captions_section.columnconfigure(1, weight=1)
-
-        advanced_section = ttk.LabelFrame(general_tab, text="Training", padding=8)
-        advanced_section.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        advanced_section.columnconfigure(0, weight=0)
-        advanced_section.columnconfigure(1, weight=1)
-        advanced_section.columnconfigure(2, weight=0)
-        advanced_section.columnconfigure(3, weight=1)
-
-        # ── Models tab ────────────────────────────────────────────────────
-        model_loc_frame = ttk.Frame(models_tab)
-        model_loc_frame.grid(row=0, column=0, sticky="ew")
-        model_location_var = tk.StringVar(
-            value=settings_state.get(MODEL_DOWNLOAD_LOCATION_KEY, DOWNLOAD_LOCATION_MODELS_FOLDER)
-        )
-        ttk.Label(model_loc_frame, text="Download location:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Combobox(
-            model_loc_frame,
-            textvariable=model_location_var,
-            values=list(DOWNLOAD_LOCATIONS),
-            state="readonly",
-            width=22,
-        ).grid(row=0, column=1, sticky="w")
-        hf_token_var = tk.StringVar(value=settings_state.get(HF_TOKEN_KEY, ""))
-        ttk.Label(model_loc_frame, text="HuggingFace token:").grid(row=0, column=2, sticky="w", padx=(24, 8))
-        ttk.Entry(model_loc_frame, textvariable=hf_token_var, show="*", width=36, style="Flat.TEntry").grid(row=0, column=3, sticky="ew")
-        model_loc_frame.columnconfigure(3, weight=1)
-
-        # ── ComfyUI path + scan ───────────────────────────────────────────
-        _raw_extra = settings_state.get(EXTRA_SEARCH_PATHS_KEY, "")
-        import json as _json_extra
-        try:
-            _extra_paths_list: list[str] = _json_extra.loads(_raw_extra) if _raw_extra else []
-        except Exception:
-            _extra_paths_list = []
-
-        extra_paths_frame = ttk.Frame(models_tab)
-        extra_paths_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
-        extra_paths_frame.columnconfigure(1, weight=1)
-        ttk.Label(extra_paths_frame, text="ComfyUI models path:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        extra_path_var = tk.StringVar(value=_extra_paths_list[0] if _extra_paths_list else "")
-        ttk.Entry(extra_paths_frame, textvariable=extra_path_var, style="Flat.TEntry").grid(row=0, column=1, sticky="ew")
-
-        def _browse_extra_path() -> None:
-            picked = filedialog.askdirectory(
-                parent=dialog,
-                title="Select ComfyUI models folder",
-                initialdir=extra_path_var.get().strip() or str(Path.home()),
-            )
-            if picked:
-                extra_path_var.set(picked)
-
-        def _scan_all_sources() -> None:
-            """Scan Models folder, HF cache, and optionally the ComfyUI path for any missing files."""
-            ws_root = download_workspace_root()
-            comfy_dir = extra_path_var.get().strip()
-            extra = [comfy_dir] if comfy_dir and Path(comfy_dir).is_dir() else []
-            found_count = 0
-            for mn, comps in DOWNLOAD_MODELS.items():
-                for comp in comps:
-                    if pending_model_paths.get(mn, {}).get(comp):
-                        continue  # already set
-                    hit = find_component(mn, comp, ws_root, extra or None)
-                    if hit is not None:
-                        pending_model_paths.setdefault(mn, {})[comp] = str(hit)
-                        found_count += 1
-            # Refresh all entry StringVars and status labels
-            for mn in DOWNLOAD_MODELS:
-                for comp, cpv in _comp_path_vars_all.get(mn, {}).items():
-                    new_val = pending_model_paths.get(mn, {}).get(comp, "")
-                    if cpv.get() != new_val:
-                        cpv.set(new_val)
-                _refresh_status(mn)
-            if found_count:
-                messagebox.showinfo("Scan complete", f"Found {found_count} new file(s). Click Save to apply.", parent=dialog)
-            else:
-                messagebox.showinfo("Scan complete", "No new files found.", parent=dialog)
-
-        ttk.Button(extra_paths_frame, text="Browse…", command=_browse_extra_path).grid(row=0, column=2, padx=(6, 0))
-        ttk.Button(extra_paths_frame, text="Scan for models", command=_scan_all_sources).grid(row=0, column=3, padx=(6, 0))
-
-        # Registry of all component StringVars so _scan_extra_path can update them
-        _comp_path_vars_all: dict[str, dict[str, tk.StringVar]] = {}
-
-        models_canvas = tk.Canvas(models_tab, bg=bg_panel, highlightthickness=0)
-        models_scrollbar = ttk.Scrollbar(models_tab, orient="vertical", command=models_canvas.yview)
-        models_canvas.configure(yscrollcommand=models_scrollbar.set)
-        models_canvas.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
-        models_scrollbar.grid(row=2, column=1, sticky="ns", pady=(10, 0))
-        models_tab.rowconfigure(2, weight=1)
-
-        models_inner = ttk.Frame(models_canvas)
-        models_inner.columnconfigure(0, weight=1)
-        _mw_id = models_canvas.create_window((0, 0), window=models_inner, anchor="nw")
-
-        def _on_models_inner_configure(event: tk.Event) -> None:
-            models_canvas.configure(scrollregion=models_canvas.bbox("all"))
-
-        def _on_models_canvas_configure(event: tk.Event) -> None:
-            models_canvas.itemconfig(_mw_id, width=event.width)
-
-        models_inner.bind("<Configure>", _on_models_inner_configure)
-        models_canvas.bind("<Configure>", _on_models_canvas_configure)
-
-        def _bind_mousewheel(widget: tk.Widget) -> None:
-            widget.bind("<MouseWheel>", lambda e: models_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
-            for child in widget.winfo_children():
-                _bind_mousewheel(child)
-
-        selected_backends_root = current_backends_root
-        selected_musubi_main_path = current_main_dir
-        selected_musubi_ltx_path = current_ltx_dir
-        selected_sd_scripts_path = current_sd_scripts_dir
-        selected_musubi_python = str(current_musubi_python_path) if current_musubi_python_path is not None else ""
-
-        # pending_model_paths: model_name → {component: path_str}
-        import json as _json_settings
-        _raw_model_paths = settings_state.get(MODEL_PATHS_KEY, "")
-        try:
-            pending_model_paths: dict[str, dict[str, str]] = _json_settings.loads(_raw_model_paths) if _raw_model_paths else {}
-        except Exception:
-            pending_model_paths = {}
-        preset_none_label = "---------"
-        _raw_preferred_presets = settings_state.get(PREFERRED_PRESETS_BY_FAMILY_KEY, "")
-        try:
-            _preferred_presets_loaded = _json_settings.loads(_raw_preferred_presets) if _raw_preferred_presets else {}
-        except Exception:
-            _preferred_presets_loaded = {}
-        preferred_preset_by_family: dict[str, str] = {}
-        if isinstance(_preferred_presets_loaded, dict):
-            preferred_preset_by_family = {
-                str(k): str(v)
-                for k, v in _preferred_presets_loaded.items()
-                if isinstance(k, str) and isinstance(v, str)
-            }
-
-        def _preset_names_for_family_settings(family_name: str) -> list[str]:
-            names: set[str] = set()
-            presets_dir = download_workspace_root() / "Presets"
-            if not presets_dir.exists() or not presets_dir.is_dir():
-                return []
-            for path in sorted(presets_dir.glob(f"*{JOB_PRESET_FILE_SUFFIX}"), key=lambda p: p.name.casefold()):
-                try:
-                    payload = json.loads(path.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-                if not isinstance(payload, dict):
-                    continue
-                payload_family = str(payload.get("family", "")).strip()
-                preset_name = str(payload.get("name", "")).strip()
-                if payload_family == family_name and preset_name:
-                    names.add(preset_name)
-            return sorted(names, key=str.casefold)
-
-        preferred_preset_vars: dict[str, tk.StringVar] = {}
-        backends_root_var = tk.StringVar(value=selected_backends_root)
-        musubi_main_display_var = tk.StringVar(value=selected_musubi_main_path if selected_musubi_main_path else "(none)")
-        musubi_ltx_display_var = tk.StringVar(value=selected_musubi_ltx_path if selected_musubi_ltx_path else "(none)")
-        sd_scripts_display_var = tk.StringVar(value=selected_sd_scripts_path if selected_sd_scripts_path else "(none)")
-        musubi_main_status_var = tk.StringVar(value="")
-        musubi_ltx_status_var = tk.StringVar(value="")
-        sd_scripts_status_var = tk.StringVar(value="")
-        musubi_main_action_var = tk.StringVar(value="Auto Download")
-        musubi_ltx_action_var = tk.StringVar(value="Auto Download")
-        sd_scripts_action_var = tk.StringVar(value="Auto Download")
-        default_caption_keyword_var = tk.StringVar(value=current_default_caption_keyword)
-        compile_optimizations_var = tk.BooleanVar(value=current_compile_optimizations)
-        cuda_allow_tf32_var = tk.BooleanVar(value=current_cuda_allow_tf32)
-        cuda_cudnn_benchmark_var = tk.BooleanVar(value=current_cuda_cudnn_benchmark)
-        fp8_dit_var = tk.BooleanVar(value=current_fp8_dit)
-        gc_cpu_offload_var = tk.BooleanVar(value=current_gc_cpu_offload)
-        enable_training_logging_var = tk.BooleanVar(value=current_enable_training_logging)
-        train_log_tracker_name_var = tk.StringVar(value=current_train_log_tracker_name)
-        stream_to_logger_var = tk.BooleanVar(value=current_train_stream_to_logger)
-        auto_start_tensorboard_var = tk.BooleanVar(value=current_auto_start_tensorboard)
-        auto_cleanup_states_var = tk.BooleanVar(value=current_auto_cleanup_states)
-        train_save_every_default_var = tk.StringVar(value=current_train_save_every_n_steps)
-
-        ttk.Label(backends_section, text="Backends root:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Label(
-            backends_section,
-            textvariable=backends_root_var,
-            anchor="w",
-            style="PathDisplay.TLabel",
-            padding=(6, 4),
-        ).grid(row=0, column=1, sticky="ew")
-        ttk.Button(backends_section, text="Browse Root", command=lambda: browse_backends_root()).grid(
-            row=0,
-            column=2,
-            padx=(8, 0),
-        )
-
-        ttk.Label(backends_section, text="Musubi Main:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Label(
-            backends_section,
-            textvariable=musubi_main_display_var,
-            anchor="w",
-            style="PathDisplay.TLabel",
-            padding=(6, 4),
-        ).grid(row=1, column=1, sticky="ew", pady=(8, 0))
-        ttk.Button(backends_section, text="Browse", command=lambda: browse_backend("musubi-main")).grid(
-            row=1,
-            column=2,
-            padx=(8, 0),
-            pady=(8, 0),
-        )
-        ttk.Button(backends_section, textvariable=musubi_main_action_var, command=lambda: auto_download_backend("musubi-main")).grid(
-            row=1,
-            column=3,
-            padx=(8, 0),
-            pady=(8, 0),
-        )
-        ttk.Label(backends_section, textvariable=musubi_main_status_var).grid(row=2, column=1, sticky="w")
-        ttk.Label(
-            backends_section,
-            text="Used for: FLUX2, QWEN, ZIMAGE, WAN",
-            foreground=fg_muted,
-        ).grid(row=2, column=2, columnspan=2, sticky="w")
-
-        ttk.Label(backends_section, text="Musubi LTX:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Label(
-            backends_section,
-            textvariable=musubi_ltx_display_var,
-            anchor="w",
-            style="PathDisplay.TLabel",
-            padding=(6, 4),
-        ).grid(row=3, column=1, sticky="ew", pady=(8, 0))
-        ttk.Button(backends_section, text="Browse", command=lambda: browse_backend("musubi-ltx")).grid(
-            row=3,
-            column=2,
-            padx=(8, 0),
-            pady=(8, 0),
-        )
-        ttk.Button(backends_section, textvariable=musubi_ltx_action_var, command=lambda: auto_download_backend("musubi-ltx")).grid(
-            row=3,
-            column=3,
-            padx=(8, 0),
-            pady=(8, 0),
-        )
-        ttk.Label(backends_section, textvariable=musubi_ltx_status_var).grid(row=4, column=1, sticky="w")
-        ttk.Label(
-            backends_section,
-            text="Used for: LTX",
-            foreground=fg_muted,
-        ).grid(row=4, column=2, columnspan=2, sticky="w")
-
-        ttk.Label(backends_section, text="sd-scripts:").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Label(
-            backends_section,
-            textvariable=sd_scripts_display_var,
-            anchor="w",
-            style="PathDisplay.TLabel",
-            padding=(6, 4),
-        ).grid(row=5, column=1, sticky="ew", pady=(8, 0))
-        ttk.Button(backends_section, text="Browse", command=lambda: browse_backend("sd-scripts")).grid(
-            row=5,
-            column=2,
-            padx=(8, 0),
-            pady=(8, 0),
-        )
-        ttk.Button(backends_section, textvariable=sd_scripts_action_var, command=lambda: auto_download_backend("sd-scripts")).grid(
-            row=5,
-            column=3,
-            padx=(8, 0),
-            pady=(8, 0),
-        )
-        ttk.Label(backends_section, textvariable=sd_scripts_status_var).grid(row=6, column=1, sticky="w")
-        ttk.Label(
-            backends_section,
-            text="Used for: ANIMA, FLUX, SDXL",
-            foreground=fg_muted,
-        ).grid(row=6, column=2, columnspan=2, sticky="w")
-
-        ttk.Label(
-            backends_section,
-            text="Model families are shown based on backend availability. Python interpreter is managed by this app.",
-        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
-
-        ttk.Label(captions_section, text="Default caption keyword:").grid(
-            row=0,
-            column=0,
-            sticky="w",
-            padx=(0, 8),
-        )
-        default_caption_keyword_entry = ttk.Entry(
-            captions_section,
-            textvariable=default_caption_keyword_var,
-            style="Flat.TEntry",
-        )
-        default_caption_keyword_entry.grid(row=0, column=1, sticky="ew")
-        ttk.Label(captions_section, text="Leave blank to create empty .txt captions.").grid(
-            row=1,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            pady=(6, 0),
-        )
-
-        training_defaults_section = ttk.LabelFrame(advanced_section, text="Training defaults", padding=8)
-        training_defaults_section.grid(row=0, column=0, columnspan=4, sticky="ew")
-        training_defaults_section.columnconfigure(1, weight=1)
-        ttk.Label(training_defaults_section, text="Save every N steps:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(training_defaults_section, textvariable=train_save_every_default_var, style="Flat.TEntry").grid(
-            row=0,
-            column=1,
-            sticky="w",
-        )
-
-        flags_section = ttk.LabelFrame(advanced_section, text="Advanced flags", padding=8)
-        flags_section.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-        flags_section.columnconfigure(0, weight=1)
-        flags_section.columnconfigure(1, weight=1)
-
-        ttk.Checkbutton(
-            flags_section,
-            text="Enable Torch Compile",
-            variable=compile_optimizations_var,
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(
-            flags_section,
-            text="Enable Allow TF32",
-            variable=cuda_allow_tf32_var,
-        ).grid(row=0, column=1, sticky="w")
-        ttk.Checkbutton(
-            flags_section,
-            text="Enable cuDNN Benchmark",
-            variable=cuda_cudnn_benchmark_var,
-        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(
-            flags_section,
-            text="Auto-clean resume state folders",
-            variable=auto_cleanup_states_var,
-        ).grid(row=1, column=1, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(
-            flags_section,
-            text="Enable FP8 (Low VRAM)",
-            variable=fp8_dit_var,
-        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(
-            flags_section,
-            text="Enable Gradient Checkpointing (Low VRAM)",
-            variable=gc_cpu_offload_var,
-        ).grid(row=2, column=1, sticky="w", pady=(6, 0))
-
-        logging_section = ttk.LabelFrame(advanced_section, text="Logging & metadata", padding=8)
-        logging_section.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-        logging_section.columnconfigure(0, weight=0)
-        logging_section.columnconfigure(1, weight=1)
-        logging_section.columnconfigure(2, weight=0)
-        logging_section.columnconfigure(3, weight=1)
-
-        ttk.Checkbutton(
-            logging_section,
-            text="Enable TensorBoard",
-            variable=enable_training_logging_var,
-        ).grid(row=0, column=0, columnspan=4, sticky="w")
-        ttk.Label(logging_section, text="Tracker name:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Entry(logging_section, textvariable=train_log_tracker_name_var, style="Flat.TEntry").grid(
-            row=1,
-            column=1,
-            columnspan=3,
-            sticky="ew",
-            pady=(6, 0),
-        )
-        ttk.Checkbutton(
-            logging_section,
-            text="Show full training output in app console",
-            variable=stream_to_logger_var,
-        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(
-            logging_section,
-            text="Keep TensorBoard running in background",
-            variable=auto_start_tensorboard_var,
-        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Label(
-            logging_section,
-            text="Logs are stored per job under each Training/<job>/logs folder and can be viewed via TensorBoard.",
-        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
-
-        # ── Model family sections ──────────────────────────────────────
-        _status_vars: dict[str, tk.StringVar] = {}
-
-        _COMPONENT_LABELS: dict[str, str] = {
-            "dit": "Model",
-            "vae": "VAE",
-            "text_encoder": "Text Encoder",
-            "t5": "T5",
-            "clip": "CLIP",
-        }
-
-        def _model_status_str(model_name: str) -> str:
-            components = list(DOWNLOAD_MODELS.get(model_name, {}).keys())
-            if not components:
-                return "Unknown"
-            from pathlib import Path as _P
-            stored = pending_model_paths.get(model_name, {})
-            found = sum(1 for c in components if stored.get(c) and _P(stored[c]).is_file())
-            if found == 0:
-                return "Not configured"
-            if found < len(components):
-                return f"Partial ({found}/{len(components)})"
-            return "✓ Ready"
-
-        def _refresh_status(model_name: str) -> None:
-            sv = _status_vars.get(model_name)
-            if sv:
-                sv.set(_model_status_str(model_name))
-
-        def _apply_status_color(lbl: ttk.Label, sv: tk.StringVar, *_a: object) -> None:
-            val = sv.get()
-            if val.startswith("✓"):
-                lbl.configure(foreground="#6fcf6f")
-            elif val.startswith("Partial"):
-                lbl.configure(foreground="#f0b429")
-            else:
-                lbl.configure(foreground=fg_muted)
-
-        def _make_family_section(parent: ttk.Frame, family_name: str, model_names: list[str], row: int, expanded: bool) -> None:
-            section_frame = ttk.Frame(parent)
-            section_frame.grid(row=row, column=0, sticky="ew", pady=(0, 6))
-            section_frame.columnconfigure(0, weight=1)
-
-            fam_expanded_var = tk.BooleanVar(value=expanded)
-
-            fam_header_btn = ttk.Button(
-                section_frame,
-                text=f"{'▼' if expanded else '▶'}  {family_name}",
-                style="FamilyHeader.TButton",
-                command=lambda: _toggle_family(fam_header_btn, fam_body, fam_expanded_var, family_name),
-            )
-            fam_header_btn.grid(row=0, column=0, sticky="ew")
-
-            fam_body = ttk.Frame(section_frame, padding=(4, 2, 4, 2))
-            fam_body.columnconfigure(0, weight=1)
-            if expanded:
-                fam_body.grid(row=1, column=0, sticky="ew")
-
-            family_preset_names = _preset_names_for_family_settings(family_name)
-            preferred_initial = preferred_preset_by_family.get(family_name, "").strip()
-            if preferred_initial and preferred_initial not in family_preset_names:
-                preferred_initial = ""
-            preferred_var = tk.StringVar(value=(preferred_initial or preset_none_label))
-            preferred_preset_vars[family_name] = preferred_var
-
-            preset_row = ttk.Frame(fam_body)
-            preset_row.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-            preset_row.columnconfigure(1, weight=1)
-            ttk.Label(preset_row, text="Preferred Preset:").grid(row=0, column=0, sticky="w", padx=(22, 8))
-            ttk.Combobox(
-                preset_row,
-                textvariable=preferred_var,
-                values=[preset_none_label] + family_preset_names,
-                state="readonly",
-                width=28,
-            ).grid(row=0, column=1, sticky="w")
-
-            for r, mn in enumerate(model_names, start=1):
-                display_name = DOWNLOAD_MODEL_DISPLAY_NAMES.get(mn, mn)
-                sv = tk.StringVar(value=_model_status_str(mn))
-                _status_vars[mn] = sv
-
-                model_block = ttk.Frame(fam_body)
-                model_block.grid(row=r, column=0, sticky="ew", pady=(1, 0))
-                model_block.columnconfigure(0, weight=1)
-
-                # ─ Model header row ─────────────────────────────────
-                hdr = ttk.Frame(model_block)
-                hdr.grid(row=0, column=0, sticky="ew")
-                hdr.columnconfigure(0, weight=1)
-
-                detail_expanded_var = tk.BooleanVar(value=False)
-                detail_frame = ttk.Frame(model_block, padding=(20, 2, 0, 2))
-                detail_frame.columnconfigure(1, weight=1)
-                # detail_frame is NOT gridded yet (hidden by default)
-
-                expand_btn = ttk.Button(
-                    hdr,
-                    text=f"▶  {display_name}",
-                    style="FamilyHeader.TButton",
-                )
-                expand_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-
-                status_lbl = ttk.Label(hdr, textvariable=sv, anchor="w", width=18)
-                status_lbl.grid(row=0, column=1, padx=(8, 0), sticky="w")
-                sv.trace_add("write", lambda *a, lbl=status_lbl, s=sv: _apply_status_color(lbl, s))
-                _apply_status_color(status_lbl, sv)
-
-                ttk.Button(
-                    hdr, text="Auto-download",
-                    command=lambda mn=mn: _auto_download_model(mn),
-                ).grid(row=0, column=2, padx=(8, 0))
-
-                # ─ Detail rows (component paths) ─────────────────────
-                components = list(DOWNLOAD_MODELS.get(mn, {}).keys())
-                _comp_path_vars: dict[str, tk.StringVar] = {}
-
-                for cr, comp in enumerate(components):
-                    comp_label = _COMPONENT_LABELS.get(comp, comp.capitalize())
-                    # Derive the friendly name for this specific component slot
-                    comp_info = DOWNLOAD_MODELS.get(mn, {}).get(comp, {})
-                    folder_name = comp_info.get("folder_name", "")
-                    friendly = DOWNLOAD_COMPONENT_FRIENDLY_NAMES.get(folder_name, "")
-                    label_text = f"{comp_label} ({friendly}):" if friendly else f"{comp_label}:"
-
-                    stored_path = pending_model_paths.get(mn, {}).get(comp, "")
-                    cpv = tk.StringVar(value=stored_path)
-                    _comp_path_vars[comp] = cpv
-
-                    ttk.Label(detail_frame, text=label_text, anchor="e").grid(
-                        row=cr, column=0, sticky="e", padx=(0, 6), pady=1
-                    )
-                    path_entry = ttk.Entry(
-                        detail_frame, textvariable=cpv, style="Flat.TEntry",
-                    )
-                    path_entry.grid(row=cr, column=1, sticky="ew", pady=1)
-
-                    def _save_path(mn: str = mn, comp: str = comp, cpv: tk.StringVar = cpv) -> None:
-                        val = cpv.get().strip()
-                        if val:
-                            pending_model_paths.setdefault(mn, {})[comp] = val
-                        elif mn in pending_model_paths and comp in pending_model_paths[mn]:
-                            del pending_model_paths[mn][comp]
-                        _refresh_status(mn)
-
-                    path_entry.bind("<FocusOut>", lambda e, mn=mn, comp=comp, cpv=cpv: _save_path(mn, comp, cpv))
-                    path_entry.bind("<Return>", lambda e, mn=mn, comp=comp, cpv=cpv: _save_path(mn, comp, cpv))
-
-                    def _browse_comp(mn: str = mn, comp: str = comp, cpv: tk.StringVar = cpv, friendly: str = friendly) -> None:
-                        cur = cpv.get().strip()
-                        initial = str(Path(cur).parent) if cur and Path(cur).parent.exists() else str(default_models_dir if default_models_dir.exists() else Path.home())
-                        title_label = friendly or _COMPONENT_LABELS.get(comp, comp)
-                        picked = filedialog.askopenfilename(
-                            parent=dialog,
-                            title=f"Select {title_label} for {DOWNLOAD_MODEL_DISPLAY_NAMES.get(mn, mn)}",
-                            initialdir=initial,
-                            filetypes=[("Safetensors / PTH", "*.safetensors *.pth"), ("All files", "*.*")],
-                        )
-                        if picked:
-                            pending_model_paths.setdefault(mn, {})[comp] = picked
-                            cpv.set(picked)
-                            _refresh_status(mn)
-
-                    ttk.Button(detail_frame, text="Browse", command=_browse_comp).grid(
-                        row=cr, column=2, padx=(6, 0), pady=1
-                    )
-
-                # Register vars so _scan_extra_path can update them
-                _comp_path_vars_all[mn] = _comp_path_vars
-
-                def _toggle_detail(
-                    btn: ttk.Button = expand_btn,
-                    det: ttk.Frame = detail_frame,
-                    var: tk.BooleanVar = detail_expanded_var,
-                    dn: str = display_name,
-                ) -> None:
-                    if var.get():
-                        det.grid_remove()
-                        var.set(False)
-                        btn.configure(text=f"▶  {dn}")
-                    else:
-                        det.grid(row=1, column=0, sticky="ew")
-                        var.set(True)
-                        btn.configure(text=f"▼  {dn}")
-
-                expand_btn.configure(command=_toggle_detail)
-                _bind_mousewheel(hdr)
-                _bind_mousewheel(detail_frame)
-
-            _bind_mousewheel(fam_body)
-
-        def _toggle_family(
-            btn: ttk.Button,
-            body: ttk.Frame,
-            var: tk.BooleanVar,
-            family_name: str,
-        ) -> None:
-            if var.get():
-                body.grid_remove()
-                var.set(False)
-                btn.configure(text=f"▶  {family_name}")
-            else:
-                body.grid(row=1, column=0, sticky="ew")
-                var.set(True)
-                btn.configure(text=f"▼  {family_name}")
-
-        _family_row = 0
-        for _fam_name, _fam_models in DOWNLOAD_MODEL_FAMILIES.items():
-            _make_family_section(models_inner, _fam_name, _fam_models, _family_row, expanded=(_fam_name == "FLUX.2"))
-            _family_row += 1
-
-        _bind_mousewheel(models_inner)
-
-        # ── Auto-download handler ──────────────────────────────────────
-        def _auto_download_model(model_name: str) -> None:
-            location = model_location_var.get()
-            ws_root = download_workspace_root()
-            hf_token = hf_token_var.get().strip() or None
-            components = list(DOWNLOAD_MODELS.get(model_name, {}).keys())
-
-            from pathlib import Path as _P
-            missing = [c for c in components if find_component(model_name, c, ws_root) is None]
-            # Also check pending_model_paths
-            stored = pending_model_paths.get(model_name, {})
-            missing = [c for c in missing if not (stored.get(c) and _P(stored.get(c, "")).is_file())]
-
-            if not missing:
-                messagebox.showinfo(
-                    "Models found",
-                    f"All '{model_name}' files are already available.",
-                    parent=dialog,
-                )
-                _refresh_status(model_name)
-                return
-
-            confirmed = messagebox.askyesno(
-                "Download models",
-                f"The following files for '{model_name}' were not found:\n\n"
-                + "\n".join(f"  \u2022 {m}" for m in missing)
-                + f"\n\nDownload to: {location}?\n\nThis may take a while.",
-                parent=dialog,
-            )
-            if not confirmed:
-                return
-
-            # Resolve which Python to use — prefer the configured Musubi-Tuner venv
-            # so that huggingface_hub is available and the process has a real stdout.
-            python_exe = selected_musubi_python
-            if not python_exe:
-                messagebox.showerror(
-                    "Python not found",
-                    "App venv Python was not found. Run Setup.bat and try again.",
-                    parent=dialog,
-                )
-                return
-            cli_script = str(Path(__file__).parent / "download_cli.py")
-
-            error_holder: list[str] = []
-            result_holder: dict[str, object] = {}
-
-            log(f"━━━ Downloading {model_name} ({', '.join(missing)}) ━━━")
-
-            def _do_download() -> None:
-                for comp in missing:
-                    cmd = [
-                        python_exe, cli_script,
-                        "--model", model_name,
-                        "--component", comp,
-                        "--ws-root", str(ws_root) if ws_root else "",
-                        "--location", location,
-                    ]
-                    if hf_token:
-                        cmd += ["--token", hf_token]
-
-                    log(f"  ↓ {comp}…")
-                    try:
-                        proc = subprocess.Popen(
-                            cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            text=True,
-                            encoding="utf-8",
-                            errors="replace",
-                        )
-                        comp_result: str | None = None
-                        assert proc.stdout is not None
-                        # Read with \r awareness so tqdm in-place updates stream through.
-                        _buf = ""
-                        while True:
-                            chunk = proc.stdout.read(256)
-                            if not chunk:
-                                break
-                            _buf += chunk
-                            while True:
-                                nl = _buf.find("\n")
-                                cr = _buf.find("\r")
-                                if nl == -1 and cr == -1:
-                                    break
-                                if cr != -1 and (nl == -1 or cr < nl):
-                                    line = _buf[:cr]
-                                    _buf = _buf[cr + 1:]
-                                    if line.startswith("RESULT:"):
-                                        comp_result = line[7:]
-                                    elif line.strip():
-                                        log(f"\r    {line.strip()}")
-                                else:
-                                    line = _buf[:nl].rstrip("\r")
-                                    _buf = _buf[nl + 1:]
-                                    if line.startswith("RESULT:"):
-                                        comp_result = line[7:]
-                                    elif line.strip():
-                                        log(f"    {line.strip()}")
-                        if _buf.strip():
-                            log(f"    {_buf.strip()}")
-                        proc.wait()
-                        if proc.returncode != 0:
-                            error_holder.append(
-                                f"Download of '{comp}' failed (exit {proc.returncode})"
-                            )
-                            break
-                        if comp_result:
-                            result_holder[comp] = comp_result
-                            # Persist each component immediately after it downloads.
-                            def _save_comp(c: str = comp, p: str = comp_result) -> None:
-                                import json as _json_save
-                                pending_model_paths.setdefault(model_name, {})[c] = p
-                                settings_state[MODEL_PATHS_KEY] = _json_save.dumps(pending_model_paths)
-                                save_settings(settings_state)
-                                _refresh_status(model_name)
-                                # Update entry box if the registry has a StringVar for it
-                                sv = _comp_path_vars_all.get(model_name, {}).get(c)
-                                if sv is not None:
-                                    sv.set(p)
-                            dialog.after(0, _save_comp)
-                    except Exception as exc:
-                        error_holder.append(str(exc))
-                        break
-
-                dialog.after(0, _on_dl_done)
-
-            def _on_dl_done() -> None:
-                if error_holder:
-                    log(f"[ERROR] {error_holder[0]}")
-                    messagebox.showerror("Download failed", error_holder[0], parent=dialog)
-                    return
-                _refresh_status(model_name)
-                log(f"━━━ Complete: {model_name} ━━━")
-                messagebox.showinfo(
-                    "Download complete",
-                    f"'{model_name}' is ready.",
-                    parent=dialog,
-                )
-
-            threading.Thread(target=_do_download, daemon=True).start()
-
-        def _refresh_backend_status_labels() -> None:
-            main_path = Path(selected_musubi_main_path).expanduser()
-            ltx_path = Path(selected_musubi_ltx_path).expanduser()
-            sd_path = Path(selected_sd_scripts_path).expanduser()
-            preferred_main = Path(selected_backends_root).expanduser() / "musubi-main"
-            preferred_ltx = Path(selected_backends_root).expanduser() / "musubi-ltx"
-            preferred_sd = Path(selected_backends_root).expanduser() / "sd-scripts"
-
-            main_ok = backend_is_valid("musubi-main", main_path)
-            ltx_ok = backend_is_valid("musubi-ltx", ltx_path)
-            sd_ok = backend_is_valid("sd-scripts", sd_path)
-            musubi_main_status_var.set("Configured" if main_ok else "Missing or invalid")
-            musubi_ltx_status_var.set("Configured" if ltx_ok else "Missing or invalid")
-            sd_scripts_status_var.set("Configured" if sd_ok else "Missing or invalid")
-
-            main_is_preferred = main_ok and main_path.resolve() == preferred_main.resolve()
-            ltx_is_preferred = ltx_ok and ltx_path.resolve() == preferred_ltx.resolve()
-            sd_is_preferred = sd_ok and sd_path.resolve() == preferred_sd.resolve()
-
-            musubi_main_action_var.set("Update" if main_is_preferred else "Auto Download")
-            musubi_ltx_action_var.set("Update" if ltx_is_preferred else "Auto Download")
-            sd_scripts_action_var.set("Update" if sd_is_preferred else "Auto Download")
-
-        def _persist_backend_paths() -> None:
-            settings_state[BACKENDS_ROOT_KEY] = str(Path(selected_backends_root).expanduser())
-            settings_state[MUSUBI_MAIN_DIR_KEY] = str(Path(selected_musubi_main_path).expanduser())
-            settings_state[MUSUBI_LTX_DIR_KEY] = str(Path(selected_musubi_ltx_path).expanduser())
-            settings_state[SD_SCRIPTS_DIR_KEY] = str(Path(selected_sd_scripts_path).expanduser())
-            # Backward compatibility for legacy single-musubi key.
-            settings_state[MUSUBI_DIR_KEY] = settings_state[MUSUBI_MAIN_DIR_KEY]
-            save_settings(settings_state)
-
-        def browse_backends_root() -> None:
-            nonlocal selected_backends_root, selected_musubi_main_path, selected_musubi_ltx_path, selected_sd_scripts_path
-            picked = filedialog.askdirectory(
-                parent=dialog,
-                title="Select Backends root folder",
-                initialdir=selected_backends_root or str(default_backends_root()),
-            )
-            if not picked:
-                return
-
-            selected_backends_root = picked
-            backends_root_var.set(picked)
-
-            if not settings_state.get(MUSUBI_MAIN_DIR_KEY, "").strip():
-                selected_musubi_main_path = str(Path(picked) / "musubi-main")
-                musubi_main_display_var.set(selected_musubi_main_path)
-            if not settings_state.get(MUSUBI_LTX_DIR_KEY, "").strip():
-                selected_musubi_ltx_path = str(Path(picked) / "musubi-ltx")
-                musubi_ltx_display_var.set(selected_musubi_ltx_path)
-            if not settings_state.get(SD_SCRIPTS_DIR_KEY, "").strip():
-                selected_sd_scripts_path = str(Path(picked) / "sd-scripts")
-                sd_scripts_display_var.set(selected_sd_scripts_path)
-            _refresh_backend_status_labels()
-
-        def browse_backend(kind: str) -> None:
-            nonlocal selected_musubi_main_path, selected_musubi_ltx_path, selected_sd_scripts_path, selected_musubi_python
-            if kind == "musubi-main":
-                current = selected_musubi_main_path
-                title = "Select Musubi Main folder"
-            elif kind == "musubi-ltx":
-                current = selected_musubi_ltx_path
-                title = "Select Musubi LTX folder"
-            else:
-                current = selected_sd_scripts_path
-                title = "Select sd-scripts folder"
-
-            picked = filedialog.askdirectory(
-                parent=dialog,
-                title=title,
-                initialdir=current or str(Path.home()),
-            )
-            if not picked:
-                return
-
-            if kind == "musubi-main":
-                selected_musubi_main_path = picked
-                musubi_main_display_var.set(picked)
-                detected_python = resolve_musubi_python(Path(picked).expanduser())
-                selected_musubi_python = str(detected_python) if detected_python is not None else ""
-            elif kind == "musubi-ltx":
-                selected_musubi_ltx_path = picked
-                musubi_ltx_display_var.set(picked)
-            else:
-                selected_sd_scripts_path = picked
-                sd_scripts_display_var.set(picked)
-
-            _refresh_backend_status_labels()
-
-        def auto_download_backend(kind: str) -> None:
-            nonlocal selected_musubi_main_path, selected_musubi_ltx_path, selected_sd_scripts_path, selected_musubi_python
-            row_map = {row_kind: (label, repo_url, branch) for label, row_kind, _k, _d, repo_url, branch in backend_repo_rows()}
-            label, repo_url, branch = row_map[kind]
-            clone_confirmed = False
-
-            if kind == "musubi-main":
-                current_target = Path(selected_musubi_main_path).expanduser() if selected_musubi_main_path else Path(selected_backends_root) / "musubi-main"
-                preferred_target = Path(selected_backends_root).expanduser() / "musubi-main"
-            elif kind == "musubi-ltx":
-                current_target = Path(selected_musubi_ltx_path).expanduser() if selected_musubi_ltx_path else Path(selected_backends_root) / "musubi-ltx"
-                preferred_target = Path(selected_backends_root).expanduser() / "musubi-ltx"
-            else:
-                current_target = Path(selected_sd_scripts_path).expanduser() if selected_sd_scripts_path else Path(selected_backends_root) / "sd-scripts"
-                preferred_target = Path(selected_backends_root).expanduser() / "sd-scripts"
-
-            target = preferred_target
-
-            selected_is_preferred = False
-            if backend_is_valid(kind, current_target):
-                try:
-                    selected_is_preferred = current_target.resolve() == target.resolve()
-                except OSError:
-                    selected_is_preferred = False
-
-            def _apply_selected_backend(path: Path) -> None:
-                nonlocal selected_musubi_main_path, selected_musubi_ltx_path, selected_sd_scripts_path, selected_musubi_python
-                if kind == "musubi-main":
-                    selected_musubi_main_path = str(path)
-                    musubi_main_display_var.set(str(path))
-                    detected_python = resolve_musubi_python(path)
-                    selected_musubi_python = str(detected_python) if detected_python is not None else ""
-                elif kind == "musubi-ltx":
-                    selected_musubi_ltx_path = str(path)
-                    musubi_ltx_display_var.set(str(path))
-                else:
-                    selected_sd_scripts_path = str(path)
-                    sd_scripts_display_var.set(str(path))
-                _refresh_backend_status_labels()
-                _persist_backend_paths()
-
-            if selected_is_preferred:
-                _settings_log(f"[Backends] {label}: update started")
-                confirm_update = messagebox.askyesno(
-                    "Update backend",
-                    f"Run git pull for {label}?\n\nTarget:\n{target}",
-                    parent=dialog,
-                )
-                if not confirm_update:
-                    _settings_log(f"[Backends] {label}: update cancelled")
-                    return
-
-                ok, output = update_backend_repo(target)
-                if ok:
-                    _apply_selected_backend(target)
-                    _settings_log(f"[Backends] {label}: update done")
-                    messagebox.showinfo(
-                        "Update complete",
-                        f"{label} updated successfully.\n\n{output}",
-                        parent=dialog,
-                    )
-                    return
-
-                _settings_log(f"[Backends] {label}: update failed")
-
-                reset_now = messagebox.askyesno(
-                    "Update failed",
-                    f"git pull failed for {label}:\n\n{output}\n\n"
-                    "Do you want to reset this backend (delete folder and re-download)?",
-                    parent=dialog,
-                )
-                if not reset_now:
-                    _settings_log(f"[Backends] {label}: reset cancelled")
-                    return
-
-                _settings_log(f"[Backends] {label}: reset started")
-                try:
-                    shutil.rmtree(target)
-                except OSError as exc:
-                    _settings_log(f"[Backends] {label}: reset failed")
-                    messagebox.showerror("Reset failed", f"Could not remove folder:\n{exc}", parent=dialog)
-                    return
-
-                ok, err = clone_backend_repo(target, repo_url, branch)
-                if not ok:
-                    _settings_log(f"[Backends] {label}: re-download failed")
-                    messagebox.showerror("Re-download failed", err, parent=dialog)
-                    return
-
-                _apply_selected_backend(target)
-                _settings_log(f"[Backends] {label}: reset done")
-                messagebox.showinfo("Reset complete", f"Re-downloaded {label}:\n{target}", parent=dialog)
-                return
-
-            if backend_is_valid(kind, target):
-                _apply_selected_backend(target)
-                return
-
-            if backend_is_valid(kind, current_target) and current_target.resolve() != target.resolve():
-                clone_here = messagebox.askyesno(
-                    "Download backend",
-                    f"{label} is currently configured outside Backends:\n{current_target}\n\n"
-                    f"Clone another copy into Backends and switch to it?\n\nTarget:\n{target}",
-                    parent=dialog,
-                )
-                if not clone_here:
-                    _apply_selected_backend(current_target)
-                    return
-                clone_confirmed = True
-
-            if not clone_confirmed:
-                confirm = messagebox.askyesno(
-                    "Download backend",
-                    f"Clone {label} into:\n{target}\n\nRepository:\n{repo_url}" + (f"\nBranch: {branch}" if branch else ""),
-                    parent=dialog,
-                )
-                if not confirm:
-                    _settings_log(f"[Backends] {label}: download cancelled")
-                    return
-
-            _settings_log(f"[Backends] {label}: download started")
-            ok, err = clone_backend_repo(target, repo_url, branch)
-            if not ok:
-                _settings_log(f"[Backends] {label}: download failed")
-                messagebox.showerror("Clone failed", err, parent=dialog)
-                return
-
-            _apply_selected_backend(target)
-            _settings_log(f"[Backends] {label}: download done")
-            messagebox.showinfo("Clone complete", f"Configured {label}:\n{target}", parent=dialog)
-
-        _refresh_backend_status_labels()
-
-        def browse_file(current_path: str, initial_dir_hint: str, title: str) -> str | None:
-            initial_dir = initial_dir_hint
-            if default_models_dir.exists() and default_models_dir.is_dir():
-                initial_dir = str(default_models_dir)
-            if current_path:
-                current_parent = Path(current_path).expanduser().parent
-                initial_dir = str(current_parent)
-            picked = filedialog.askopenfilename(
-                parent=dialog,
-                title=title,
-                initialdir=initial_dir or str(Path.home()),
-                filetypes=[("Safetensors", "*.safetensors"), ("All files", "*.*")],
-            )
-            return picked if picked else None
-
-        def normalize_model_checkpoint_path(raw_path: str | None) -> str:
-            if not raw_path:
-                return ""
-            candidate = Path(raw_path).expanduser()
-            if candidate.is_file() and candidate.name.lower().endswith(".safetensors.index.json"):
-                try:
-                    payload = json.loads(candidate.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    return str(candidate)
-                weight_map = payload.get("weight_map", {})
-                if not isinstance(weight_map, dict) or not weight_map:
-                    return str(candidate)
-                shard_names = sorted({str(v) for v in weight_map.values() if isinstance(v, str) and v.lower().endswith(".safetensors")})
-                preferred = next((name for name in shard_names if re.search(r"-00001-of-\d+\.safetensors$", name, flags=re.IGNORECASE)), None)
-                shard_name = preferred or (shard_names[0] if shard_names else None)
-                if shard_name:
-                    shard_path = candidate.parent / shard_name
-                    if shard_path.is_file():
-                        return str(shard_path)
-            return str(candidate)
-
-        def save_and_close() -> None:
-            nonlocal result, settings_state
-            # Force any focused entry widget to commit (triggers FocusOut → _save_path)
-            dialog.focus_set()
-            main_dir = Path(selected_musubi_main_path).expanduser()
-            ltx_dir = Path(selected_musubi_ltx_path).expanduser()
-            sd_scripts_dir = Path(selected_sd_scripts_path).expanduser()
-
-            if required:
-                if not backend_is_valid("musubi-main", main_dir) and not backend_is_valid("musubi-ltx", ltx_dir):
-                    messagebox.showerror(
-                        "Missing backend",
-                        "Set at least one Musubi backend (Main or LTX) before continuing.",
-                        parent=dialog,
-                    )
-                    return
-
-            try:
-                save_every_default_value = int(train_save_every_default_var.get().strip())
-                if save_every_default_value < 1:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror(
-                    "Invalid value",
-                    "Training default 'Save every N steps' must be a positive integer.",
-                    parent=dialog,
-                )
-                return
-
-            if not main_dir.exists() or not main_dir.is_dir():
-                messagebox.showerror("Invalid folder", "Choose a valid Musubi Main folder.", parent=dialog)
-                return
-
-            musubi_python_path = resolve_musubi_python(main_dir)
-            if musubi_python_path is None:
-                messagebox.showerror(
-                    "Python venv not found",
-                    "App venv Python was not found. Run Setup.bat first.",
-                    parent=dialog,
-                )
-                return
-
-            import json as _json_save
-            settings_state[BACKENDS_ROOT_KEY] = str(Path(selected_backends_root).expanduser())
-            settings_state[MUSUBI_MAIN_DIR_KEY] = str(main_dir)
-            settings_state[MUSUBI_LTX_DIR_KEY] = str(ltx_dir)
-            settings_state[SD_SCRIPTS_DIR_KEY] = str(sd_scripts_dir)
-            settings_state[MUSUBI_DIR_KEY] = str(main_dir)
-            settings_state[MUSUBI_PYTHON_KEY] = ""
-            settings_state[MODEL_PATHS_KEY] = _json_save.dumps(pending_model_paths)
-            # Backward compat: derive legacy keys from pending_model_paths
-            _active_klein = settings_state.get(KLEIN_MODEL_VERSION_KEY, "klein-base-9b") or "klein-base-9b"
-            _kpaths = pending_model_paths.get(_active_klein, {})
-            settings_state[KLEIN_MODEL_VERSION_KEY] = _active_klein
-            settings_state[KLEIN_DIT_KEY] = _kpaths.get("dit", "")
-            settings_state[KLEIN_VAE_KEY] = _kpaths.get("vae", "")
-            settings_state[KLEIN_TEXT_ENCODER_KEY] = _kpaths.get("text_encoder", "")
-            _ltx_paths = pending_model_paths.get("ltx-2.3", {})
-            settings_state[LTX_MODEL_VERSION_KEY] = "ltx-2.3" if _ltx_paths else ""
-            settings_state[LTX_DIT_KEY] = _ltx_paths.get("dit", "")
-            settings_state[LTX_VAE_KEY] = _ltx_paths.get("vae", "")
-            settings_state[LTX_TEXT_ENCODER_KEY] = _ltx_paths.get("text_encoder", "")
-            settings_state[DEFAULT_CAPTION_KEYWORD_KEY] = default_caption_keyword_var.get().strip()
-            settings_state[ENABLE_COMPILE_OPTIMIZATIONS_KEY] = "1" if compile_optimizations_var.get() else "0"
-            settings_state[ENABLE_CUDA_ALLOW_TF32_KEY] = "1" if cuda_allow_tf32_var.get() else "0"
-            settings_state[ENABLE_CUDA_CUDNN_BENCHMARK_KEY] = "1" if cuda_cudnn_benchmark_var.get() else "0"
-            settings_state[ENABLE_FP8_DIT_KEY] = "1" if fp8_dit_var.get() else "0"
-            settings_state[ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY] = "1" if gc_cpu_offload_var.get() else "0"
-            settings_state[TRAIN_ENABLE_LOGGING_KEY] = "1" if enable_training_logging_var.get() else "0"
-            settings_state[TRAIN_LOG_BACKEND_KEY] = "tensorboard"
-            settings_state[TRAIN_LOG_TRACKER_NAME_KEY] = train_log_tracker_name_var.get().strip()
-            settings_state[TRAIN_STREAM_TO_LOGGER_KEY] = "1" if stream_to_logger_var.get() else "0"
-            settings_state[TRAIN_AUTO_START_TENSORBOARD_KEY] = "1" if auto_start_tensorboard_var.get() else "0"
-            settings_state[TRAIN_AUTO_CLEANUP_STATES_KEY] = "1" if auto_cleanup_states_var.get() else "0"
-            settings_state[TRAIN_SAVE_EVERY_N_STEPS_KEY] = str(save_every_default_value)
-            preferred_to_save = {
-                family_name: var.get().strip()
-                for family_name, var in preferred_preset_vars.items()
-                if var.get().strip() and var.get().strip() != preset_none_label
-            }
-            settings_state[PREFERRED_PRESETS_BY_FAMILY_KEY] = _json_save.dumps(preferred_to_save)
-            settings_state[MODEL_DOWNLOAD_LOCATION_KEY] = model_location_var.get()
-            settings_state[HF_TOKEN_KEY] = hf_token_var.get().strip()
-            _ep = extra_path_var.get().strip()
-            settings_state[EXTRA_SEARCH_PATHS_KEY] = _json_save.dumps([_ep] if _ep else [])
-            save_settings(settings_state)
-            result = runtime_config_from_settings(settings_state)
-            dialog.destroy()
-
-        def cancel_and_close() -> None:
-            dialog.destroy()
-
-        def reset_settings() -> None:
-            nonlocal result, settings_state, settings_reset_requested
-            confirmed = messagebox.askyesno(
-                "Reset settings",
-                "Delete settings.json and reset all saved settings?",
-                parent=dialog,
-            )
-            if not confirmed:
-                return
-
-            try:
-                if SETTINGS_FILE.exists():
-                    SETTINGS_FILE.unlink()
-            except OSError as exc:
-                messagebox.showerror("Reset failed", f"Could not delete settings file:\n{exc}", parent=dialog)
-                return
-
-            settings_reset_requested = True
-            settings_state = {}
-            result = None
-            dialog.destroy()
-            root.after_idle(root.destroy)
-
-        button_row = ttk.Frame(footer)
-        button_row.grid(row=0, column=0, sticky="ew")
-        button_row.columnconfigure(0, weight=1)
-        ttk.Button(button_row, text="Reset Settings", command=reset_settings).grid(row=0, column=0, sticky="w")
-        ttk.Button(button_row, text="Cancel", command=cancel_and_close).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(button_row, text="Save", command=save_and_close).grid(row=0, column=2)
-
-        dialog.protocol("WM_DELETE_WINDOW", cancel_and_close)
-        dialog.update_idletasks()
-
-        content_w = max(notebook.winfo_reqwidth(), footer.winfo_reqwidth()) + 44
-        content_h = notebook.winfo_reqheight() + footer.winfo_reqheight() + 20
-        max_w = max(760, dialog.winfo_screenwidth() - 80)
-        max_h = max(480, dialog.winfo_screenheight() - 80)
-        win_w = max(780, min(1080, content_w))
-        win_w = min(win_w, max_w)
-        win_h = min(max(520, content_h), max_h)
-        dialog.geometry(f"{win_w}x{win_h}")
-        center_window(dialog)
-        dialog.deiconify()
-        dialog.grab_set()
-        dialog.focus_set()
-        root.wait_window(dialog)
-
-        if required and result is None:
-            return None
-
-        return result
 
     if is_first_launch_unconfigured():
         messagebox.showinfo(
@@ -3168,46 +1754,6 @@ def launch_ui() -> int:
             return []
         return sorted([p for p in output_dir.iterdir() if p.is_file() and p.suffix.lower() == ".safetensors"])
 
-    def compact_merge_selection_token(selected_files: list[str]) -> str:
-        step_values: list[int] = []
-        for raw_path in selected_files:
-            match = re.search(r"step0*(\d+)", Path(raw_path).name, re.IGNORECASE)
-            if match:
-                step_values.append(int(match.group(1)))
-
-        if not step_values:
-            return f"n{len(selected_files)}"
-
-        unique_steps = sorted(set(step_values))
-        if len(unique_steps) <= 4:
-            return "s" + "-".join(str(step) for step in unique_steps)
-
-        return f"s{unique_steps[0]}-{unique_steps[-1]}x{len(unique_steps)}"
-
-    def merge_preset_file_token(preset_name: str) -> str:
-        preset_key = preset_name.strip().lower()
-        if preset_key == "smooth":
-            return "Smooth"
-        if preset_key == "anti-overfit":
-            return "NoOverfit"
-        return "Balance"
-
-    def merge_preset_tooltip_text() -> str:
-        return (
-            "Preset guide\n"
-            "Balanced: General starting point for most training runs.\n"
-            "Smooth: Prefer when training converged early and you want a smoother blend.\n"
-            "Anti-overfit: Prefer when late checkpoints look overfit and too close to training images."
-        )
-
-    def merge_mode_tooltip_text() -> str:
-        return (
-            "Merge mode guide\n"
-            "BETA: Uses a single constant decay rate across all checkpoints.\n"
-            "BETA + BETA2: Interpolates decay from beta to beta2 across the merge order.\n"
-            "SIGMA_REL: Uses Power Function EMA to compute decay schedule and reduce first-checkpoint bias."
-        )
-
     def attach_hover_tooltip(widget: tk.Widget, text_provider: Callable[[], str] | str) -> None:
         tooltip_window: tk.Toplevel | None = None
 
@@ -3252,883 +1798,52 @@ def launch_ui() -> int:
         widget.bind("<ButtonPress>", hide_tooltip, add="+")
         widget.bind("<FocusOut>", hide_tooltip, add="+")
 
-    def next_merged_output_path(
-        dataset_name: str,
-        output_dir: Path,
-        merge_mode_suffix: str,
-        preset_name: str,
-        selected_files: list[str],
-    ) -> Path:
-        # Keep method name in the filename to make comparisons between merge modes easy.
-        method_token = re.sub(r"[^A-Za-z0-9]+", "_", merge_mode_suffix.strip()).strip("_")
-        preset_token = merge_preset_file_token(preset_name)
-        selection_token = compact_merge_selection_token(selected_files)
-        if method_token and preset_token:
-            base_name = f"{dataset_name}_merged_{method_token}_{preset_token}_{selection_token}"
-        elif method_token:
-            base_name = f"{dataset_name}_merged_{method_token}_{selection_token}"
-        else:
-            base_name = f"{dataset_name}_merged_{selection_token}"
-        candidate = output_dir / f"{base_name}.safetensors"
-        if not candidate.exists():
-            return candidate
+    def _lora_merge_window():
+        from .ui.windows import lora_merge_window
 
-        index = 2
-        while True:
-            candidate = output_dir / f"{base_name}_{index}.safetensors"
-            if not candidate.exists():
-                return candidate
-            index += 1
-
-    def post_hoc_ema_mode_args_for_preset(preset_name: str) -> dict[str, list[str]]:
-        preset_key = preset_name.strip().lower()
-        if preset_key == "smooth":
-            return {
-                "beta": ["--beta", "0.95"],
-                "beta2": ["--beta", "0.95", "--beta2", "0.98"],
-                "sigma_rel": ["--sigma_rel", "0.25"],
-            }
-        if preset_key == "anti-overfit":
-            return {
-                "beta": ["--beta", "0.8"],
-                "beta2": ["--beta", "0.80", "--beta2", "0.90"],
-                "sigma_rel": ["--sigma_rel", "0.15"],
-            }
-        return {
-            "beta": ["--beta", "0.9"],
-            "beta2": ["--beta", "0.90", "--beta2", "0.95"],
-            "sigma_rel": ["--sigma_rel", "0.2"],
+        dependencies = {
+            "DND_FILES": DND_FILES,
+            "Path": Path,
+            "attach_hover_tooltip": attach_hover_tooltip,
+            "bg_panel": bg_panel,
+            "border_dark": border_dark,
+            "center_window": center_window,
+            "checkpoint_cache": checkpoint_cache,
+            "fg_text": fg_text,
+            "filedialog": filedialog,
+            "log": log,
+            "merge_mode_tooltip_text": merge_mode_tooltip_text,
+            "merge_preset_file_token": merge_preset_file_token,
+            "merge_preset_tooltip_text": merge_preset_tooltip_text,
+            "messagebox": messagebox,
+            "next_merged_output_path": next_merged_output_path,
+            "os": os,
+            "post_hoc_ema_mode_args_for_preset": post_hoc_ema_mode_args_for_preset,
+            "rebuild_folder_list": rebuild_folder_list,
+            "root": root,
+            "runtime_config": runtime_config,
+            "set_dark_title_bar": set_dark_title_bar,
+            "subprocess": subprocess,
+            "tk": tk,
+            "tkdnd_available": tkdnd_available,
+            "ttk": ttk,
         }
+        return lora_merge_window.LoraMergeWindow(**dependencies)
 
     def ask_lora_merge_options(
         dataset_name: str,
         available_loras: list[Path],
     ) -> tuple[list[str], list[tuple[str, str, list[str], str]]] | None:
-        dialog = tk.Toplevel(root)
-        dialog.withdraw()
-        dialog.title("LoRA Post-Hoc EMA Merge")
-        dialog.transient(root)
-        dialog.grab_set()
-        dialog.resizable(False, False)
-        dialog.configure(bg=bg_panel)
-        set_dark_title_bar(dialog)
-        dialog.minsize(380, 460)
-        dialog.columnconfigure(0, weight=1)
-        dialog.rowconfigure(0, weight=1)
-
-        frame = ttk.Frame(dialog, padding=12)
-        frame.grid(row=0, column=0, sticky="nsew")
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(2, weight=1)
-
-        ttk.Label(frame, text=f"LoRAs in output for {dataset_name}:").grid(row=0, column=0, sticky="w")
-        ttk.Label(frame, text="Select the LoRAs you want to merge.").grid(row=1, column=0, sticky="w", pady=(4, 0))
-
-        selected_box_frame = ttk.Frame(frame)
-        selected_box_frame.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
-        selected_box_frame.columnconfigure(0, weight=1)
-        selected_box_frame.rowconfigure(0, weight=1)
-
-        selected_list = tk.Listbox(
-            selected_box_frame,
-            selectmode="extended",
-            exportselection=False,
-            activestyle="none",
-            width=1,
-            bg="#1f1f1f",
-            fg=fg_text,
-            highlightthickness=1,
-            highlightbackground=border_dark,
-            selectbackground="#2f4f66",
-            selectforeground="#ffffff",
-            relief="flat",
-            height=8,
-        )
-        selected_list.grid(row=0, column=0, sticky="nsew")
-        selected_scroll = ttk.Scrollbar(
-            selected_box_frame,
-            orient="vertical",
-            command=selected_list.yview,
-            style="Dark.Vertical.TScrollbar",
-        )
-        selected_scroll.grid(row=0, column=1, sticky="ns")
-        selected_list.configure(yscrollcommand=selected_scroll.set)
-
-        for lora_path in available_loras:
-            selected_list.insert("end", lora_path.name)
-
-        ttk.Label(
-            frame,
-            text="Post-Hoc EMA smooths checkpoints from the same run into one more stable LoRA.",
-        ).grid(row=3, column=0, sticky="ew", pady=(10, 0))
-
-        options_frame = ttk.Frame(frame)
-        options_frame.grid(row=4, column=0, sticky="ew", pady=(10, 0))
-        options_frame.columnconfigure(0, weight=1)
-        options_frame.columnconfigure(1, weight=1)
-
-        preset_section = ttk.LabelFrame(options_frame, text="Preset(s)", padding=6)
-        preset_section.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        attach_hover_tooltip(preset_section, merge_preset_tooltip_text)
-
-        mode_section = ttk.LabelFrame(options_frame, text="Mode(s)", padding=6)
-        mode_section.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        attach_hover_tooltip(mode_section, merge_mode_tooltip_text)
-
-        preset_balanced_var = tk.BooleanVar(value=False)
-        preset_smooth_var = tk.BooleanVar(value=False)
-        preset_anti_overfit_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(preset_section, text="Balanced", variable=preset_balanced_var).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(preset_section, text="Smooth", variable=preset_smooth_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(preset_section, text="Anti-overfit", variable=preset_anti_overfit_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
-
-        mode_beta_var = tk.BooleanVar(value=False)
-        mode_beta2_var = tk.BooleanVar(value=False)
-        mode_sigma_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(mode_section, text="BETA (Default)", variable=mode_beta_var).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(mode_section, text="SIGMA_REL", variable=mode_sigma_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
-
-        button_row = ttk.Frame(frame)
-        button_row.grid(row=5, column=0, sticky="ew", pady=(12, 0))
-        button_row.columnconfigure(0, weight=1)
-
-        choice: tuple[list[str], list[tuple[str, str, list[str], str]]] | None = None
-
-        def choose_and_close() -> None:
-            nonlocal choice
-            picked_indices = selected_list.curselection()
-            selected_file_paths = [str(available_loras[i]) for i in picked_indices]
-            if len(selected_file_paths) < 2:
-                messagebox.showerror(
-                    "Merge unavailable",
-                    "Select at least 2 .safetensors files for Post-Hoc EMA merge.",
-                    parent=dialog,
-                )
-                return
-
-            selected_preset_names: list[str] = []
-            if preset_balanced_var.get():
-                selected_preset_names.append("Balanced")
-            if preset_smooth_var.get():
-                selected_preset_names.append("Smooth")
-            if preset_anti_overfit_var.get():
-                selected_preset_names.append("Anti-overfit")
-            if not selected_preset_names:
-                messagebox.showerror(
-                    "Merge unavailable",
-                    "Select at least one preset.",
-                    parent=dialog,
-                )
-                return
-
-            mode_defs: list[tuple[str, str, str]] = []
-            if mode_beta_var.get():
-                mode_defs.append(("BETA", "Beta", "beta"))
-            if mode_beta2_var.get():
-                mode_defs.append(("BETA2", "Beta2", "beta2"))
-            if mode_sigma_var.get():
-                mode_defs.append(("SIGMA_REL", "Sigma", "sigma_rel"))
-
-            if not mode_defs:
-                messagebox.showerror(
-                    "Merge unavailable",
-                    "Select at least one merge mode.",
-                    parent=dialog,
-                )
-                return
-
-            selected_jobs: list[tuple[str, str, list[str], str]] = []
-            for preset_name in selected_preset_names:
-                preset_args = post_hoc_ema_mode_args_for_preset(preset_name)
-                for mode_label, mode_suffix, mode_key in mode_defs:
-                    selected_jobs.append((mode_label, mode_suffix, preset_args[mode_key], preset_name))
-
-            choice = (selected_file_paths, selected_jobs)
-            dialog.destroy()
-
-        def cancel_and_close() -> None:
-            dialog.destroy()
-
-        go_button = ttk.Button(button_row, text="Go", command=choose_and_close)
-        go_button.grid(row=0, column=0)
-
-        dialog.protocol("WM_DELETE_WINDOW", cancel_and_close)
-        dialog.bind("<Escape>", lambda _e: cancel_and_close())
-        dialog.bind("<Return>", lambda _e: choose_and_close())
-
-        dialog.update_idletasks()
-        requested_width = max(390, dialog.winfo_reqwidth())
-        requested_height = max(500, dialog.winfo_reqheight())
-        dialog.geometry(f"{requested_width}x{requested_height}")
-        center_window(dialog)
-        dialog.deiconify()
-        dialog.focus_set()
-        selected_list.focus_set()
-        root.wait_window(dialog)
-        return choice
+        return _lora_merge_window().ask_lora_merge_options(dataset_name, available_loras)
 
     def lora_post_hoc_ema_merge(dataset_name: str) -> None:
-        output_dir = runtime_config.training_dir / dataset_name / "output"
-        lora_post_hoc_ema_merge_for_output(dataset_name, output_dir)
+        _lora_merge_window().lora_post_hoc_ema_merge(dataset_name)
 
     def lora_post_hoc_ema_merge_for_output(target_name: str, output_dir: Path, merge_output_dir: Path | None = None) -> None:
-        if merge_output_dir is None:
-            merge_output_dir = output_dir
-        if not output_dir.exists() or not output_dir.is_dir():
-            messagebox.showerror(
-                "Merge unavailable",
-                "No output folder was found for this job.",
-                parent=root,
-            )
-            return
-
-        available = sorted([p for p in output_dir.iterdir() if p.is_file() and p.suffix.lower() == ".safetensors"])
-        if not available:
-            messagebox.showerror(
-                "Merge unavailable",
-                "No .safetensors files were found in this output folder.",
-                parent=root,
-            )
-            return
-        module_script = runtime_config.musubi_dir / "src" / "musubi_tuner" / "lora_post_hoc_ema.py"
-        root_script = runtime_config.musubi_dir / "lora_post_hoc_ema.py"
-        if not module_script.exists() and not root_script.exists():
-            messagebox.showerror(
-                "Merge unavailable",
-                "Could not find lora_post_hoc_ema.py in Musubi-Tuner.",
-                parent=root,
-            )
-            return
-
-        merge_options = ask_lora_merge_options(target_name, available)
-        if merge_options is None:
-            return
-        selected_files, selected_jobs = merge_options
-
-        musubi_python = runtime_config.musubi_python
-        if musubi_python is None or not musubi_python.is_file():
-            messagebox.showerror(
-                "Merge unavailable",
-                (
-                    "Musubi-Tuner Python was not found in its venv.\n"
-                    "Expected: .venv/Scripts/python.exe inside your Musubi-Tuner folder."
-                ),
-                parent=root,
-            )
-            return
-
-        run_env = os.environ.copy()
-        musubi_src = str(runtime_config.musubi_dir / "src")
-        existing_pythonpath = run_env.get("PYTHONPATH", "")
-        run_env["PYTHONPATH"] = musubi_src if not existing_pythonpath else f"{musubi_src}{os.pathsep}{existing_pythonpath}"
-
-        log("")
-        created_paths: list[Path] = []
-        for merge_mode_label, merge_mode_suffix, merge_mode_args, preset_name in selected_jobs:
-            output_path = next_merged_output_path(
-                target_name,
-                merge_output_dir,
-                merge_mode_suffix,
-                preset_name,
-                selected_files,
-            )
-            command: list[str]
-            if module_script.exists():
-                command = [
-                    str(musubi_python),
-                    "-m",
-                    "musubi_tuner.lora_post_hoc_ema",
-                    *selected_files,
-                    "--output_file",
-                    str(output_path),
-                    *merge_mode_args,
-                ]
-            else:
-                command = [
-                    str(musubi_python),
-                    str(root_script),
-                    *selected_files,
-                    "--output_file",
-                    str(output_path),
-                    *merge_mode_args,
-                ]
-
-            log(
-                f"[Post-Hoc EMA] Merging {len(selected_files)} checkpoint(s) for '{target_name}' "
-                f"using {merge_mode_label} / {preset_name}..."
-            )
-            result = subprocess.run(
-                command,
-                cwd=str(runtime_config.musubi_dir),
-                env=run_env,
-                capture_output=True,
-                text=True,
-            )
-
-            stdout_text = result.stdout.strip()
-            stderr_text = result.stderr.strip()
-            if stdout_text:
-                log(stdout_text)
-
-            if result.returncode != 0:
-                message = stderr_text if stderr_text else "lora_post_hoc_ema.py failed with no error output."
-                log(f"[Post-Hoc EMA] Failed ({result.returncode}) while running {merge_mode_label} / {preset_name}.")
-                if stderr_text:
-                    log(stderr_text)
-                messagebox.showerror("Post-Hoc EMA merge failed", message, parent=root)
-                return
-
-            log(f"[Post-Hoc EMA] Created ({merge_mode_suffix} / {preset_name}): {output_path}")
-            if stderr_text:
-                log(stderr_text)
-            created_paths.append(output_path)
-
-        if created_paths:
-            created_text = "\n".join(str(path) for path in created_paths)
-            messagebox.showinfo("Post-Hoc EMA merge complete", f"Created:\n{created_text}", parent=root)
-
-        checkpoint_cache.pop(target_name, None)
-        rebuild_folder_list(force=True)
+        _lora_merge_window().lora_post_hoc_ema_merge_for_output(target_name, output_dir, merge_output_dir)
 
     def open_lora_merge_tool_dialog() -> None:
-        musubi_python = runtime_config.musubi_python
-        if musubi_python is None or not musubi_python.is_file():
-            messagebox.showerror(
-                "Merge unavailable",
-                "App venv Python was not found. Run Setup.bat first.",
-                parent=root,
-            )
-            return
-
-        module_script = runtime_config.musubi_dir / "src" / "musubi_tuner" / "lora_post_hoc_ema.py"
-        root_script = runtime_config.musubi_dir / "lora_post_hoc_ema.py"
-        if not module_script.exists() and not root_script.exists():
-            messagebox.showerror(
-                "Merge unavailable",
-                "Could not find lora_post_hoc_ema.py in Musubi-Tuner.",
-                parent=root,
-            )
-            return
-
-        dialog = tk.Toplevel(root)
-        dialog.withdraw()
-        dialog.title("LoRA Post-Hoc EMA Merge")
-        dialog.transient(root)
-        dialog.grab_set()
-        dialog.configure(bg=bg_panel)
-        dialog.resizable(False, False)
-        dialog.columnconfigure(0, weight=1)
-        dialog.rowconfigure(0, weight=1)
-        set_dark_title_bar(dialog)
-
-        candidate_loras: list[Path] = []
-        merge_loras: list[Path] = []
-
-        frame = ttk.Frame(dialog, padding=10)
-        frame.grid(row=0, column=0, sticky="nsew")
-        frame.columnconfigure(0, weight=1)
-        frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(0, weight=1)
-
-        candidate_section = ttk.LabelFrame(frame, text="LoRAs", padding=8)
-        candidate_section.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        candidate_section.columnconfigure(0, weight=1)
-        candidate_section.rowconfigure(0, weight=1)
-
-        candidate_list = tk.Listbox(
-            candidate_section,
-            selectmode="extended",
-            exportselection=False,
-            height=10,
-            activestyle="none",
-            bg="#1f1f1f",
-            fg=fg_text,
-            highlightthickness=1,
-            highlightbackground=border_dark,
-            selectbackground="#2f4f66",
-            selectforeground="#ffffff",
-            relief="flat",
-        )
-        candidate_list.grid(row=0, column=0, sticky="nsew")
-        candidate_scroll = ttk.Scrollbar(
-            candidate_section,
-            orient="vertical",
-            command=candidate_list.yview,
-            style="Dark.Vertical.TScrollbar",
-        )
-        candidate_scroll.grid(row=0, column=1, sticky="ns")
-        candidate_list.configure(yscrollcommand=candidate_scroll.set)
-
-        merge_section = ttk.LabelFrame(frame, text="Merge order", padding=8)
-        merge_section.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        merge_section.columnconfigure(0, weight=1)
-        merge_section.rowconfigure(0, weight=1)
-
-        merge_list = tk.Listbox(
-            merge_section,
-            selectmode="extended",
-            exportselection=False,
-            height=10,
-            activestyle="none",
-            bg="#1f1f1f",
-            fg=fg_text,
-            highlightthickness=1,
-            highlightbackground=border_dark,
-            selectbackground="#2f4f66",
-            selectforeground="#ffffff",
-            relief="flat",
-        )
-        merge_list.grid(row=0, column=0, sticky="nsew")
-        merge_scroll = ttk.Scrollbar(
-            merge_section,
-            orient="vertical",
-            command=merge_list.yview,
-            style="Dark.Vertical.TScrollbar",
-        )
-        merge_scroll.grid(row=0, column=1, sticky="ns")
-        merge_list.configure(yscrollcommand=merge_scroll.set)
-
-        mode_section = ttk.LabelFrame(frame, text="Merge options", padding=8)
-        mode_section.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        mode_section.columnconfigure(0, weight=1)
-        mode_section.columnconfigure(1, weight=1)
-
-        ttk.Label(
-            mode_section,
-            text="Post-Hoc EMA smooths checkpoints from the same run into one more stable LoRA.",
-        ).grid(row=0, column=0, columnspan=2, sticky="w")
-
-        mode_beta_var = tk.BooleanVar(value=False)
-        mode_beta2_var = tk.BooleanVar(value=False)
-        mode_sigma_var = tk.BooleanVar(value=False)
-        preset_balanced_var = tk.BooleanVar(value=False)
-        preset_smooth_var = tk.BooleanVar(value=False)
-        preset_anti_overfit_var = tk.BooleanVar(value=False)
-
-        preset_section = ttk.LabelFrame(mode_section, text="Preset(s)", padding=6)
-        preset_section.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(8, 0))
-        attach_hover_tooltip(preset_section, merge_preset_tooltip_text)
-        ttk.Checkbutton(preset_section, text="Balanced", variable=preset_balanced_var).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(preset_section, text="Smooth", variable=preset_smooth_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(preset_section, text="Anti-overfit", variable=preset_anti_overfit_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
-
-        mode_group = ttk.LabelFrame(mode_section, text="Mode(s)", padding=6)
-        mode_group.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(8, 0))
-        attach_hover_tooltip(mode_group, merge_mode_tooltip_text)
-        ttk.Checkbutton(mode_group, text="BETA (Default)", variable=mode_beta_var).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(mode_group, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(mode_group, text="SIGMA_REL", variable=mode_sigma_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
-
-        output_name_var = tk.StringVar(value="merged_lora")
-        output_dir_var = tk.StringVar(value="")
-
-        ttk.Label(mode_section, text="Output name:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Entry(mode_section, textvariable=output_name_var, style="Flat.TEntry").grid(row=2, column=1, sticky="ew", pady=(8, 0))
-
-        ttk.Label(mode_section, text="Output folder:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Label(mode_section, textvariable=output_dir_var, style="PathDisplay.TLabel", anchor="w", padding=(6, 4)).grid(
-            row=3,
-            column=1,
-            sticky="ew",
-            pady=(8, 0),
-        )
-
-        actions = ttk.Frame(frame)
-        actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        actions.columnconfigure(0, weight=1)
-
-        def refresh_candidate_list() -> None:
-            candidate_list.delete(0, "end")
-            for path in candidate_loras:
-                candidate_list.insert("end", path.name)
-
-        def refresh_merge_list() -> None:
-            merge_list.delete(0, "end")
-            for path in merge_loras:
-                merge_list.insert("end", path.name)
-
-        def _normalize_lora_paths(raw_paths: list[str]) -> list[Path]:
-            normalized: list[Path] = []
-            for raw_path in raw_paths:
-                value = raw_path.strip().strip('"')
-                if not value:
-                    continue
-                path = Path(value).expanduser()
-                if not path.exists() or not path.is_file() or path.suffix.lower() != ".safetensors":
-                    continue
-                normalized.append(path)
-            return normalized
-
-        def add_loras_to_candidate_pool(paths: list[Path]) -> int:
-            if not paths:
-                return 0
-            existing = {str(path.resolve()) for path in candidate_loras}
-            added = 0
-            for path in paths:
-                key = str(path.resolve())
-                if key in existing:
-                    continue
-                candidate_loras.append(path)
-                existing.add(key)
-                added += 1
-
-            if added > 0:
-                candidate_loras.sort(key=lambda p: p.name.lower())
-                refresh_candidate_list()
-            return added
-
-        def add_paths_to_merge_list(paths: list[Path]) -> int:
-            if not paths:
-                return 0
-            existing = {str(path.resolve()) for path in merge_loras}
-            added = 0
-            for path in paths:
-                key = str(path.resolve())
-                if key in existing:
-                    continue
-                merge_loras.append(path)
-                existing.add(key)
-                added += 1
-
-            if added > 0:
-                if merge_loras and not output_dir_var.get().strip():
-                    output_dir_var.set(str(merge_loras[0].parent))
-                refresh_merge_list()
-            return added
-
-        def add_raw_paths(raw_paths: list[str], to_merge: bool = False) -> int:
-            paths = _normalize_lora_paths(raw_paths)
-            if not paths:
-                return 0
-            add_loras_to_candidate_pool(paths)
-            return add_paths_to_merge_list(paths) if to_merge else len(paths)
-
-        def add_loras_to_pool() -> None:
-            initial_dir = str(runtime_config.training_dir)
-            if candidate_loras:
-                initial_dir = str(candidate_loras[-1].parent)
-            picked = filedialog.askopenfilenames(
-                parent=dialog,
-                title="Select LoRA files",
-                initialdir=initial_dir,
-                filetypes=[("Safetensors", "*.safetensors"), ("All files", "*.*")],
-            )
-            if not picked:
-                return
-
-            add_raw_paths([str(p) for p in picked], to_merge=False)
-
-        def add_to_merge_list() -> None:
-            raw_selected_indices = list(candidate_list.curselection())
-            if not raw_selected_indices:
-                return
-
-            selected_indices: list[int] = []
-            for raw_index in raw_selected_indices:
-                try:
-                    index = int(raw_index)
-                except (TypeError, ValueError):
-                    continue
-                if 0 <= index < len(candidate_loras):
-                    selected_indices.append(index)
-
-            if not selected_indices:
-                return
-
-            selected_paths = [candidate_loras[index] for index in selected_indices]
-            add_paths_to_merge_list(selected_paths)
-
-        def on_candidate_double_click(event: tk.Event) -> str:
-            # Only treat double-clicks on an actual item row as "add to merge".
-            clicked_index = candidate_list.nearest(event.y)
-            if clicked_index < 0 or clicked_index >= len(candidate_loras):
-                return "break"
-
-            row_bbox = candidate_list.bbox(clicked_index)
-            if row_bbox is None:
-                return "break"
-            _x, y, _w, h = row_bbox
-            if not (y <= event.y < y + h):
-                return "break"
-
-            candidate_list.selection_clear(0, "end")
-            candidate_list.selection_set(clicked_index)
-            candidate_list.activate(clicked_index)
-            add_to_merge_list()
-            return "break"
-
-        def try_enable_file_dnd() -> bool:
-            if not tkdnd_available or DND_FILES is None:
-                return False
-
-            def process_drop_on_ui_thread(raw_paths: list[str], to_merge: bool, target_name: str) -> None:
-                if not dialog.winfo_exists():
-                    return
-
-                def _apply_drop() -> None:
-                    try:
-                        added = add_raw_paths(raw_paths, to_merge=to_merge)
-                        if added > 0:
-                            destination = "merge list" if to_merge else "pool"
-                            log(f"[LoRA Post-Hoc EMA Merge] Added {added} dropped LoRA file(s) to {destination}.")
-                    except Exception as exc:
-                        log(f"[LoRA Post-Hoc EMA Merge] Drop handling failed on {target_name}: {exc}")
-
-                dialog.after(0, _apply_drop)
-
-            def decode_dropped_paths(event_data: str) -> list[str]:
-                if not event_data:
-                    return []
-                try:
-                    split_values = dialog.tk.splitlist(event_data)
-                except Exception:
-                    split_values = [event_data]
-                return [str(item) for item in split_values if str(item).strip()]
-
-            def on_drop_to_pool(event: tk.Event) -> str:
-                raw_paths = decode_dropped_paths(str(getattr(event, "data", "")))
-                process_drop_on_ui_thread(raw_paths, to_merge=False, target_name="LoRAs")
-                return "break"
-
-            def on_drop_to_merge(event: tk.Event) -> str:
-                raw_paths = decode_dropped_paths(str(getattr(event, "data", "")))
-                process_drop_on_ui_thread(raw_paths, to_merge=True, target_name="Merge order")
-                return "break"
-
-            try:
-                candidate_list.drop_target_register(DND_FILES)
-                candidate_list.dnd_bind("<<Drop>>", on_drop_to_pool)
-                merge_list.drop_target_register(DND_FILES)
-                merge_list.dnd_bind("<<Drop>>", on_drop_to_merge)
-                return True
-            except Exception:
-                return False
-
-        def remove_from_merge_list() -> None:
-            selected_indices = list(merge_list.curselection())
-            if not selected_indices:
-                return
-            for index in reversed(selected_indices):
-                merge_loras.pop(index)
-            refresh_merge_list()
-
-        def move_merge_up() -> None:
-            selected_indices = list(merge_list.curselection())
-            if not selected_indices or selected_indices[0] == 0:
-                return
-            for index in selected_indices:
-                merge_loras[index - 1], merge_loras[index] = merge_loras[index], merge_loras[index - 1]
-            refresh_merge_list()
-            for index in [i - 1 for i in selected_indices]:
-                merge_list.selection_set(index)
-
-        def move_merge_down() -> None:
-            selected_indices = list(merge_list.curselection())
-            if not selected_indices or selected_indices[-1] >= len(merge_loras) - 1:
-                return
-            for index in reversed(selected_indices):
-                merge_loras[index + 1], merge_loras[index] = merge_loras[index], merge_loras[index + 1]
-            refresh_merge_list()
-            for index in [i + 1 for i in selected_indices]:
-                merge_list.selection_set(index)
-
-        def clear_merge_list() -> None:
-            merge_loras.clear()
-            refresh_merge_list()
-
-        def browse_output_folder() -> None:
-            picked = filedialog.askdirectory(parent=dialog, title="Select output folder")
-            if picked:
-                output_dir_var.set(picked)
-
-        def resolve_output_base() -> tuple[Path, str] | None:
-            output_name = output_name_var.get().strip()
-            if not output_name:
-                messagebox.showerror("Missing value", "Output name is required.", parent=dialog)
-                return None
-
-            output_folder_raw = output_dir_var.get().strip()
-            if not output_folder_raw:
-                messagebox.showerror("Missing value", "Output folder is required.", parent=dialog)
-                return None
-
-            output_folder = Path(output_folder_raw).expanduser()
-            try:
-                output_folder.mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                messagebox.showerror("Invalid folder", f"Could not use output folder:\n{exc}", parent=dialog)
-                return None
-
-            output_name = output_name[:-12] if output_name.lower().endswith(".safetensors") else output_name
-            return output_folder, output_name
-
-        def build_output_path(output_folder: Path, output_name: str, mode_suffix: str, preset_name: str) -> Path:
-            preset_token = merge_preset_file_token(preset_name)
-            return output_folder / f"{output_name}_{mode_suffix}_{preset_token}.safetensors"
-
-        def run_merge() -> None:
-            if len(merge_loras) < 2:
-                messagebox.showerror("Merge unavailable", "Add at least 2 LoRAs to merge list.", parent=dialog)
-                return
-
-            selected_preset_names: list[str] = []
-            if preset_balanced_var.get():
-                selected_preset_names.append("Balanced")
-            if preset_smooth_var.get():
-                selected_preset_names.append("Smooth")
-            if preset_anti_overfit_var.get():
-                selected_preset_names.append("Anti-overfit")
-            if not selected_preset_names:
-                messagebox.showerror("Merge unavailable", "Select at least one preset.", parent=dialog)
-                return
-
-            mode_defs: list[tuple[str, str, str]] = []
-            if mode_beta_var.get():
-                mode_defs.append(("BETA", "Beta", "beta"))
-            if mode_beta2_var.get():
-                mode_defs.append(("BETA2", "Beta2", "beta2"))
-            if mode_sigma_var.get():
-                mode_defs.append(("SIGMA_REL", "Sigma", "sigma_rel"))
-            if not mode_defs:
-                messagebox.showerror("Merge unavailable", "Select at least one merge mode.", parent=dialog)
-                return
-
-            output_base = resolve_output_base()
-            if output_base is None:
-                return
-            output_folder, output_name = output_base
-
-            selected_jobs: list[tuple[str, str, list[str], str]] = []
-            for preset_name in selected_preset_names:
-                preset_args = post_hoc_ema_mode_args_for_preset(preset_name)
-                for mode_label, mode_suffix, mode_key in mode_defs:
-                    selected_jobs.append((mode_label, mode_suffix, preset_args[mode_key], preset_name))
-
-            existing_outputs: list[Path] = []
-            for _merge_mode_label, merge_mode_suffix, _merge_mode_args, preset_name in selected_jobs:
-                candidate = build_output_path(output_folder, output_name, merge_mode_suffix, preset_name)
-                if candidate.exists():
-                    existing_outputs.append(candidate)
-            if existing_outputs:
-                existing_text = "\n".join(str(path) for path in existing_outputs)
-                messagebox.showerror(
-                    "Name already exists",
-                    f"One or more output files already exist:\n{existing_text}\n\nChoose a different output name.",
-                    parent=dialog,
-                )
-                return
-
-            selected_files = [str(path) for path in merge_loras]
-
-            run_env = os.environ.copy()
-            musubi_src = str(runtime_config.musubi_dir / "src")
-            existing_pythonpath = run_env.get("PYTHONPATH", "")
-            run_env["PYTHONPATH"] = musubi_src if not existing_pythonpath else f"{musubi_src}{os.pathsep}{existing_pythonpath}"
-
-            log("")
-            created_paths: list[Path] = []
-            for merge_mode_label, merge_mode_suffix, merge_mode_args, preset_name in selected_jobs:
-                output_path = build_output_path(output_folder, output_name, merge_mode_suffix, preset_name)
-                command: list[str]
-                if module_script.exists():
-                    command = [
-                        str(musubi_python),
-                        "-m",
-                        "musubi_tuner.lora_post_hoc_ema",
-                        *selected_files,
-                        "--output_file",
-                        str(output_path),
-                        "--no_sort",
-                        *merge_mode_args,
-                    ]
-                else:
-                    command = [
-                        str(musubi_python),
-                        str(root_script),
-                        *selected_files,
-                        "--output_file",
-                        str(output_path),
-                        "--no_sort",
-                        *merge_mode_args,
-                    ]
-
-                log(
-                    f"[LoRA Post-Hoc EMA Merge] Merging {len(selected_files)} LoRA(s) "
-                    f"using {merge_mode_label} / {preset_name}..."
-                )
-                log(f"[LoRA Post-Hoc EMA Merge] Output: {output_path}")
-
-                result = subprocess.run(
-                    command,
-                    cwd=str(runtime_config.musubi_dir),
-                    env=run_env,
-                    capture_output=True,
-                    text=True,
-                )
-
-                if result.stdout.strip():
-                    log(result.stdout.strip())
-
-                if result.returncode != 0:
-                    log(
-                        f"[LoRA Post-Hoc EMA Merge] Failed ({result.returncode}) "
-                        f"while running {merge_mode_label} / {preset_name}."
-                    )
-                    if result.stderr.strip():
-                        log(result.stderr.strip())
-                    messagebox.showerror(
-                        "Merge failed",
-                        result.stderr.strip() or "lora_post_hoc_ema.py failed with no error output.",
-                        parent=dialog,
-                    )
-                    return
-
-                if result.stderr.strip():
-                    log(result.stderr.strip())
-                log(f"[LoRA Post-Hoc EMA Merge] Created ({merge_mode_suffix} / {preset_name}): {output_path}")
-                created_paths.append(output_path)
-
-            created_text = "\n".join(str(path) for path in created_paths)
-            messagebox.showinfo("Merge complete", f"Created:\n{created_text}", parent=dialog)
-
-        candidate_list.bind("<Double-Button-1>", on_candidate_double_click)
-
-        candidate_actions = ttk.Frame(candidate_section)
-        candidate_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Button(candidate_actions, text="Add LoRA", command=add_loras_to_pool).grid(row=0, column=0, padx=(0, 8), sticky="w")
-        ttk.Button(candidate_actions, text="Add to Merge List >>", command=add_to_merge_list).grid(row=0, column=1, sticky="w")
-
-        dnd_enabled = try_enable_file_dnd()
-        dnd_hint = (
-            "Tip: Drag .safetensors files onto LoRAs or Merge order lists."
-            if dnd_enabled
-            else "Tip: Drag-and-drop requires tkinterdnd2 in app Python (pip install tkinterdnd2). Use Add LoRA for now."
-        )
-        ttk.Label(candidate_section, text=dnd_hint, style="Dim.TLabel", wraplength=320).grid(
-            row=2,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            pady=(8, 0),
-        )
-
-        merge_actions = ttk.Frame(merge_section)
-        merge_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Button(merge_actions, text="Remove", command=remove_from_merge_list).grid(row=0, column=0, padx=(0, 6))
-        ttk.Button(merge_actions, text="Up", command=move_merge_up).grid(row=0, column=1, padx=(0, 6))
-        ttk.Button(merge_actions, text="Down", command=move_merge_down).grid(row=0, column=2, padx=(0, 6))
-        ttk.Button(merge_actions, text="Clear", command=clear_merge_list).grid(row=0, column=3)
-
-        ttk.Button(mode_section, text="Browse", command=browse_output_folder).grid(row=6, column=2, padx=(8, 0), pady=(8, 0))
-
-        ttk.Button(actions, text="Close", command=dialog.destroy).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(actions, text="Go", command=run_merge).grid(row=0, column=2)
-
-        dialog.geometry("820x620")
-        center_window(dialog)
-        dialog.deiconify()
-        root.wait_window(dialog)
+        _lora_merge_window().open_lora_merge_tool_dialog()
 
     def archive_root_dir() -> Path:
         return datasets_root_dir().parent / "Archives"
@@ -4388,8 +2103,17 @@ def launch_ui() -> int:
         cols_w = COLS * (THUMB_PX + 24) + 44
         win_w = max(cols_w, 420)
         win_h = min(700, max(380, (len(archived_names) // COLS + 1) * (THUMB_PX + 60) + 120))
-        dialog.geometry(f"{win_w}x{win_h}")
-        center_window(dialog)
+
+        # Keep the dialog fully visible on smaller displays before centering.
+        screen_w = dialog.winfo_screenwidth()
+        screen_h = dialog.winfo_screenheight()
+        win_w = min(win_w, max(420, screen_w - 40))
+        win_h = min(win_h, max(320, screen_h - 80))
+
+        # Center using the final geometry dimensions (not requested size), then show.
+        pos_x = max(0, (screen_w - win_w) // 2)
+        pos_y = max(0, (screen_h - win_h) // 2)
+        dialog.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
         dialog.deiconify()
         root.wait_window(dialog)
 
@@ -5022,20 +2746,20 @@ def launch_ui() -> int:
             "save_every_n_steps": str(
                 get_positive_int_setting(
                     settings_state,
-                    TRAIN_SAVE_EVERY_N_STEPS_KEY,
+                    app_settings.TRAIN_SAVE_EVERY_N_STEPS_KEY,
                     DEFAULT_SAVE_EVERY_N_STEPS,
                     minimum=1,
                 )
             ),
-            "enable_compile": settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0"),
-            "enable_tf32": settings_state.get(ENABLE_CUDA_ALLOW_TF32_KEY, "1"),
-            "enable_cudnn": settings_state.get(ENABLE_CUDA_CUDNN_BENCHMARK_KEY, "1"),
-            "enable_fp8": settings_state.get(ENABLE_FP8_DIT_KEY, "0"),
-            "enable_gc": settings_state.get(ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY, "0"),
-            "enable_logging": bool_to_flag(is_truthy(settings_state.get(TRAIN_ENABLE_LOGGING_KEY), default=True)),
+            "enable_compile": settings_state.get(app_settings.ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0"),
+            "enable_tf32": settings_state.get(app_settings.ENABLE_CUDA_ALLOW_TF32_KEY, "1"),
+            "enable_cudnn": settings_state.get(app_settings.ENABLE_CUDA_CUDNN_BENCHMARK_KEY, "1"),
+            "enable_fp8": settings_state.get(app_settings.ENABLE_FP8_DIT_KEY, "0"),
+            "enable_gc": settings_state.get(app_settings.ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY, "0"),
+            "enable_logging": bool_to_flag(is_truthy(settings_state.get(app_settings.TRAIN_ENABLE_LOGGING_KEY), default=True)),
             "tracker_name": training_name,
-            "stream_output": bool_to_flag(is_truthy(settings_state.get(TRAIN_STREAM_TO_LOGGER_KEY), default=False)),
-            "auto_cleanup": bool_to_flag(is_truthy(settings_state.get(TRAIN_AUTO_CLEANUP_STATES_KEY), default=True)),
+            "stream_output": bool_to_flag(is_truthy(settings_state.get(app_settings.TRAIN_STREAM_TO_LOGGER_KEY), default=False)),
+            "auto_cleanup": bool_to_flag(is_truthy(settings_state.get(app_settings.TRAIN_AUTO_CLEANUP_STATES_KEY), default=True)),
             "hold": "0",
             "status": "queued",
         }
@@ -5428,7 +3152,7 @@ def launch_ui() -> int:
                 training_name=new_name,
                 datasets=dup_datasets,
                 resolution=resolution_value,
-                default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+                default_caption_keyword=settings_state.get(app_settings.DEFAULT_CAPTION_KEYWORD_KEY, ""),
                 model_name=source.get("model", ""),
             )
         except Exception as exc:
@@ -5634,1496 +3358,79 @@ def launch_ui() -> int:
         queue_drag_allowed = False
 
     def open_create_job_dialog(existing_job: dict[str, str] | None = None) -> None:
-        if existing_job is None:
-            selected = selected_dataset_names()
-            if not selected:
-                messagebox.showinfo("No source dataset selected", "Select at least one dataset card first.", parent=root)
-                return
-            initial_datasets: list[dict] = [{"name": n, "num_repeats": 1} for n in selected]
-            dataset_name = selected[0]
-        else:
-            dataset_name = existing_job.get("dataset_name", "").strip()
-            if not dataset_name:
-                messagebox.showerror("Invalid job", "Job has no dataset name.", parent=root)
-                return
-            raw_datasets = existing_job.get("datasets_json", "")
-            if raw_datasets:
-                try:
-                    initial_datasets = json.loads(raw_datasets)
-                except Exception:
-                    initial_datasets = [{"name": dataset_name, "num_repeats": 1}]
-            else:
-                initial_datasets = [{"name": dataset_name, "num_repeats": 1}]
-
-        dialog = tk.Toplevel(root)
-        dialog.withdraw()
-        dialog.title("Edit Job" if existing_job is not None else "Create Job")
-        dialog.transient(root)
-        dialog.grab_set()
-        dialog.configure(bg=bg_panel)
-        dialog.resizable(False, False)
-        set_dark_title_bar(dialog)
-
-        dialog.columnconfigure(0, weight=1)
-        dialog.rowconfigure(0, weight=1)
-
-        outer = ttk.Frame(dialog, padding=10)
-        outer.grid(row=0, column=0, sticky="nsew")
-        outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(1, weight=1)
-
-        # ── Header: LoRA name + model ──────────────────────────────────────
-        header_frame = ttk.Frame(outer)
-        header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        header_frame.columnconfigure(1, weight=1)
-
-        def _fit_create_job_dialog_to_content() -> None:
-            if not dialog.winfo_exists():
-                return
-            dialog.update_idletasks()
-            target_width = max(740, dialog.winfo_reqwidth())
-            target_height = dialog.winfo_reqheight()
-            if dialog.state() == "withdrawn":
-                dialog.geometry(f"{target_width}x{target_height}")
-            else:
-                pos_x = dialog.winfo_x()
-                pos_y = dialog.winfo_y()
-                dialog.geometry(f"{target_width}x{target_height}+{pos_x}+{pos_y}")
-
-        _model_to_family: dict[str, str] = {
-            mn: fam
-            for fam, models in DOWNLOAD_MODEL_FAMILIES.items()
-            for mn in models
+        from .ui.windows import create_job_window
+        dependencies = {
+            "DEFAULT_CAPTION_KEYWORD_KEY": app_settings.DEFAULT_CAPTION_KEYWORD_KEY,
+            "DEFAULT_LEARNING_RATE": DEFAULT_LEARNING_RATE,
+            "DEFAULT_NETWORK_ALPHA": DEFAULT_NETWORK_ALPHA,
+            "DEFAULT_NETWORK_DIM": DEFAULT_NETWORK_DIM,
+            "DEFAULT_PRODIGY_OPTIMIZER_ARGS": DEFAULT_PRODIGY_OPTIMIZER_ARGS,
+            "DEFAULT_RESOLUTION": DEFAULT_RESOLUTION,
+            "DEFAULT_SAVE_EVERY_N_STEPS": DEFAULT_SAVE_EVERY_N_STEPS,
+            "DEFAULT_TRAIN_STEPS": DEFAULT_TRAIN_STEPS,
+            "DOWNLOAD_MODEL_DISPLAY_NAMES": DOWNLOAD_MODEL_DISPLAY_NAMES,
+            "DOWNLOAD_MODEL_FAMILIES": DOWNLOAD_MODEL_FAMILIES,
+            "ENABLE_COMPILE_OPTIMIZATIONS_KEY": app_settings.ENABLE_COMPILE_OPTIMIZATIONS_KEY,
+            "ENABLE_CUDA_ALLOW_TF32_KEY": app_settings.ENABLE_CUDA_ALLOW_TF32_KEY,
+            "ENABLE_CUDA_CUDNN_BENCHMARK_KEY": app_settings.ENABLE_CUDA_CUDNN_BENCHMARK_KEY,
+            "ENABLE_FP8_DIT_KEY": app_settings.ENABLE_FP8_DIT_KEY,
+            "ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY": app_settings.ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY,
+            "KLEIN_DIT_KEY": app_settings.KLEIN_DIT_KEY,
+            "MODEL_PATHS_KEY": app_settings.MODEL_PATHS_KEY,
+            "OPTIMIZER_TYPE_CHOICES": OPTIMIZER_TYPE_CHOICES,
+            "PREFERRED_PRESETS_BY_FAMILY_KEY": app_settings.PREFERRED_PRESETS_BY_FAMILY_KEY,
+            "RESOLUTION_CHOICES": RESOLUTION_CHOICES,
+            "TRAIN_AUTO_CLEANUP_STATES_KEY": app_settings.TRAIN_AUTO_CLEANUP_STATES_KEY,
+            "TRAIN_DIM_ALPHA_CHOICES": TRAIN_DIM_ALPHA_CHOICES,
+            "TRAIN_ENABLE_LOGGING_KEY": app_settings.TRAIN_ENABLE_LOGGING_KEY,
+            "TRAIN_LOG_TRACKER_NAME_KEY": app_settings.TRAIN_LOG_TRACKER_NAME_KEY,
+            "TRAIN_SAVE_EVERY_N_STEPS_KEY": app_settings.TRAIN_SAVE_EVERY_N_STEPS_KEY,
+            "TRAIN_STREAM_TO_LOGGER_KEY": app_settings.TRAIN_STREAM_TO_LOGGER_KEY,
+            "apply_card_style": apply_card_style,
+            "attach_hover_tooltip": attach_hover_tooltip,
+            "backend_is_valid": backend_is_valid,
+            "backend_kind_for_model": backend_kind_for_model,
+            "bg_panel": bg_panel,
+            "bool_to_flag": bool_to_flag,
+            "card_frame_by_name": card_frame_by_name,
+            "center_window": center_window,
+            "configured_backend_dirs": configured_backend_dirs,
+            "dataset_image_files": dataset_image_files,
+            "datasets_root_dir": datasets_root_dir,
+            "detect_job_element_base_mismatch": detect_job_element_base_mismatch,
+            "detect_job_status": detect_job_status,
+            "ensure_training_job_structure": ensure_training_job_structure,
+            "flag_to_bool": flag_to_bool,
+            "get_positive_int_setting": get_positive_int_setting,
+            "is_truthy": is_truthy,
+            "is_valid_folder_name": is_valid_folder_name,
+            "job_preset_file_path": job_preset_file_path,
+            "job_queue": job_queue,
+            "load_job_presets_from_disk": load_job_presets_from_disk,
+            "load_job_queue_from_disk": load_job_queue_from_disk,
+            "log": log,
+            "refresh_job_queue_list": refresh_job_queue_list,
+            "rename_job_elements_to_training_name": rename_job_elements_to_training_name,
+            "root": root,
+            "save_job_order": save_job_order,
+            "save_job_preset_to_disk": save_job_preset_to_disk,
+            "save_job_to_disk": save_job_to_disk,
+            "scan_training_folders": scan_training_folders,
+            "selected_dataset_names": selected_dataset_names,
+            "set_dark_title_bar": set_dark_title_bar,
+            "settings_state": settings_state,
+            "training_job_dir_path": training_job_dir_path,
+            "update_start_button_state": update_start_button_state,
+            "vars_by_name": vars_by_name,
+            "messagebox": messagebox,
+            "simpledialog": simpledialog,
+            "tk": tk,
+            "ttk": ttk,
+            "json": json,
+            "Path": Path,
+            "shutil": shutil,
         }
-
-        _KLEIN_MODELS = {"klein-base-9b", "klein-9b", "klein-base-4b", "klein-4b"}
-
-        def _family_label(mn: str) -> str:
-            if mn in _KLEIN_MODELS:
-                return "Klein"
-            fam = _model_to_family.get(mn, "")
-            if fam == "FLUX.2":
-                return "Flux2"
-            return fam or mn
-
-        model_var = tk.StringVar(value=(existing_job or {}).get("model", "klein-base-9b"))
-        ltx_mode_var = tk.StringVar(value=(existing_job or {}).get("ltx_mode", "video"))
-        default_job_name = f"{dataset_name}_{_family_label(model_var.get())}"
-        if existing_job is not None:
-            default_job_name = existing_job.get("job_name", default_job_name)
-        job_name_var = tk.StringVar(value=default_job_name)
-        _job_name_user_edited = [existing_job is not None]  # track manual edits
-
-        # Build available model list from saved paths
-        import json as _json_cj
-        _mpaths_cj: dict[str, dict[str, str]] = {}
-        try:
-            _mpaths_cj = _json_cj.loads(settings_state.get(MODEL_PATHS_KEY, "{}"))
-        except Exception:
-            pass
-        _all_mn = [mn for fam in DOWNLOAD_MODEL_FAMILIES.values() for mn in fam]
-        _backend_dirs = configured_backend_dirs()
-
-        def _backend_ready_for_model(mn: str) -> bool:
-            kind = backend_kind_for_model(mn)
-            path = _backend_dirs.get(kind)
-            if path is None:
-                return False
-            return backend_is_valid(kind, path)
-
-        def _model_has_saved_path(mn: str) -> bool:
-            return bool(str(_mpaths_cj.get(mn, {}).get("dit", "")).strip())
-
-        _backend_blocked_models = [
-            mn for mn in _all_mn
-            if _model_has_saved_path(mn) and not _backend_ready_for_model(mn)
-        ]
-
-        _avail_models = [
-            mn for mn in _all_mn
-            if _mpaths_cj.get(mn, {}).get("dit") and _backend_ready_for_model(mn)
-        ]
-        # Backward compat: legacy klein key
-        if not _avail_models and settings_state.get(KLEIN_DIT_KEY, "").strip() and _backend_ready_for_model("klein-base-9b"):
-            _avail_models = ["klein-base-9b"]
-        if not _avail_models:
-            _avail_models = [mn for mn in _all_mn if _backend_ready_for_model(mn)]
-        if not _avail_models:
-            messagebox.showinfo(
-                "No models available",
-                (
-                    "Models were found, but their required kohya-ss backend is not ready.\n\n"
-                    "Configure Musubi Main and/or Musubi LTX in Settings."
-                    if _backend_blocked_models
-                    else "No model backend is currently available for Jobs.\n\n"
-                    "Configure Musubi Main and/or Musubi LTX in Settings."
-                ),
-                parent=root,
-            )
-            dialog.destroy()
-            return
-        if model_var.get() not in _avail_models:
-            model_var.set(_avail_models[0])
-        _display_values = [DOWNLOAD_MODEL_DISPLAY_NAMES.get(mn, mn) for mn in _avail_models]
-        _ltx_mode_display_to_value = {"Image Training": "video"}
-        _ltx_mode_value_to_display = {
-            value: key for key, value in _ltx_mode_display_to_value.items()
-        }
-        _ltx_image_lora_target_choices = (
-            "t2v",
-            "v2v",
-            "video_sa",
-            "video_sa_ff",
-            "video_sa_ca_ff",
-            "full",
-            "lycoris",
-        )
-
-        def _normalize_ltx_mode_ui(value: str) -> str:
-            mode = (value or "video").strip().lower()
-            if mode in {"video", "v", "image"}:
-                return "video"
-            if mode in {"av", "va"}:
-                return "av"
-            if mode in {"audio", "a"}:
-                return "audio"
-            return "video"
-
-        ltx_mode_var.set(_normalize_ltx_mode_ui(ltx_mode_var.get()))
-
-        _preferred_presets_raw = settings_state.get(PREFERRED_PRESETS_BY_FAMILY_KEY, "")
-        try:
-            _preferred_presets_loaded = json.loads(_preferred_presets_raw) if _preferred_presets_raw else {}
-        except Exception:
-            _preferred_presets_loaded = {}
-        preferred_preset_by_family: dict[str, str] = {}
-        if isinstance(_preferred_presets_loaded, dict):
-            preferred_preset_by_family = {
-                str(k): str(v)
-                for k, v in _preferred_presets_loaded.items()
-                if isinstance(k, str) and isinstance(v, str)
-            }
-
-        ttk.Label(header_frame, text="LoRA name:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        _lora_name_entry = ttk.Entry(header_frame, textvariable=job_name_var, style="Flat.TEntry")
-        _lora_name_entry.grid(row=0, column=1, sticky="ew")
-        _lora_name_entry.bind("<Key>", lambda _e: _job_name_user_edited.__setitem__(0, True))
-        ttk.Label(header_frame, text="Model:").grid(row=0, column=2, sticky="w", padx=(12, 8))
-        _model_display_var = tk.StringVar(value=DOWNLOAD_MODEL_DISPLAY_NAMES.get(model_var.get(), model_var.get()))
-
-        def _on_model_display_change(*_a: object) -> None:
-            disp = _model_display_var.get()
-            for mn, dn in DOWNLOAD_MODEL_DISPLAY_NAMES.items():
-                if dn == disp:
-                    model_var.set(mn)
-                    break
-            else:
-                model_var.set(disp)
-            # Auto-update job name suffix if the user hasn't manually edited it
-            if not _job_name_user_edited[0]:
-                current = job_name_var.get()
-                # Replace suffix after the last underscore with the new family label
-                base = current.rsplit("_", 1)[0] if "_" in current else current
-                job_name_var.set(f"{base}_{_family_label(model_var.get())}")
-            _sync_model_specific_controls()
-            _refresh_preset_combo()
-
-        _model_display_var.trace_add("write", _on_model_display_change)
-        ttk.Combobox(header_frame, textvariable=_model_display_var, values=_display_values, state="readonly", width=28).grid(row=0, column=3, sticky="w")
-
-        if _backend_blocked_models:
-            blocked_display = sorted(
-                {DOWNLOAD_MODEL_DISPLAY_NAMES.get(mn, mn) for mn in _backend_blocked_models},
-                key=lambda name: name.casefold(),
-            )
-            blocked_names = ", ".join(blocked_display)
-            warning_icon = ttk.Label(
-                header_frame,
-                text="⚠️",
-                foreground="#d8c07a",
-            )
-            warning_icon.grid(row=0, column=4, sticky="w", padx=(8, 0))
-            attach_hover_tooltip(
-                warning_icon,
-                (
-                    "Some configured models are hidden because the matching kohya-ss backend is not set.\n\n"
-                    f"Hidden models: {blocked_names}"
-                ),
-            )
-
-        # ── Create Job content ─────────────────────────────────────────────
-        training_tab = ttk.Frame(outer, padding=10)
-        training_tab.grid(row=1, column=0, sticky="nsew")
-        training_tab.columnconfigure(1, weight=1)
-        training_tab.columnconfigure(3, weight=1)
-
-        train_optimizer_var = tk.StringVar(
-            value=(existing_job or {}).get("optimizer_type", "prodigy")
-        )
-        train_optimizer_args_var = tk.StringVar(
-            value=(existing_job or {}).get("optimizer_args", "")
-        )
-        train_learning_rate_var = tk.StringVar(
-            value=(existing_job or {}).get("learning_rate", DEFAULT_LEARNING_RATE)
-        )
-        train_steps_var = tk.StringVar(
-            value=(existing_job or {}).get("train_steps", str(DEFAULT_TRAIN_STEPS))
-        )
-        _default_save_every_from_settings = str(
-            get_positive_int_setting(
-                settings_state,
-                TRAIN_SAVE_EVERY_N_STEPS_KEY,
-                DEFAULT_SAVE_EVERY_N_STEPS,
-                minimum=1,
-            )
-        )
-        train_save_every_var = tk.StringVar(
-            value=(existing_job or {}).get("save_every_n_steps", _default_save_every_from_settings)
-        )
-        train_network_dim_var = tk.StringVar(
-            value=(existing_job or {}).get("network_dim", str(DEFAULT_NETWORK_DIM))
-        )
-        train_network_alpha_var = tk.StringVar(
-            value=(existing_job or {}).get("network_alpha", str(DEFAULT_NETWORK_ALPHA))
-        )
-        lr_scheduler_var = tk.StringVar(value=(existing_job or {}).get("lr_scheduler", "constant"))
-        lr_warmup_steps_var = tk.StringVar(value=(existing_job or {}).get("lr_warmup_steps", "0"))
-        gradient_accumulation_steps_var = tk.StringVar(value=(existing_job or {}).get("gradient_accumulation_steps", "1"))
-        blocks_to_swap_var = tk.StringVar(value=(existing_job or {}).get("blocks_to_swap", "0"))
-        timestep_sampling_var = tk.StringVar(value=(existing_job or {}).get("timestep_sampling", "sigma"))
-        ltx_lora_target_preset_var = tk.StringVar(value=(existing_job or {}).get("ltx_lora_target_preset", "full"))
-        ltx_first_frame_conditioning_p_var = tk.StringVar(value=(existing_job or {}).get("ltx_first_frame_conditioning_p", "0.5"))
-        sd_unet_lr_var = tk.StringVar(value=(existing_job or {}).get("sd_unet_lr", ""))
-        sd_text_encoder_lr_var = tk.StringVar(value=(existing_job or {}).get("sd_text_encoder_lr", ""))
-
-        job_presets = load_job_presets_from_disk()
-        preset_none_label = "---------"
-        preset_name_var = tk.StringVar(value=preset_none_label)
-        compile_var = tk.BooleanVar(
-            value=flag_to_bool((existing_job or {}).get("enable_compile", bool_to_flag(is_truthy(settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY), default=False))))
-        )
-        tf32_var = tk.BooleanVar(
-            value=flag_to_bool((existing_job or {}).get("enable_tf32", bool_to_flag(is_truthy(settings_state.get(ENABLE_CUDA_ALLOW_TF32_KEY), default=True))))
-        )
-        cudnn_var = tk.BooleanVar(
-            value=flag_to_bool((existing_job or {}).get("enable_cudnn", bool_to_flag(is_truthy(settings_state.get(ENABLE_CUDA_CUDNN_BENCHMARK_KEY), default=True))))
-        )
-        fp8_var = tk.BooleanVar(
-            value=flag_to_bool((existing_job or {}).get("enable_fp8", bool_to_flag(is_truthy(settings_state.get(ENABLE_FP8_DIT_KEY), default=False))))
-        )
-        gc_var = tk.BooleanVar(
-            value=flag_to_bool((existing_job or {}).get("enable_gc", bool_to_flag(is_truthy(settings_state.get(ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY), default=False))))
-        )
-        sdxl_grad_ckpt_var = tk.BooleanVar(
-            value=flag_to_bool((existing_job or {}).get("enable_grad_ckpt", "1"))
-        )
-
-        def _collect_preset_values() -> dict[str, str]:
-            return {
-                "optimizer_type": train_optimizer_var.get().strip().lower(),
-                "optimizer_args": train_optimizer_args_var.get().strip(),
-                "learning_rate": train_learning_rate_var.get().strip(),
-                "train_steps": train_steps_var.get().strip(),
-                "save_every_n_steps": train_save_every_var.get().strip(),
-                "network_dim": train_network_dim_var.get().strip(),
-                "network_alpha": train_network_alpha_var.get().strip(),
-                "resolution": train_resolution_var.get().strip(),
-                "batch_size": train_batch_var.get().strip(),
-                "lr_scheduler": lr_scheduler_var.get().strip(),
-                "lr_warmup_steps": lr_warmup_steps_var.get().strip(),
-                "gradient_accumulation_steps": gradient_accumulation_steps_var.get().strip(),
-                "blocks_to_swap": blocks_to_swap_var.get().strip(),
-                "timestep_sampling": timestep_sampling_var.get().strip(),
-                "ltx_mode": _normalize_ltx_mode_ui(ltx_mode_var.get()),
-                "ltx_lora_target_preset": ltx_lora_target_preset_var.get().strip(),
-                "ltx_first_frame_conditioning_p": ltx_first_frame_conditioning_p_var.get().strip(),
-                "sd_unet_lr": sd_unet_lr_var.get().strip(),
-                "sd_text_encoder_lr": sd_text_encoder_lr_var.get().strip(),
-                "enable_compile": bool_to_flag(compile_var.get()),
-                "enable_tf32": bool_to_flag(tf32_var.get()),
-                "enable_cudnn": bool_to_flag(cudnn_var.get()),
-                "enable_fp8": bool_to_flag(fp8_var.get()),
-                "enable_gc": bool_to_flag(gc_var.get()),
-                "enable_grad_ckpt": bool_to_flag(sdxl_grad_ckpt_var.get()),
-            }
-
-        def _apply_preset_values(values: dict[str, str]) -> None:
-            if "optimizer_type" in values:
-                train_optimizer_var.set(values["optimizer_type"])
-            if "optimizer_args" in values:
-                train_optimizer_args_var.set(values["optimizer_args"])
-            if "learning_rate" in values:
-                train_learning_rate_var.set(values["learning_rate"])
-            if "train_steps" in values:
-                train_steps_var.set(values["train_steps"])
-            if "save_every_n_steps" in values:
-                train_save_every_var.set(values["save_every_n_steps"])
-            if "network_dim" in values:
-                train_network_dim_var.set(values["network_dim"])
-            if "network_alpha" in values:
-                train_network_alpha_var.set(values["network_alpha"])
-            if "resolution" in values:
-                train_resolution_var.set(values["resolution"])
-            if "batch_size" in values:
-                train_batch_var.set(values["batch_size"])
-            if "lr_scheduler" in values:
-                lr_scheduler_var.set(values["lr_scheduler"])
-            if "lr_warmup_steps" in values:
-                lr_warmup_steps_var.set(values["lr_warmup_steps"])
-            if "gradient_accumulation_steps" in values:
-                gradient_accumulation_steps_var.set(values["gradient_accumulation_steps"])
-            if "blocks_to_swap" in values:
-                blocks_to_swap_var.set(values["blocks_to_swap"])
-            if "timestep_sampling" in values:
-                timestep_sampling_var.set(values["timestep_sampling"])
-            if "ltx_mode" in values:
-                ltx_mode_var.set(_normalize_ltx_mode_ui(values["ltx_mode"]))
-            if "ltx_lora_target_preset" in values:
-                ltx_lora_target_preset_var.set(values["ltx_lora_target_preset"])
-            if "ltx_first_frame_conditioning_p" in values:
-                ltx_first_frame_conditioning_p_var.set(values["ltx_first_frame_conditioning_p"])
-            if "sd_unet_lr" in values:
-                sd_unet_lr_var.set(values["sd_unet_lr"])
-            if "sd_text_encoder_lr" in values:
-                sd_text_encoder_lr_var.set(values["sd_text_encoder_lr"])
-            if "enable_compile" in values:
-                compile_var.set(flag_to_bool(values["enable_compile"]))
-            if "enable_tf32" in values:
-                tf32_var.set(flag_to_bool(values["enable_tf32"]))
-            if "enable_cudnn" in values:
-                cudnn_var.set(flag_to_bool(values["enable_cudnn"]))
-            if "enable_fp8" in values:
-                fp8_var.set(flag_to_bool(values["enable_fp8"]))
-            if "enable_gc" in values:
-                gc_var.set(flag_to_bool(values["enable_gc"]))
-            if "enable_grad_ckpt" in values:
-                sdxl_grad_ckpt_var.set(flag_to_bool(values["enable_grad_ckpt"]))
-
-        def _preset_names_for_model(model_name: str) -> list[str]:
-            selected_family = _model_to_family.get(model_name, "")
-            names = {
-                str(payload.get("name", "")).strip()
-                for payload in job_presets.values()
-                if isinstance(payload, dict)
-                and (
-                    str(payload.get("family", "")).strip() == selected_family
-                    or str(payload.get("model", "")).strip() == model_name
-                    or (
-                        not str(payload.get("family", "")).strip()
-                        and _model_to_family.get(str(payload.get("model", "")).strip(), "") == selected_family
-                    )
-                )
-            }
-            return sorted([name for name in names if name], key=str.casefold)
-
-        def _preset_payload_for_model_name(model_name: str, preset_name: str) -> dict[str, object] | None:
-            selected_family = _model_to_family.get(model_name, "")
-            for payload in job_presets.values():
-                if not isinstance(payload, dict):
-                    continue
-                if str(payload.get("name", "")).strip() != preset_name:
-                    continue
-                payload_family = str(payload.get("family", "")).strip()
-                payload_model = str(payload.get("model", "")).strip()
-                if payload_family == selected_family:
-                    return payload
-                if payload_model == model_name:
-                    return payload
-                if not payload_family and _model_to_family.get(payload_model, "") == selected_family:
-                    return payload
-            return None
-
-        preset_section = ttk.LabelFrame(training_tab, text="Preset", padding=8)
-        preset_section.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 10))
-        preset_section.columnconfigure(1, weight=1)
-        ttk.Label(preset_section, text="Preset:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        preset_combo = ttk.Combobox(preset_section, textvariable=preset_name_var, state="readonly")
-        preset_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8))
-
-        def _refresh_preset_combo() -> None:
-            nonlocal job_presets
-            job_presets = load_job_presets_from_disk()
-            names = [preset_none_label] + _preset_names_for_model(model_var.get().strip())
-            preset_combo.configure(values=names)
-            if preset_name_var.get() not in names:
-                preset_name_var.set(preset_none_label)
-
-        def _on_preset_selected(*_args: object) -> None:
-            selected_name = preset_name_var.get().strip()
-            if selected_name == preset_none_label:
-                return
-            payload = _preset_payload_for_model_name(model_var.get().strip(), selected_name)
-            if not isinstance(payload, dict):
-                return
-            values = payload.get("values", {})
-            if isinstance(values, dict):
-                _apply_preset_values({str(k): str(v) for k, v in values.items() if isinstance(k, str)})
-                _sync_resolution_controls()
-                _sync_model_specific_controls()
-
-        preset_name_var.trace_add("write", _on_preset_selected)
-
-        def _save_preset() -> None:
-            current_model = model_var.get().strip()
-            current_family = _model_to_family.get(current_model, "") or current_model
-            initial_name = preset_name_var.get().strip()
-            if not initial_name or initial_name == preset_none_label:
-                initial_name = f"{current_family} preset"
-            preset_name = simpledialog.askstring(
-                "Save preset",
-                "Preset name:",
-                initialvalue=initial_name,
-                parent=dialog,
-            )
-            if preset_name is None:
-                return
-            preset_name = preset_name.strip()
-            if not preset_name:
-                messagebox.showerror("Invalid preset", "Preset name is required.", parent=dialog)
-                return
-            if _preset_payload_for_model_name(current_model, preset_name) is not None:
-                if not messagebox.askyesno(
-                    "Overwrite preset",
-                    f"Preset '{preset_name}' already exists for family {current_family}. Overwrite it?",
-                    parent=dialog,
-                ):
-                    return
-            save_job_preset_to_disk(current_model, current_family, preset_name, _collect_preset_values())
-            _refresh_preset_combo()
-            preset_name_var.set(preset_name)
-
-        def _reload_presets() -> None:
-            _refresh_preset_combo()
-
-        def _delete_preset() -> None:
-            selected_name = preset_name_var.get().strip()
-            if not selected_name or selected_name == preset_none_label:
-                messagebox.showerror("Delete preset", "Select a preset to delete.", parent=dialog)
-                return
-
-            current_model = model_var.get().strip()
-            payload = _preset_payload_for_model_name(current_model, selected_name)
-            if not isinstance(payload, dict):
-                messagebox.showerror("Delete preset", "Preset could not be found on disk.", parent=dialog)
-                return
-
-            payload_family = str(payload.get("family", "")).strip() or _model_to_family.get(current_model, "")
-            file_path_raw = str(payload.get("file", "")).strip()
-            target_path = Path(file_path_raw) if file_path_raw else job_preset_file_path(payload_family, selected_name)
-
-            if not messagebox.askyesno(
-                "Delete preset",
-                f"Delete preset '{selected_name}' for family {payload_family}?",
-                parent=dialog,
-            ):
-                return
-
-            try:
-                if target_path.exists():
-                    target_path.unlink()
-            except OSError as exc:
-                messagebox.showerror("Delete preset", f"Could not delete preset:\n{exc}", parent=dialog)
-                return
-
-            _refresh_preset_combo()
-            preset_name_var.set(preset_none_label)
-
-        _reload_preset_button = ttk.Button(preset_section, text="\u21bb", command=_reload_presets, width=3)
-        _reload_preset_button.grid(row=0, column=2, sticky="e")
-        _save_preset_button = ttk.Button(preset_section, text="Save preset", command=_save_preset)
-        _save_preset_button.grid(row=0, column=3, sticky="e", padx=(6, 0))
-        _delete_preset_button = ttk.Button(preset_section, text="\U0001F5D1", command=_delete_preset, width=3)
-        _delete_preset_button.grid(row=0, column=4, sticky="e", padx=(6, 0))
-        attach_hover_tooltip(_reload_preset_button, "Reload presets from disk")
-        attach_hover_tooltip(_delete_preset_button, "Delete selected preset")
-
-        def _attach_field_tooltip(label_widget: tk.Widget, input_widget: tk.Widget, text: str) -> None:
-            attach_hover_tooltip(label_widget, text)
-            attach_hover_tooltip(input_widget, text)
-
-        options = ttk.LabelFrame(training_tab, text="Training settings", padding=8)
-        options.grid(row=1, column=0, columnspan=4, sticky="ew")
-        options.columnconfigure(1, weight=1)
-        options.columnconfigure(3, weight=1)
-
-        _optimizer_label = ttk.Label(options, text="Optimizer type:")
-        _optimizer_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
-        train_optimizer_combo = ttk.Combobox(
-            options, textvariable=train_optimizer_var, values=OPTIMIZER_TYPE_CHOICES, state="readonly"
-        )
-        train_optimizer_combo.grid(row=0, column=1, sticky="ew")
-        _steps_label = ttk.Label(options, text="Training steps:")
-        _steps_label.grid(row=0, column=2, sticky="w", padx=(12, 8))
-        _steps_entry = ttk.Entry(options, textvariable=train_steps_var, style="Flat.TEntry")
-        _steps_entry.grid(row=0, column=3, sticky="ew")
-
-        _learning_rate_label = ttk.Label(options, text="Learning rate:")
-        _learning_rate_label.grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        train_learning_rate_entry = ttk.Entry(options, textvariable=train_learning_rate_var, style="Flat.TEntry")
-        train_learning_rate_entry.grid(row=1, column=1, sticky="ew", pady=(6, 0))
-        _network_dim_label = ttk.Label(options, text="LoRA network dim:")
-        _network_dim_label.grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
-        _network_dim_combo = ttk.Combobox(options, textvariable=train_network_dim_var, values=TRAIN_DIM_ALPHA_CHOICES, state="readonly")
-        _network_dim_combo.grid(
-            row=1, column=3, sticky="ew", pady=(6, 0)
-        )
-        _save_steps_label = ttk.Label(options, text="Save every N steps:")
-        _save_steps_label.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        _save_steps_entry = ttk.Entry(options, textvariable=train_save_every_var, style="Flat.TEntry")
-        _save_steps_entry.grid(row=2, column=1, sticky="ew", pady=(6, 0))
-        _network_alpha_label = ttk.Label(options, text="LoRA network alpha:")
-        _network_alpha_label.grid(row=2, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
-        _network_alpha_combo = ttk.Combobox(options, textvariable=train_network_alpha_var, values=TRAIN_DIM_ALPHA_CHOICES, state="readonly")
-        _network_alpha_combo.grid(
-            row=2, column=3, sticky="ew", pady=(6, 0)
-        )
-
-        _optimizer_args_label = ttk.Label(options, text="Optimizer args:")
-        _optimizer_args_label.grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        _optimizer_args_entry = ttk.Entry(options, textvariable=train_optimizer_args_var, style="Flat.TEntry")
-        _optimizer_args_entry.grid(row=3, column=1, columnspan=3, sticky="ew", pady=(6, 0))
-
-        _attach_field_tooltip(
-            _optimizer_label,
-            train_optimizer_combo,
-            "Optimizer algorithm for LoRA training. Prodigy uses lr=1 in this UI; other optimizers use the entered learning rate.",
-        )
-        _attach_field_tooltip(
-            _steps_label,
-            _steps_entry,
-            "Total update steps to run. Higher values train longer and can improve fit at the cost of overfit risk.",
-        )
-        _attach_field_tooltip(
-            _learning_rate_label,
-            train_learning_rate_entry,
-            "Main step size for updates. For Prodigy, this value is ignored and the launcher uses 1 automatically.",
-        )
-        _attach_field_tooltip(
-            _optimizer_args_label,
-            _optimizer_args_entry,
-            "Optional optimizer key=value args separated by spaces. Example (Prodigy): safeguard_warmup=True use_bias_correction=True weight_decay=0.01 betas=(0.9,0.99)",
-        )
-        _attach_field_tooltip(
-            _network_dim_label,
-            _network_dim_combo,
-            "LoRA rank (capacity). Higher rank can capture more detail but uses more VRAM and may overfit faster.",
-        )
-        _attach_field_tooltip(
-            _save_steps_label,
-            _save_steps_entry,
-            "Checkpoint interval. Saves model/state every N steps so you can resume or pick the best checkpoint.",
-        )
-        _attach_field_tooltip(
-            _network_alpha_label,
-            _network_alpha_combo,
-            "LoRA scaling value. Commonly kept equal to dim for balanced behavior.",
-        )
-
-        common_advanced = ttk.LabelFrame(training_tab, text="Advanced settings", padding=8)
-        common_advanced.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-        common_advanced.columnconfigure(1, weight=1)
-        common_advanced.columnconfigure(3, weight=1)
-
-        _lr_scheduler_label = ttk.Label(common_advanced, text="LR scheduler:")
-        _lr_scheduler_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
-        _lr_scheduler_combo = ttk.Combobox(
-            common_advanced,
-            textvariable=lr_scheduler_var,
-            values=("constant", "constant_with_warmup", "linear", "cosine", "cosine_with_restarts", "polynomial"),
-            state="readonly",
-        )
-        _lr_scheduler_combo.grid(row=0, column=1, sticky="ew")
-        _lr_warmup_label = ttk.Label(common_advanced, text="LR warmup steps:")
-        _lr_warmup_label.grid(row=0, column=2, sticky="w", padx=(12, 8))
-        _lr_warmup_entry = ttk.Entry(common_advanced, textvariable=lr_warmup_steps_var, style="Flat.TEntry")
-        _lr_warmup_entry.grid(row=0, column=3, sticky="ew")
-
-        _grad_accum_label = ttk.Label(common_advanced, text="Grad accumulation:")
-        _grad_accum_label.grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        _grad_accum_entry = ttk.Entry(common_advanced, textvariable=gradient_accumulation_steps_var, style="Flat.TEntry")
-        _grad_accum_entry.grid(row=1, column=1, sticky="ew", pady=(6, 0))
-        _blocks_to_swap_label = ttk.Label(common_advanced, text="Blocks to swap:")
-        _blocks_to_swap_label.grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
-        _blocks_to_swap_entry = ttk.Entry(common_advanced, textvariable=blocks_to_swap_var, style="Flat.TEntry")
-        _blocks_to_swap_entry.grid(row=1, column=3, sticky="ew", pady=(6, 0))
-
-        _timestep_sampling_label = ttk.Label(common_advanced, text="Timestep sampling:")
-        _timestep_sampling_label.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        _timestep_sampling_combo = ttk.Combobox(
-            common_advanced,
-            textvariable=timestep_sampling_var,
-            values=("sigma", "uniform", "sigmoid", "shift", "flux_shift", "flux2_shift", "qwen_shift", "logsnr", "shifted_logit_normal"),
-            state="readonly",
-        )
-        _timestep_sampling_combo.grid(row=2, column=1, sticky="ew", pady=(6, 0))
-
-        _attach_field_tooltip(
-            _lr_scheduler_label,
-            _lr_scheduler_combo,
-            "Learning-rate decay strategy over training. constant keeps LR fixed; warmup/linear/cosine vary it by step.",
-        )
-        _attach_field_tooltip(
-            _lr_warmup_label,
-            _lr_warmup_entry,
-            "Number of initial steps used to ramp LR up. Helpful when using warmup schedulers.",
-        )
-        _attach_field_tooltip(
-            _grad_accum_label,
-            _grad_accum_entry,
-            "Accumulate gradients across N steps before optimizer update. Increases effective batch size.",
-        )
-        _attach_field_tooltip(
-            _blocks_to_swap_label,
-            _blocks_to_swap_entry,
-            "Model-specific memory/perf tuning knob from Musubi scripts. Keep at profile default unless needed.",
-        )
-        _attach_field_tooltip(
-            _timestep_sampling_label,
-            _timestep_sampling_combo,
-            "How timesteps are sampled during flow-matching training. Recommended values are model-family dependent.",
-        )
-
-        model_specific = ttk.LabelFrame(training_tab, text="Model-specific settings", padding=8)
-        model_specific.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-        model_specific.columnconfigure(1, weight=1)
-        model_specific.columnconfigure(3, weight=1)
-
-        ltx_specific_frame = ttk.Frame(model_specific)
-        ltx_specific_frame.grid(row=0, column=0, columnspan=4, sticky="ew")
-        ltx_specific_frame.columnconfigure(1, weight=1)
-        ltx_specific_frame.columnconfigure(3, weight=1)
-
-        ttk.Label(ltx_specific_frame, text="LTX mode:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        _ltx_mode_display_var = tk.StringVar(
-            value=_ltx_mode_value_to_display.get(_normalize_ltx_mode_ui(ltx_mode_var.get()), "Image Training")
-        )
-
-        def _on_ltx_mode_display_change(*_args: object) -> None:
-            ltx_mode_var.set(_ltx_mode_display_to_value.get(_ltx_mode_display_var.get(), "video"))
-
-        _ltx_mode_display_var.trace_add("write", _on_ltx_mode_display_change)
-        _ltx_mode_combo = ttk.Combobox(
-            ltx_specific_frame,
-            textvariable=_ltx_mode_display_var,
-            values=list(_ltx_mode_display_to_value.keys()),
-            state="readonly",
-        )
-        _ltx_mode_combo.grid(row=0, column=1, sticky="ew", pady=(6, 0))
-
-        ttk.Label(ltx_specific_frame, text="LoRA target preset:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        _ltx_lora_target_combo = ttk.Combobox(
-            ltx_specific_frame,
-            textvariable=ltx_lora_target_preset_var,
-            values=_ltx_image_lora_target_choices,
-            state="readonly",
-        )
-        _ltx_lora_target_combo.grid(row=1, column=1, sticky="ew", pady=(6, 0))
-
-        ttk.Label(ltx_specific_frame, text="First-frame conditioning p:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
-        _ltx_first_frame_entry = ttk.Entry(ltx_specific_frame, textvariable=ltx_first_frame_conditioning_p_var, style="Flat.TEntry")
-        _ltx_first_frame_entry.grid(row=1, column=3, sticky="ew", pady=(6, 0))
-
-        attach_hover_tooltip(
-            _ltx_lora_target_combo,
-            (
-                "LoRA target preset controls which parts of the LTX model receive LoRA adapters.\n"
-                "For image-training workflows, presets are limited to video/image-relevant targets."
-            ),
-        )
-        attach_hover_tooltip(
-            _ltx_first_frame_entry,
-            (
-                "First-frame conditioning probability.\n"
-                "Higher values bias training to preserve frame-0 identity/composition guidance."
-            ),
-        )
-
-        sd_scripts_specific_frame = ttk.Frame(model_specific)
-        sd_scripts_specific_frame.grid(row=1, column=0, columnspan=4, sticky="ew")
-        sd_scripts_specific_frame.columnconfigure(1, weight=1)
-        sd_scripts_specific_frame.columnconfigure(3, weight=1)
-
-        _sd_unet_lr_label = ttk.Label(sd_scripts_specific_frame, text="U-Net LR override:")
-        _sd_unet_lr_label.grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        _sd_unet_lr_entry = ttk.Entry(sd_scripts_specific_frame, textvariable=sd_unet_lr_var, style="Flat.TEntry")
-        _sd_unet_lr_entry.grid(row=0, column=1, sticky="ew", pady=(6, 0))
-
-        _sd_text_encoder_lr_label = ttk.Label(sd_scripts_specific_frame, text="Text Encoder LR override:")
-        _sd_text_encoder_lr_label.grid(row=0, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
-        _sd_text_encoder_lr_entry = ttk.Entry(sd_scripts_specific_frame, textvariable=sd_text_encoder_lr_var, style="Flat.TEntry")
-        _sd_text_encoder_lr_entry.grid(row=0, column=3, sticky="ew", pady=(6, 0))
-
-        _attach_field_tooltip(
-            _sd_unet_lr_label,
-            _sd_unet_lr_entry,
-            "SD-Scripts only. Optional U-Net learning-rate override. Leave blank to use the global learning rate.",
-        )
-        _attach_field_tooltip(
-            _sd_text_encoder_lr_label,
-            _sd_text_encoder_lr_entry,
-            "SD-Scripts only. Optional Text Encoder learning-rate override. Leave blank to use defaults.",
-        )
-
-        flags = ttk.LabelFrame(training_tab, text="Advanced flags", padding=8)
-        flags.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-        flags.columnconfigure(0, weight=1)
-        flags.columnconfigure(1, weight=1)
-        _compile_check = ttk.Checkbutton(flags, text="Enable Torch Compile", variable=compile_var)
-        _compile_check.grid(row=0, column=0, sticky="w")
-        _tf32_check = ttk.Checkbutton(flags, text="Enable Allow TF32", variable=tf32_var)
-        _tf32_check.grid(row=2, column=0, sticky="w", pady=(6, 0))
-        _cudnn_check = ttk.Checkbutton(flags, text="Enable cuDNN Benchmark", variable=cudnn_var)
-        _cudnn_check.grid(row=2, column=1, sticky="w", pady=(6, 0), padx=(12, 0))
-        _fp8_check = ttk.Checkbutton(flags, text="Enable FP8 (Low VRAM)", variable=fp8_var)
-        _fp8_check.grid(row=0, column=1, sticky="w", padx=(12, 0))
-        _sdxl_grad_ckpt_check = ttk.Checkbutton(
-            flags,
-            text="Enable SDXL Gradient Checkpointing (Lower VRAM, slower)",
-            variable=sdxl_grad_ckpt_var,
-        )
-        _sdxl_grad_ckpt_check.grid(row=1, column=0, sticky="w", pady=(6, 0))
-        _gc_check = ttk.Checkbutton(flags, text="Enable CPU Offload for Checkpointing (Very low VRAM)", variable=gc_var)
-        _gc_check.grid(row=1, column=1, sticky="w", pady=(6, 0), padx=(12, 0))
-
-        attach_hover_tooltip(
-            _sdxl_grad_ckpt_check,
-            (
-                "SD-Scripts SDXL only. Reduces VRAM use by recomputing activations during backward pass.\n"
-                "Usually slower per step; disable on high-VRAM GPUs for higher throughput."
-            ),
-        )
-        attach_hover_tooltip(
-            _gc_check,
-            (
-                "Offloads gradient-checkpointing state to CPU for extra memory savings.\n"
-                "Can be significantly slower and may increase host RAM / PCIe traffic."
-            ),
-        )
-        _sd_scripts_hidden_widgets: list[tk.Widget] = [
-            _blocks_to_swap_label,
-            _blocks_to_swap_entry,
-            _timestep_sampling_label,
-            _timestep_sampling_combo,
-            _tf32_check,
-            _cudnn_check,
-        ]
-        _sd_scripts_only_widgets: list[tk.Widget] = [
-            _sdxl_grad_ckpt_check,
-        ]
-        _advanced_state_specs: list[tuple[tk.Widget, str]] = [(_lr_scheduler_combo, "readonly"), (_lr_warmup_entry, "normal"), (_grad_accum_entry, "normal")]
-        _flags_state_specs: list[tuple[tk.Widget, str]] = [(_compile_check, "normal"), (_fp8_check, "normal"), (_sdxl_grad_ckpt_check, "normal"), (_gc_check, "normal"), (_tf32_check, "normal"), (_cudnn_check, "normal")]
-
-        def _sync_backend_specific_controls() -> None:
-            model_name = model_var.get().strip()
-            is_sd_scripts = backend_kind_for_model(model_name) == "sd-scripts"
-
-            for widget, enabled_state in _advanced_state_specs:
-                widget.configure(state=enabled_state)
-            for widget, enabled_state in _flags_state_specs:
-                widget.configure(state=enabled_state)
-
-            for widget in _sd_scripts_hidden_widgets:
-                if is_sd_scripts:
-                    widget.grid_remove()
-                else:
-                    widget.grid()
-
-            for widget in _sd_scripts_only_widgets:
-                if is_sd_scripts:
-                    widget.grid()
-                else:
-                    widget.grid_remove()
-
-        def sync_optimizer_controls() -> None:
-            optimizer_value = train_optimizer_var.get().strip().lower()
-            if optimizer_value == "prodigy":
-                if not train_optimizer_args_var.get().strip():
-                    train_optimizer_args_var.set(DEFAULT_PRODIGY_OPTIMIZER_ARGS)
-            else:
-                if train_optimizer_args_var.get().strip() == DEFAULT_PRODIGY_OPTIMIZER_ARGS:
-                    train_optimizer_args_var.set("")
-
-        def _sync_model_specific_controls() -> None:
-            model_name = model_var.get().strip()
-            is_ltx = _model_to_family.get(model_name, "") == "LTX"
-            is_sd_scripts = backend_kind_for_model(model_name) == "sd-scripts"
-            if is_ltx:
-                model_specific.grid()
-                ltx_specific_frame.grid()
-                _ltx_mode_combo.configure(state="disabled")
-                ltx_mode_var.set("video")
-                _ltx_mode_display_var.set(_ltx_mode_value_to_display["video"])
-                if ltx_lora_target_preset_var.get().strip() not in _ltx_image_lora_target_choices:
-                    ltx_lora_target_preset_var.set("full")
-            else:
-                ltx_specific_frame.grid_remove()
-
-            if is_sd_scripts:
-                model_specific.grid()
-                sd_scripts_specific_frame.grid()
-            else:
-                sd_scripts_specific_frame.grid_remove()
-
-            if not is_ltx and not is_sd_scripts:
-                model_specific.grid_remove()
-            _sync_backend_specific_controls()
-            _fit_create_job_dialog_to_content()
-
-        train_optimizer_var.trace_add("write", lambda *_args: sync_optimizer_controls())
-        sync_optimizer_controls()
-        _sync_model_specific_controls()
-        _refresh_preset_combo()
-
-        # ── Datasets (bottom section) ─────────────────────────────────────
-        datasets_section = ttk.LabelFrame(training_tab, text="Datasets", padding=8)
-        datasets_section.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-        datasets_section.columnconfigure(0, weight=1)
-        datasets_section.rowconfigure(1, weight=1)
-
-        # Resolution + Batch row (both written to [general] section of dataset.toml)
-        res_row = ttk.Frame(datasets_section)
-        res_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        _saved_res = int((existing_job or {}).get("resolution", str(DEFAULT_RESOLUTION)))
-        _saved_res_str = str(_saved_res) if _saved_res in RESOLUTION_CHOICES else str(RESOLUTION_CHOICES[RESOLUTION_CHOICES.index(1024)])
-        train_resolution_var = tk.StringVar(value=_saved_res_str)
-        _ltx_resolution_choices = (1280, 1920)
-        _ltx_resolution_choice_values = [str(r) for r in _ltx_resolution_choices]
-        _default_resolution_choice_values = [str(r) for r in RESOLUTION_CHOICES]
-        _saved_batch = (existing_job or {}).get("batch_size", "1")
-        train_batch_var = tk.StringVar(value=str(_saved_batch))
-        ttk.Label(res_row, text="Resolution:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        _resolution_combo = ttk.Combobox(
-            res_row, textvariable=train_resolution_var,
-            values=_default_resolution_choice_values,
-            state="readonly", width=7,
-        )
-        _resolution_combo.grid(row=0, column=1, sticky="w")
-        ttk.Label(res_row, text="Batch size:").grid(row=0, column=2, sticky="w", padx=(16, 8))
-        ttk.Entry(res_row, textvariable=train_batch_var, style="Flat.TEntry", width=5).grid(row=0, column=3, sticky="w")
-
-        def _sync_resolution_controls() -> None:
-            model_name = model_var.get().strip()
-            is_ltx = _model_to_family.get(model_name, "") == "LTX"
-            allowed_values = _ltx_resolution_choice_values if is_ltx else _default_resolution_choice_values
-            _resolution_combo.configure(values=allowed_values)
-
-            current_value = train_resolution_var.get().strip()
-            if current_value not in allowed_values:
-                train_resolution_var.set("1920" if is_ltx else _saved_res_str)
-
-        _family_default_profiles: dict[str, dict[str, str]] = {
-            "SDXL": {
-                "optimizer_type": "prodigy",
-                "optimizer_args": DEFAULT_PRODIGY_OPTIMIZER_ARGS,
-                "learning_rate": DEFAULT_LEARNING_RATE,
-                "train_steps": str(DEFAULT_TRAIN_STEPS),
-                "save_every_n_steps": _default_save_every_from_settings,
-                "network_dim": str(DEFAULT_NETWORK_DIM),
-                "network_alpha": str(DEFAULT_NETWORK_ALPHA),
-                "lr_scheduler": "constant_with_warmup",
-                "lr_warmup_steps": "100",
-                "gradient_accumulation_steps": "1",
-                "blocks_to_swap": "0",
-                "timestep_sampling": "sigma",
-                "resolution": "1024",
-                "batch_size": "1",
-            },
-            "FLUX.2": {
-                "optimizer_type": "prodigy",
-                "optimizer_args": DEFAULT_PRODIGY_OPTIMIZER_ARGS,
-                "learning_rate": DEFAULT_LEARNING_RATE,
-                "train_steps": str(DEFAULT_TRAIN_STEPS),
-                "save_every_n_steps": _default_save_every_from_settings,
-                "network_dim": str(DEFAULT_NETWORK_DIM),
-                "network_alpha": str(DEFAULT_NETWORK_ALPHA),
-                "lr_scheduler": "constant",
-                "lr_warmup_steps": "0",
-                "gradient_accumulation_steps": "1",
-                "blocks_to_swap": "0",
-                "timestep_sampling": "flux2_shift",
-                "resolution": str(DEFAULT_RESOLUTION),
-                "batch_size": "1",
-            },
-            "LTX": {
-                "optimizer_type": "adamw8bit",
-                "optimizer_args": "",
-                "learning_rate": DEFAULT_LEARNING_RATE,
-                "train_steps": "400",
-                "save_every_n_steps": _default_save_every_from_settings,
-                "network_dim": "16",
-                "network_alpha": "16",
-                "lr_scheduler": "constant_with_warmup",
-                "lr_warmup_steps": "100",
-                "gradient_accumulation_steps": "1",
-                "blocks_to_swap": "1",
-                "timestep_sampling": "shifted_logit_normal",
-                "resolution": "1920",
-                "batch_size": "1",
-                "ltx_lora_target_preset": "full",
-                "ltx_first_frame_conditioning_p": "0.5",
-            },
-            "Wan": {
-                "optimizer_type": "prodigy",
-                "optimizer_args": DEFAULT_PRODIGY_OPTIMIZER_ARGS,
-                "learning_rate": DEFAULT_LEARNING_RATE,
-                "train_steps": str(DEFAULT_TRAIN_STEPS),
-                "save_every_n_steps": _default_save_every_from_settings,
-                "network_dim": str(DEFAULT_NETWORK_DIM),
-                "network_alpha": str(DEFAULT_NETWORK_ALPHA),
-                "lr_scheduler": "constant",
-                "lr_warmup_steps": "0",
-                "gradient_accumulation_steps": "1",
-                "blocks_to_swap": "0",
-                "timestep_sampling": "shift",
-                "resolution": str(DEFAULT_RESOLUTION),
-                "batch_size": "1",
-            },
-            "Z-Image": {
-                "optimizer_type": "prodigy",
-                "optimizer_args": DEFAULT_PRODIGY_OPTIMIZER_ARGS,
-                "learning_rate": DEFAULT_LEARNING_RATE,
-                "train_steps": str(DEFAULT_TRAIN_STEPS),
-                "save_every_n_steps": _default_save_every_from_settings,
-                "network_dim": str(DEFAULT_NETWORK_DIM),
-                "network_alpha": str(DEFAULT_NETWORK_ALPHA),
-                "lr_scheduler": "constant",
-                "lr_warmup_steps": "0",
-                "gradient_accumulation_steps": "1",
-                "blocks_to_swap": "0",
-                "timestep_sampling": "shift",
-                "resolution": str(DEFAULT_RESOLUTION),
-                "batch_size": "1",
-            },
-            "Qwen-Image": {
-                "optimizer_type": "prodigy",
-                "optimizer_args": DEFAULT_PRODIGY_OPTIMIZER_ARGS,
-                "learning_rate": DEFAULT_LEARNING_RATE,
-                "train_steps": str(DEFAULT_TRAIN_STEPS),
-                "save_every_n_steps": _default_save_every_from_settings,
-                "network_dim": str(DEFAULT_NETWORK_DIM),
-                "network_alpha": str(DEFAULT_NETWORK_ALPHA),
-                "lr_scheduler": "constant",
-                "lr_warmup_steps": "0",
-                "gradient_accumulation_steps": "1",
-                "blocks_to_swap": "0",
-                "timestep_sampling": "qwen_shift",
-                "resolution": str(DEFAULT_RESOLUTION),
-                "batch_size": "1",
-            },
-        }
-
-        def _apply_family_defaults_if_needed() -> None:
-            if existing_job is not None:
-                return
-            if preset_name_var.get().strip() != preset_none_label:
-                return
-
-            model_name = model_var.get().strip()
-            family_name = _model_to_family.get(model_name, "")
-
-            preferred_name = preferred_preset_by_family.get(family_name, "").strip()
-            if preferred_name:
-                preferred_payload = _preset_payload_for_model_name(model_name, preferred_name)
-                if isinstance(preferred_payload, dict):
-                    preferred_values = preferred_payload.get("values", {})
-                    if isinstance(preferred_values, dict):
-                        _apply_preset_values({str(k): str(v) for k, v in preferred_values.items() if isinstance(k, str)})
-                        preset_name_var.set(preferred_name)
-                        return
-                # Preferred preset may have been deleted/renamed; fall back to family defaults.
-                preferred_preset_by_family.pop(family_name, None)
-
-            profile = _family_default_profiles.get(family_name)
-            if not profile:
-                return
-
-            train_optimizer_var.set(profile["optimizer_type"])
-            train_optimizer_args_var.set(profile.get("optimizer_args", ""))
-            train_learning_rate_var.set(profile["learning_rate"])
-            train_steps_var.set(profile["train_steps"])
-            train_save_every_var.set(profile["save_every_n_steps"])
-            train_network_dim_var.set(profile["network_dim"])
-            train_network_alpha_var.set(profile["network_alpha"])
-            lr_scheduler_var.set(profile["lr_scheduler"])
-            lr_warmup_steps_var.set(profile["lr_warmup_steps"])
-            gradient_accumulation_steps_var.set(profile["gradient_accumulation_steps"])
-            blocks_to_swap_var.set(profile["blocks_to_swap"])
-            timestep_sampling_var.set(profile["timestep_sampling"])
-            train_resolution_var.set(profile["resolution"])
-            train_batch_var.set(profile["batch_size"])
-            if "ltx_lora_target_preset" in profile:
-                ltx_lora_target_preset_var.set(profile["ltx_lora_target_preset"])
-            if "ltx_first_frame_conditioning_p" in profile:
-                ltx_first_frame_conditioning_p_var.set(profile["ltx_first_frame_conditioning_p"])
-
-        def _on_model_change_for_defaults(*_args: object) -> None:
-            _sync_resolution_controls()
-            _apply_family_defaults_if_needed()
-            _sync_resolution_controls()
-
-        def _on_preset_change_for_defaults(*_args: object) -> None:
-            _apply_family_defaults_if_needed()
-
-        model_var.trace_add("write", _on_model_change_for_defaults)
-        preset_name_var.trace_add("write", _on_preset_change_for_defaults)
-        _sync_resolution_controls()
-        _apply_family_defaults_if_needed()
-        _sync_resolution_controls()
-
-        # Dataset list
-        list_host = ttk.Frame(datasets_section)
-        list_host.grid(row=1, column=0, sticky="nsew")
-        list_host.columnconfigure(0, weight=1)
-        list_host.rowconfigure(0, weight=1)
-
-        ds_canvas = tk.Canvas(list_host, bg=bg_panel, highlightthickness=0, height=120)
-        ds_canvas.grid(row=0, column=0, sticky="nsew")
-        ds_scrollbar = ttk.Scrollbar(list_host, orient="vertical", command=ds_canvas.yview, style="Dark.Vertical.TScrollbar")
-        ds_scrollbar.grid(row=0, column=1, sticky="ns")
-        ds_canvas.configure(yscrollcommand=ds_scrollbar.set)
-
-        ds_inner = ttk.Frame(ds_canvas)
-        ds_inner_id = ds_canvas.create_window((0, 0), window=ds_inner, anchor="nw")
-        ds_inner.columnconfigure(0, weight=1)
-
-        def _sync_ds_scroll(_e: object = None) -> None:
-            ds_canvas.configure(scrollregion=ds_canvas.bbox("all"))
-
-        def _sync_ds_canvas_width(e: tk.Event) -> None:
-            ds_canvas.itemconfigure(ds_inner_id, width=e.width)
-
-        ds_inner.bind("<Configure>", _sync_ds_scroll)
-        ds_canvas.bind("<Configure>", _sync_ds_canvas_width)
-
-        # dataset_entries: list of {"name", "num_repeats_var", "frame"}
-        dataset_entries: list[dict] = []
-        dataset_image_count_cache: dict[str, int] = {}
-        estimated_epochs_var = tk.StringVar(value="Est. epochs: n/a")
-
-        def _dataset_image_count(name: str) -> int:
-            cached = dataset_image_count_cache.get(name)
-            if cached is not None:
-                return cached
-            count = len(dataset_image_files(datasets_root_dir(), name))
-            dataset_image_count_cache[name] = count
-            return count
-
-        def _refresh_estimated_epochs() -> None:
-            try:
-                steps_value = int(train_steps_var.get().strip())
-                batch_value = int(train_batch_var.get().strip())
-                grad_accum_value = int(gradient_accumulation_steps_var.get().strip())
-            except ValueError:
-                estimated_epochs_var.set("Est. epochs: n/a")
-                return
-
-            if steps_value <= 0 or batch_value <= 0 or grad_accum_value <= 0:
-                estimated_epochs_var.set("Est. epochs: n/a")
-                return
-
-            total_images = 0
-            effective_samples = 0
-            for entry in dataset_entries:
-                try:
-                    repeats = int(entry["num_repeats_var"].get().strip())
-                except ValueError:
-                    estimated_epochs_var.set("Est. epochs: n/a")
-                    return
-                if repeats <= 0:
-                    estimated_epochs_var.set("Est. epochs: n/a")
-                    return
-                image_count = _dataset_image_count(entry["name"])
-                total_images += image_count
-                effective_samples += image_count * repeats
-
-            if effective_samples <= 0:
-                estimated_epochs_var.set("Est. epochs: n/a (no images)")
-                return
-
-            denom = batch_value * grad_accum_value
-            steps_per_epoch = max(1, (effective_samples + denom - 1) // denom)
-            epochs_value = steps_value / steps_per_epoch
-            estimated_epochs_var.set(
-                f"Est. epochs: {epochs_value:.2f} (img: {total_images}, repeated: {effective_samples}, eff batch: {denom}, steps/epoch: {steps_per_epoch})"
-            )
-
-        def _rebuild_ds_rows() -> None:
-            for child in ds_inner.winfo_children():
-                child.destroy()
-            for idx, entry in enumerate(dataset_entries):
-                row_frame = ttk.Frame(ds_inner, padding=(4, 3, 4, 3), style="Card.TFrame")
-                row_frame.grid(row=idx, column=0, sticky="ew", pady=2)
-                row_frame.columnconfigure(0, weight=1)
-                entry["frame"] = row_frame
-                ttk.Label(row_frame, text=entry["name"], style="CardTitle.TLabel").grid(
-                    row=0, column=0, sticky="w", padx=(4, 12)
-                )
-                ttk.Label(row_frame, text="Repeats:", style="CardMeta.TLabel").grid(
-                    row=0, column=1, sticky="e", padx=(0, 6)
-                )
-                ttk.Entry(row_frame, textvariable=entry["num_repeats_var"], style="Flat.TEntry", width=5).grid(
-                    row=0, column=2, sticky="e", padx=(0, 8)
-                )
-
-                def _make_remove(e: dict = entry) -> None:
-                    dataset_entries.remove(e)
-                    _rebuild_ds_rows()
-                    _refresh_add_combo()
-                    _refresh_estimated_epochs()
-
-                ttk.Button(row_frame, text="✕", style="QueueAction.TButton", command=_make_remove, width=2).grid(
-                    row=0, column=3, sticky="e"
-                )
-
-            _refresh_estimated_epochs()
-
-        def _available_datasets() -> list[str]:
-            return sorted(scan_training_folders(datasets_root_dir()), key=str.casefold)
-
-        def _refresh_add_combo() -> None:
-            already = {e["name"] for e in dataset_entries}
-            available = [n for n in _available_datasets() if n not in already]
-            add_combo["values"] = available
-            if available and add_combo.get() not in available:
-                add_combo.set(available[0])
-            elif not available:
-                add_combo.set("")
-
-        # Populate from initial_datasets
-        for _ds in initial_datasets:
-            _repeats_var = tk.StringVar(value=str(_ds.get("num_repeats", 1)))
-            _repeats_var.trace_add("write", lambda *_args: _refresh_estimated_epochs())
-            dataset_entries.append({"name": _ds["name"], "num_repeats_var": _repeats_var, "frame": None})
-        _rebuild_ds_rows()
-
-        # Add dataset row
-        add_row = ttk.Frame(datasets_section, padding=(0, 8, 0, 0))
-        add_row.grid(row=2, column=0, sticky="ew")
-        add_row.columnconfigure(1, weight=1)
-        ttk.Label(add_row, text="Add dataset:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        add_combo = ttk.Combobox(add_row, state="readonly", width=24)
-        add_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        _refresh_add_combo()
-
-        def _add_dataset() -> None:
-            name = add_combo.get().strip()
-            if not name or any(e["name"] == name for e in dataset_entries):
-                return
-            _repeats_var = tk.StringVar(value="1")
-            _repeats_var.trace_add("write", lambda *_args: _refresh_estimated_epochs())
-            dataset_entries.append({"name": name, "num_repeats_var": _repeats_var, "frame": None})
-            _rebuild_ds_rows()
-            _refresh_add_combo()
-            _refresh_estimated_epochs()
-
-        ttk.Button(add_row, text="Add", command=_add_dataset).grid(row=0, column=2, sticky="w")
-        train_steps_var.trace_add("write", lambda *_args: _refresh_estimated_epochs())
-        train_batch_var.trace_add("write", lambda *_args: _refresh_estimated_epochs())
-        gradient_accumulation_steps_var.trace_add("write", lambda *_args: _refresh_estimated_epochs())
-        _refresh_estimated_epochs()
-
-        # ── create_job / save ──────────────────────────────────────────────
-        def create_job() -> None:
-            job_name = job_name_var.get().strip()
-            if not job_name:
-                messagebox.showerror("Missing value", "LoRA name is required.", parent=dialog)
-                return
-            if not is_valid_folder_name(job_name):
-                messagebox.showerror(
-                    "Invalid name",
-                    "LoRA name must be a valid folder name. Spaces and '-' are allowed.",
-                    parent=dialog,
-                )
-                return
-            if not dataset_entries:
-                messagebox.showerror("No datasets", "Add at least one dataset in the Datasets section.", parent=dialog)
-                return
-
-            resolution_value = int(train_resolution_var.get())
-
-            try:
-                batch_size_value = int(train_batch_var.get().strip())
-                if batch_size_value < 1:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Invalid value", "Batch size must be a positive integer.", parent=dialog)
-                return
-
-            try:
-                _ = int(train_steps_var.get().strip())
-            except ValueError:
-                messagebox.showerror("Invalid value", "Steps must be numeric.", parent=dialog)
-                return
-
-            try:
-                save_every_n_steps_value = int(train_save_every_var.get().strip())
-                if save_every_n_steps_value < 1:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Invalid value", "Save every N steps must be a positive integer.", parent=dialog)
-                return
-
-            train_optimizer = train_optimizer_var.get().strip().lower()
-            if train_optimizer not in set(OPTIMIZER_TYPE_CHOICES):
-                messagebox.showerror(
-                    "Invalid value",
-                    "Optimizer type must be one of: " + ", ".join(OPTIMIZER_TYPE_CHOICES),
-                    parent=dialog,
-                )
-                return
-            train_optimizer_args = train_optimizer_args_var.get().strip()
-            if train_optimizer == "prodigy" and not train_optimizer_args:
-                train_optimizer_args = DEFAULT_PRODIGY_OPTIMIZER_ARGS
-                train_optimizer_args_var.set(train_optimizer_args)
-
-            train_learning_rate = train_learning_rate_var.get().strip()
-            if train_optimizer == "prodigy":
-                train_learning_rate = "1"
-            if not train_learning_rate:
-                messagebox.showerror("Invalid value", "Learning rate is required.", parent=dialog)
-                return
-            try:
-                learning_rate_number = float(train_learning_rate)
-            except ValueError:
-                messagebox.showerror("Invalid value", "Learning rate must be numeric (example: 1e-4).", parent=dialog)
-                return
-            if learning_rate_number <= 0:
-                messagebox.showerror("Invalid value", "Learning rate must be greater than 0.", parent=dialog)
-                return
-
-            lr_scheduler_value = lr_scheduler_var.get().strip().lower() or "constant"
-            try:
-                lr_warmup_steps_value = int(lr_warmup_steps_var.get().strip())
-                if lr_warmup_steps_value < 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Invalid value", "LR warmup steps must be a non-negative integer.", parent=dialog)
-                return
-
-            try:
-                grad_accum_value = int(gradient_accumulation_steps_var.get().strip())
-                if grad_accum_value < 1:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Invalid value", "Gradient accumulation must be a positive integer.", parent=dialog)
-                return
-
-            try:
-                blocks_to_swap_value = int(blocks_to_swap_var.get().strip())
-                if blocks_to_swap_value < 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Invalid value", "Blocks to swap must be a non-negative integer.", parent=dialog)
-                return
-
-            timestep_sampling_value = timestep_sampling_var.get().strip().lower() or "sigma"
-            ltx_lora_target_preset_value = ltx_lora_target_preset_var.get().strip().lower() or "t2v"
-            try:
-                ltx_first_frame_conditioning_p_value = float(ltx_first_frame_conditioning_p_var.get().strip())
-                if ltx_first_frame_conditioning_p_value < 0 or ltx_first_frame_conditioning_p_value > 1:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Invalid value", "First-frame conditioning p must be a number between 0 and 1.", parent=dialog)
-                return
-
-            sd_unet_lr_value = sd_unet_lr_var.get().strip()
-            if sd_unet_lr_value:
-                try:
-                    if float(sd_unet_lr_value) <= 0:
-                        raise ValueError
-                except ValueError:
-                    messagebox.showerror("Invalid value", "SD-Scripts U-Net LR must be a number greater than 0.", parent=dialog)
-                    return
-
-            sd_text_encoder_lr_value = sd_text_encoder_lr_var.get().strip()
-            if sd_text_encoder_lr_value:
-                try:
-                    if float(sd_text_encoder_lr_value) <= 0:
-                        raise ValueError
-                except ValueError:
-                    messagebox.showerror("Invalid value", "SD-Scripts Text Encoder LR must be a number greater than 0.", parent=dialog)
-                    return
-
-            # Validate and collect per-dataset config
-            datasets_config: list[dict] = []
-            for entry in dataset_entries:
-                try:
-                    repeats = int(entry["num_repeats_var"].get().strip())
-                    if repeats < 1:
-                        raise ValueError
-                except ValueError:
-                    messagebox.showerror(
-                        "Invalid value",
-                        f"Repeats for '{entry['name']}' must be a positive integer.",
-                        parent=dialog,
-                    )
-                    return
-                datasets_config.append({"name": entry["name"], "num_repeats": repeats})
-
-            existing_index: int | None = None
-            if existing_job is not None:
-                try:
-                    existing_index = job_queue.index(existing_job)
-                except ValueError:
-                    existing_index = None
-
-            for idx, queued_job in enumerate(job_queue):
-                if existing_index is not None and idx == existing_index:
-                    continue
-                if queued_job.get("job_name", "").strip().lower() == job_name.lower():
-                    messagebox.showerror("Duplicate name", "LoRA name already exists in queue.", parent=dialog)
-                    return
-
-            existing_training_name = ""
-            if existing_job is not None:
-                existing_training_name = (
-                    (existing_job or {}).get("training_name", "").strip()
-                    or (existing_job or {}).get("job_name", "").strip()
-                )
-
-            training_name = job_name
-            renamed_training_folder = False
-
-            if existing_job is not None and existing_training_name and training_name != existing_training_name:
-                source_training_dir = training_job_dir_path(existing_training_name).expanduser()
-                target_training_dir = training_job_dir_path(training_name).expanduser()
-
-                if target_training_dir.exists():
-                    messagebox.showerror(
-                        "Duplicate name",
-                        (
-                            "A job folder with this LoRA name already exists:\n"
-                            f"{target_training_dir}\n\n"
-                            "Choose a different name."
-                        ),
-                        parent=dialog,
-                    )
-                    return
-
-                if source_training_dir.exists() and source_training_dir.is_dir():
-                    try:
-                        shutil.move(str(source_training_dir), str(target_training_dir))
-                        renamed_training_folder = True
-                    except OSError as exc:
-                        messagebox.showerror(
-                            "Rename failed",
-                            f"Could not rename job folder:\n{exc}",
-                            parent=dialog,
-                        )
-                        return
-
-            try:
-                training_dir_path, output_root, created_captions = ensure_training_job_structure(
-                    training_name=training_name,
-                    datasets=datasets_config,
-                    resolution=resolution_value,
-                    batch_size=batch_size_value,
-                    default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
-                    model_name=model_var.get().strip(),
-                )
-            except Exception as exc:
-                messagebox.showerror("Create job failed", str(exc), parent=dialog)
-                return
-
-            primary_dataset = datasets_config[0]["name"]
-            tracker_name = settings_state.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip() or job_name
-
-            new_job = {
-                "id": training_name,
-                "dataset_name": primary_dataset,
-                "datasets_json": json.dumps(datasets_config),
-                "training_name": training_name,
-                "training_dir": str(training_dir_path),
-                "job_name": job_name,
-                "model": model_var.get().strip() or "Klein",
-                "ltx_mode": _normalize_ltx_mode_ui(ltx_mode_var.get()),
-                "output_dir": str(output_root),
-                "resolution": str(resolution_value),
-                "batch_size": str(batch_size_value),
-                "save_every_n_steps": str(save_every_n_steps_value),
-                "network_dim": train_network_dim_var.get().strip(),
-                "network_alpha": train_network_alpha_var.get().strip(),
-                "optimizer_type": train_optimizer,
-                "optimizer_args": train_optimizer_args,
-                "learning_rate": train_learning_rate,
-                "train_steps": train_steps_var.get().strip(),
-                "lr_scheduler": lr_scheduler_value,
-                "lr_warmup_steps": str(lr_warmup_steps_value),
-                "gradient_accumulation_steps": str(grad_accum_value),
-                "blocks_to_swap": str(blocks_to_swap_value),
-                "timestep_sampling": timestep_sampling_value,
-                "ltx_lora_target_preset": ltx_lora_target_preset_value,
-                "ltx_first_frame_conditioning_p": str(ltx_first_frame_conditioning_p_value),
-                "sd_unet_lr": sd_unet_lr_value,
-                "sd_text_encoder_lr": sd_text_encoder_lr_value,
-                "enable_compile": bool_to_flag(compile_var.get()),
-                "enable_tf32": bool_to_flag(tf32_var.get()),
-                "enable_cudnn": bool_to_flag(cudnn_var.get()),
-                "enable_fp8": bool_to_flag(fp8_var.get()),
-                "enable_gc": bool_to_flag(gc_var.get()),
-                "enable_grad_ckpt": bool_to_flag(sdxl_grad_ckpt_var.get()),
-                "enable_logging": bool_to_flag(is_truthy(settings_state.get(TRAIN_ENABLE_LOGGING_KEY), default=True)),
-                "tracker_name": tracker_name,
-                "stream_output": bool_to_flag(is_truthy(settings_state.get(TRAIN_STREAM_TO_LOGGER_KEY), default=False)),
-                "auto_cleanup": bool_to_flag(is_truthy(settings_state.get(TRAIN_AUTO_CLEANUP_STATES_KEY), default=True)),
-                "hold": (existing_job or {}).get("hold", "0"),
-                "status": "queued",
-            }
-
-            new_job["status"] = detect_job_status(new_job)
-
-            auto_fixed_elements = 0
-            if existing_job is not None:
-                for _attempt in range(5):
-                    has_mismatch, source_base = detect_job_element_base_mismatch(new_job)
-                    if not has_mismatch or source_base is None:
-                        break
-                    renamed_count, _conflicts = rename_job_elements_to_training_name(new_job, source_base)
-                    auto_fixed_elements += renamed_count
-                    if renamed_count == 0:
-                        break
-
-            if existing_job is None:
-                job_queue.append(new_job)
-            else:
-                if existing_index is None:
-                    job_queue.append(new_job)
-                else:
-                    job_queue[existing_index] = new_job
-
-            save_job_to_disk(new_job)
-            save_job_order()
-            if renamed_training_folder:
-                load_job_queue_from_disk()
-            refresh_job_queue_list()
-            update_start_button_state()
-
-            ds_names = ", ".join(d["name"] for d in datasets_config)
-            if existing_job is None:
-                log(f"[Queue] Created job: {job_name} (datasets: {ds_names}, training: {training_name}, captions added: {created_captions})")
-                for var in vars_by_name.values():
-                    var.set(False)
-                for name in list(card_frame_by_name.keys()):
-                    apply_card_style(name)
-            else:
-                if auto_fixed_elements > 0:
-                    log(f"[Queue] Updated job: {job_name} (datasets: {ds_names}, training: {training_name}, captions added: {created_captions}, renamed elements: {auto_fixed_elements})")
-                else:
-                    log(f"[Queue] Updated job: {job_name} (datasets: {ds_names}, training: {training_name}, captions added: {created_captions})")
-            dialog.destroy()
-
-        # ── Footer buttons ─────────────────────────────────────────────────
-        buttons = ttk.Frame(outer, padding=(0, 10, 0, 0))
-        buttons.grid(row=2, column=0, sticky="ew")
-        buttons.columnconfigure(0, weight=1)
-        ttk.Label(buttons, textvariable=estimated_epochs_var, style="Dim.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(buttons, text="Save" if existing_job is not None else "Create Job", command=create_job).grid(row=0, column=2)
-
-        _fit_create_job_dialog_to_content()
-        center_window(dialog)
-        dialog.deiconify()
-        root.wait_window(dialog)
+        return create_job_window.CreateJobWindow(**dependencies).open(existing_job)
 
     def first_image_path(dataset_name: str) -> Path | None:
         cached = first_image_cache.get(dataset_name)
@@ -7368,10 +3675,10 @@ def launch_ui() -> int:
             update_start_button_state()
             return
 
-        gap = ui_config["card_gap"]
-        card_width = ui_config["card_width"]
-        thumb_px = ui_config["thumbnail_size"]
-        card_height = ui_config["card_height"]
+        gap = 8
+        card_width = 172
+        thumb_px = 152
+        card_height = 212
         columns = 4
 
         for col in range(max(1, len(names))):
@@ -7436,7 +3743,7 @@ def launch_ui() -> int:
 
         if resize_after_id is not None:
             root.after_cancel(resize_after_id)
-        resize_after_id = root.after(ui_config["relayout_debounce_ms"], rebuild_folder_list)
+        resize_after_id = root.after(120, rebuild_folder_list)
 
     def is_widget_in_dataset_panel(widget: tk.Misc | None) -> bool:
         current: tk.Misc | None = widget
@@ -7452,10 +3759,16 @@ def launch_ui() -> int:
                 break
         return False
 
+    def is_dataset_panel_scrollable() -> bool:
+        first, last = canvas.yview()
+        return first > 0.0 or last < 0.999
+
     def on_mousewheel(event: tk.Event) -> str | None:
         hovered = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
         if not is_widget_in_dataset_panel(hovered):
             return None
+        if not is_dataset_panel_scrollable():
+            return "break"
         delta = int(-event.delta / 120)
         if delta == 0:
             delta = -1 if event.delta > 0 else 1
@@ -7466,6 +3779,8 @@ def launch_ui() -> int:
         hovered = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
         if not is_widget_in_dataset_panel(hovered):
             return None
+        if not is_dataset_panel_scrollable():
+            return "break"
         canvas.yview_scroll(-1, "units")
         return "break"
 
@@ -7473,6 +3788,8 @@ def launch_ui() -> int:
         hovered = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
         if not is_widget_in_dataset_panel(hovered):
             return None
+        if not is_dataset_panel_scrollable():
+            return "break"
         canvas.yview_scroll(1, "units")
         return "break"
 
@@ -7702,7 +4019,7 @@ def launch_ui() -> int:
                                 datasets=runner_datasets,
                                 resolution=resolution_value,
                                 batch_size=batch_size_value,
-                                default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+                                default_caption_keyword=settings_state.get(app_settings.DEFAULT_CAPTION_KEYWORD_KEY, ""),
                                 model_name=model_name,
                             )
                             if captions_added > 0:
@@ -7727,7 +4044,7 @@ def launch_ui() -> int:
                                 "dataset_name": training_name,
                                 "output_name": job_name,
                                 "output_dir": output_dir,
-                                "default_caption_keyword": settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+                                "default_caption_keyword": settings_state.get(app_settings.DEFAULT_CAPTION_KEYWORD_KEY, ""),
                                 "resolution": resolution_value,
                                 "network_dim": get_positive_int_setting(job, "network_dim", DEFAULT_NETWORK_DIM),
                                 "network_alpha": get_positive_int_setting(job, "network_alpha", DEFAULT_NETWORK_ALPHA),
@@ -7741,11 +4058,11 @@ def launch_ui() -> int:
                                 "enable_cuda_cudnn_benchmark": flag_to_bool(job.get("enable_cudnn", "1")),
                                 "enable_fp8_dit": flag_to_bool(job.get("enable_fp8", "0")),
                                 "enable_gradient_checkpointing_cpu_offload": flag_to_bool(job.get("enable_gc", "0")),
-                                "enable_training_logging": is_truthy(settings_state.get(TRAIN_ENABLE_LOGGING_KEY), default=True),
+                                "enable_training_logging": is_truthy(settings_state.get(app_settings.TRAIN_ENABLE_LOGGING_KEY), default=True),
                                 "training_log_backend": get_train_log_backend_setting(settings_state),
-                                "training_log_tracker_name": settings_state.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip(),
-                                "stream_training_output": is_truthy(settings_state.get(TRAIN_STREAM_TO_LOGGER_KEY), default=False),
-                                "auto_cleanup_states": is_truthy(settings_state.get(TRAIN_AUTO_CLEANUP_STATES_KEY), default=True),
+                                "training_log_tracker_name": settings_state.get(app_settings.TRAIN_LOG_TRACKER_NAME_KEY, "").strip(),
+                                "stream_training_output": is_truthy(settings_state.get(app_settings.TRAIN_STREAM_TO_LOGGER_KEY), default=False),
+                                "auto_cleanup_states": is_truthy(settings_state.get(app_settings.TRAIN_AUTO_CLEANUP_STATES_KEY), default=True),
                                 "logger": log,
                                 "do_prep_dataset": True,
                                 "do_cache_latents": True,
@@ -8263,10 +4580,10 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.names:
-        settings = load_settings()
+        settings = app_settings.load_settings()
         runtime_config = runtime_config_from_settings(settings)
         if runtime_config is None:
-            print(f"Missing settings file: {SETTINGS_FILE}")
+            print(f"Missing settings file: {app_settings.SETTINGS_FILE}")
             print("Run without CLI args once to set Musubi-Tuner location.")
             return 1
 
@@ -8280,7 +4597,7 @@ def main() -> int:
         return train_models(
             runtime_config,
             model_names,
-            default_caption_keyword=settings.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+            default_caption_keyword=settings.get(app_settings.DEFAULT_CAPTION_KEYWORD_KEY, ""),
             resolution=DEFAULT_RESOLUTION,
             network_dim=DEFAULT_NETWORK_DIM,
             network_alpha=DEFAULT_NETWORK_ALPHA,
@@ -8289,31 +4606,31 @@ def main() -> int:
             learning_rate=DEFAULT_LEARNING_RATE,
             train_steps=DEFAULT_TRAIN_STEPS,
             enable_compile_optimizations=(
-                settings.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
+                settings.get(app_settings.ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
             ),
             enable_cuda_allow_tf32=(
-                settings.get(ENABLE_CUDA_ALLOW_TF32_KEY, "1").strip().lower() in {"1", "true", "yes", "on"}
+                settings.get(app_settings.ENABLE_CUDA_ALLOW_TF32_KEY, "1").strip().lower() in {"1", "true", "yes", "on"}
             ),
             enable_cuda_cudnn_benchmark=(
-                settings.get(ENABLE_CUDA_CUDNN_BENCHMARK_KEY, "1").strip().lower() in {"1", "true", "yes", "on"}
+                settings.get(app_settings.ENABLE_CUDA_CUDNN_BENCHMARK_KEY, "1").strip().lower() in {"1", "true", "yes", "on"}
             ),
             enable_fp8_dit=(
-                settings.get(ENABLE_FP8_DIT_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
+                settings.get(app_settings.ENABLE_FP8_DIT_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
             ),
             enable_gradient_checkpointing_cpu_offload=(
-                settings.get(ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY, "0").strip().lower()
+                settings.get(app_settings.ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY, "0").strip().lower()
                 in {"1", "true", "yes", "on"}
             ),
             enable_training_logging=(
-                settings.get(TRAIN_ENABLE_LOGGING_KEY, "1").strip().lower() in {"1", "true", "yes", "on"}
+                settings.get(app_settings.TRAIN_ENABLE_LOGGING_KEY, "1").strip().lower() in {"1", "true", "yes", "on"}
             ),
             training_log_backend=get_train_log_backend_setting(settings),
-            training_log_tracker_name=settings.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip(),
+            training_log_tracker_name=settings.get(app_settings.TRAIN_LOG_TRACKER_NAME_KEY, "").strip(),
             stream_training_output=(
-                settings.get(TRAIN_STREAM_TO_LOGGER_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
+                settings.get(app_settings.TRAIN_STREAM_TO_LOGGER_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
             ),
             auto_cleanup_states=(
-                settings.get(TRAIN_AUTO_CLEANUP_STATES_KEY, "1").strip().lower() in {"1", "true", "yes", "on"}
+                settings.get(app_settings.TRAIN_AUTO_CLEANUP_STATES_KEY, "1").strip().lower() in {"1", "true", "yes", "on"}
             ),
             logger=print,
             do_prep_dataset=do_prep_dataset,
