@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable
 
 from .app_settings import (
+    BACKENDS_ROOT_KEY,
     DEFAULT_CAPTION_KEYWORD_KEY,
     ENABLE_CUDA_ALLOW_TF32_KEY,
     ENABLE_CUDA_CUDNN_BENCHMARK_KEY,
@@ -31,7 +32,10 @@ from .app_settings import (
     LTX_TEXT_ENCODER_KEY,
     LTX_VAE_KEY,
     MUSUBI_DIR_KEY,
+    MUSUBI_LTX_DIR_KEY,
+    MUSUBI_MAIN_DIR_KEY,
     MUSUBI_PYTHON_KEY,
+    SD_SCRIPTS_DIR_KEY,
     SETTINGS_FILE,
     TRAIN_LOG_BACKEND_KEY,
     TRAIN_LOG_TRACKER_NAME_KEY,
@@ -92,6 +96,11 @@ _LTX_MODELS = {"ltx-2.3"}
 _WAN_MODELS = {"wan2.1-t2v-14b", "wan2.1-i2v-720p-14b", "wan2.1-i2v-480p-14b", "wan2.2-t2v-14b", "wan2.2-i2v-720p-14b", "wan2.2-i2v-480p-14b"}
 _ZIMAGE_MODELS = {"zimage-de-turbo"}
 _QWEN_MODELS = {"qwen-image", "qwen-image-edit", "qwen-image-edit-2509", "qwen-image-edit-2511", "qwen-image-layered"}
+
+MUSUBI_MAIN_REPO_URL = "https://github.com/kohya-ss/musubi-tuner.git"
+MUSUBI_LTX_REPO_URL = "https://github.com/AkaneTendo25/musubi-tuner.git"
+MUSUBI_LTX_REPO_BRANCH = "ltx-2-dev"
+SD_SCRIPTS_REPO_URL = "https://github.com/kohya-ss/sd-scripts.git"
 
 
 def _run_job_for_model(model_name: str):
@@ -413,6 +422,54 @@ def launch_ui() -> int:
     dataset_order: list[str] = load_dataset_order(settings_state)
     window_position_applied = False
     settings_reset_requested = False
+
+    def default_backends_root() -> Path:
+        return workspace_dir / "Backends"
+
+    def default_backend_dir(kind: str) -> Path:
+        root = default_backends_root()
+        if kind == "musubi-main":
+            return root / "musubi-main"
+        if kind == "musubi-ltx":
+            return root / "musubi-ltx"
+        if kind == "sd-scripts":
+            return root / "sd-scripts"
+        return root / kind
+
+    def configured_backends_root() -> Path:
+        raw = settings_state.get(BACKENDS_ROOT_KEY, "").strip()
+        return Path(raw).expanduser() if raw else default_backends_root()
+
+    def configured_backend_dir(setting_key: str, default_kind: str) -> Path:
+        raw = settings_state.get(setting_key, "").strip()
+        if raw:
+            return Path(raw).expanduser()
+        return configured_backends_root() / default_kind
+
+    def has_any_backend_setting() -> bool:
+        keys = [MUSUBI_DIR_KEY, MUSUBI_MAIN_DIR_KEY, MUSUBI_LTX_DIR_KEY, SD_SCRIPTS_DIR_KEY]
+        return any(settings_state.get(key, "").strip() for key in keys)
+
+    def has_any_model_setting() -> bool:
+        raw_model_paths = settings_state.get(MODEL_PATHS_KEY, "").strip()
+        if raw_model_paths:
+            try:
+                payload = json.loads(raw_model_paths)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                for comp_map in payload.values():
+                    if not isinstance(comp_map, dict):
+                        continue
+                    for path_value in comp_map.values():
+                        if str(path_value or "").strip():
+                            return True
+
+        legacy_keys = [KLEIN_DIT_KEY, KLEIN_VAE_KEY, KLEIN_TEXT_ENCODER_KEY, LTX_DIT_KEY, LTX_VAE_KEY, LTX_TEXT_ENCODER_KEY]
+        return any(settings_state.get(key, "").strip() for key in legacy_keys)
+
+    def is_first_launch_unconfigured() -> bool:
+        return (not has_any_backend_setting()) and (not has_any_model_setting())
 
     def apply_initial_main_window_position() -> None:
         nonlocal window_position_applied
@@ -1004,101 +1061,174 @@ def launch_ui() -> int:
             or (path / "flux_2_train_network.py").exists()
         )
 
+    def is_valid_sd_scripts_dir(path: Path) -> bool:
+        if not path.exists() or not path.is_dir():
+            return False
+        has_project_marker = (
+            (path / "pyproject.toml").exists()
+            or (path / "setup.py").exists()
+            or (path / "requirements.txt").exists()
+        )
+        has_train_entry = any((path / name).exists() for name in (
+            "train_network.py",
+            "flux_train_network.py",
+            "sdxl_train_network.py",
+            "anima_train_network.py",
+        ))
+        return has_project_marker and has_train_entry
+
+    def backend_kind_for_model(model_name: str) -> str:
+        if model_name in _LTX_MODELS:
+            return "musubi-ltx"
+        return "musubi-main"
+
+    def backend_repo_rows() -> list[tuple[str, str, str, str, str, str]]:
+        return [
+            (
+                "Musubi Main",
+                "musubi-main",
+                MUSUBI_MAIN_DIR_KEY,
+                str(default_backend_dir("musubi-main")),
+                MUSUBI_MAIN_REPO_URL,
+                "",
+            ),
+            (
+                "Musubi LTX",
+                "musubi-ltx",
+                MUSUBI_LTX_DIR_KEY,
+                str(default_backend_dir("musubi-ltx")),
+                MUSUBI_LTX_REPO_URL,
+                MUSUBI_LTX_REPO_BRANCH,
+            ),
+            (
+                "sd-scripts",
+                "sd-scripts",
+                SD_SCRIPTS_DIR_KEY,
+                str(default_backend_dir("sd-scripts")),
+                SD_SCRIPTS_REPO_URL,
+                "",
+            ),
+        ]
+
+    def configured_backend_dirs() -> dict[str, Path]:
+        root = configured_backends_root()
+        main_raw = settings_state.get(MUSUBI_MAIN_DIR_KEY, "").strip()
+        ltx_raw = settings_state.get(MUSUBI_LTX_DIR_KEY, "").strip()
+        sd_raw = settings_state.get(SD_SCRIPTS_DIR_KEY, "").strip()
+
+        legacy_raw = settings_state.get(MUSUBI_DIR_KEY, "").strip()
+        legacy_path = Path(legacy_raw).expanduser() if legacy_raw else None
+
+        main_dir = Path(main_raw).expanduser() if main_raw else (legacy_path if legacy_path is not None else root / "musubi-main")
+        ltx_dir = Path(ltx_raw).expanduser() if ltx_raw else (root / "musubi-ltx")
+        sd_dir = Path(sd_raw).expanduser() if sd_raw else (root / "sd-scripts")
+        return {
+            "musubi-main": main_dir,
+            "musubi-ltx": ltx_dir,
+            "sd-scripts": sd_dir,
+        }
+
+    def backend_is_valid(kind: str, path: Path) -> bool:
+        if kind == "sd-scripts":
+            return is_valid_sd_scripts_dir(path)
+        return is_valid_musubi_tuner_dir(path)
+
+    def required_backends_ready() -> bool:
+        # Keep compatibility with older call sites; startup no longer requires all backends.
+        # A backend should only gate model visibility, not app launch.
+        return True
+
     def apply_musubi_dir_setting(musubi_dir: Path) -> bool:
         nonlocal runtime_config, settings_state
         if not is_valid_musubi_tuner_dir(musubi_dir):
             return False
         settings_state[MUSUBI_DIR_KEY] = str(musubi_dir)
+        settings_state[MUSUBI_MAIN_DIR_KEY] = str(musubi_dir)
         settings_state[MUSUBI_PYTHON_KEY] = ""
+        settings_state.setdefault(BACKENDS_ROOT_KEY, str(default_backends_root()))
         save_settings(settings_state)
         runtime_config = runtime_config_from_settings(settings_state)
         return runtime_config is not None
 
-    def prompt_to_clone_or_select_musubi() -> bool:
-        choice = messagebox.askyesnocancel(
-            "Musubi-Tuner not found",
-            "Musubi-Tuner folder is not configured or is invalid.\n\n"
-            "Yes: Clone Musubi-Tuner now\n"
-            "No: Choose it manually in Settings\n"
-            "Cancel: Exit",
-            parent=root,
-        )
-        if choice is None:
-            return False
-        if choice is False:
-            return True
-
-        clone_parent = filedialog.askdirectory(
-            title="Choose parent folder for Musubi-Tuner clone",
-            initialdir=str(workspace_dir.parent),
-            parent=root,
-        )
-        if not clone_parent:
-            return True
-
-        clone_target = Path(clone_parent).expanduser() / "Musubi-Tuner"
-        if clone_target.exists():
-            if is_valid_musubi_tuner_dir(clone_target):
-                use_existing = messagebox.askyesno(
-                    "Use existing Musubi-Tuner",
-                    f"Found existing Musubi-Tuner at:\n{clone_target}\n\nUse this folder?",
-                    parent=root,
-                )
-                if use_existing:
-                    if apply_musubi_dir_setting(clone_target):
-                        return True
-                    messagebox.showerror(
-                        "Invalid Musubi-Tuner",
-                        f"Could not use folder:\n{clone_target}",
-                        parent=root,
-                    )
-                return True
-
-            if any(clone_target.iterdir()):
-                messagebox.showerror(
-                    "Clone target not empty",
-                    f"Target folder already exists and is not a Musubi-Tuner checkout:\n{clone_target}\n\n"
-                    "Choose a different parent folder.",
-                    parent=root,
-                )
-                return True
-
+    def _run_git_streaming(
+        command: list[str],
+        logger: Callable[[str], None] | None = None,
+    ) -> tuple[int, str]:
         try:
-            clone_target.parent.mkdir(parents=True, exist_ok=True)
-            result = subprocess.run(
-                ["git", "clone", "https://github.com/kohya-ss/musubi-tuner.git", str(clone_target)],
-                capture_output=True,
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except OSError as exc:
-            messagebox.showerror(
-                "Clone failed",
-                f"Could not run git clone:\n{exc}\n\nInstall Git or clone manually, then select the folder in Settings.",
-                parent=root,
-            )
-            return True
+            return 1, str(exc)
 
-        if result.returncode != 0:
-            err_tail = (result.stderr or result.stdout or "").strip()
+        output_lines: list[str] = []
+        assert process.stdout is not None
+        for raw_line in process.stdout:
+            line = raw_line.rstrip("\r\n")
+            output_lines.append(line)
+            if logger is not None and line:
+                logger(f"[git] {line}")
+        process.wait()
+        output = "\n".join(output_lines).strip()
+        return int(process.returncode or 0), output
+
+    def clone_backend_repo(
+        target_dir: Path,
+        repo_url: str,
+        branch: str = "",
+        logger: Callable[[str], None] | None = None,
+    ) -> tuple[bool, str]:
+        try:
+            target_dir.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return False, f"Could not create parent folder:\n{exc}"
+
+        if target_dir.exists():
+            if any(target_dir.iterdir()):
+                return False, f"Target folder is not empty:\n{target_dir}"
+        else:
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                return False, f"Could not create target folder:\n{exc}"
+
+        cmd = ["git", "clone"]
+        if branch:
+            cmd += ["--branch", branch]
+        cmd += [repo_url, str(target_dir)]
+        if logger is not None:
+            logger(f"[Backends] Running: {' '.join(cmd)}")
+        return_code, combined_output = _run_git_streaming(cmd, logger=logger)
+
+        if return_code != 0:
+            err_tail = (combined_output or "").strip()
             if len(err_tail) > 1500:
                 err_tail = err_tail[-1500:]
-            messagebox.showerror(
-                "Clone failed",
-                "git clone did not complete successfully.\n\n"
-                f"Target: {clone_target}\n\n"
-                f"Details:\n{err_tail}",
-                parent=root,
-            )
-            return True
+            return False, err_tail or "git clone failed."
 
-        if not apply_musubi_dir_setting(clone_target):
-            messagebox.showerror(
-                "Clone incomplete",
-                f"Clone finished but folder does not look valid:\n{clone_target}\n\n"
-                "Choose the Musubi-Tuner folder manually in Settings.",
-                parent=root,
-            )
-        return True
+        return True, ""
+
+    def update_backend_repo(repo_dir: Path, logger: Callable[[str], None] | None = None) -> tuple[bool, str]:
+        if not repo_dir.exists() or not repo_dir.is_dir():
+            return False, f"Backend folder does not exist:\n{repo_dir}"
+        if not (repo_dir / ".git").exists():
+            return False, f"Backend folder is not a git checkout:\n{repo_dir}"
+        cmd = ["git", "-C", str(repo_dir), "pull", "--ff-only"]
+        if logger is not None:
+            logger(f"[Backends] Running: {' '.join(cmd)}")
+        return_code, combined_output = _run_git_streaming(cmd, logger=logger)
+
+        if return_code != 0:
+            err_tail = (combined_output or "").strip()
+            if len(err_tail) > 1500:
+                err_tail = err_tail[-1500:]
+            return False, err_tail or "git pull failed."
+        return True, combined_output or "Already up to date."
 
     def persist_dataset_order() -> None:
         nonlocal settings_state
@@ -1195,10 +1325,12 @@ def launch_ui() -> int:
         return job_dir, output_dir, created_captions
 
     def open_settings_dialog(required: bool) -> RuntimeConfig | None:
-        current_dir = ""
-        if runtime_config is not None:
-            current_dir = str(runtime_config.musubi_dir)
-        current_musubi_python_path = resolve_musubi_python(Path(current_dir).expanduser()) if current_dir else None
+        backend_dirs = configured_backend_dirs()
+        current_main_dir = str(backend_dirs["musubi-main"])
+        current_ltx_dir = str(backend_dirs["musubi-ltx"])
+        current_sd_scripts_dir = str(backend_dirs["sd-scripts"])
+        current_backends_root = str(configured_backends_root())
+        current_musubi_python_path = resolve_musubi_python(Path(current_main_dir).expanduser()) if current_main_dir else None
         current_default_caption_keyword = settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, "")
         current_compile_optimizations = settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0").strip().lower() in {
             "1",
@@ -1279,6 +1411,13 @@ def launch_ui() -> int:
             "on",
         }
 
+        def _settings_log(message: str) -> None:
+            msg = str(message)
+            try:
+                log(msg)  # type: ignore[name-defined]
+            except Exception:
+                print(msg)
+
         result: RuntimeConfig | None = None
         dialog = tk.Toplevel(root)
         dialog.withdraw()
@@ -1306,9 +1445,9 @@ def launch_ui() -> int:
         footer.grid(row=1, column=0, sticky="ew")
         footer.columnconfigure(0, weight=1)
 
-        musubi_section = ttk.LabelFrame(general_tab, text="Musubi-Tuner", padding=8)
-        musubi_section.grid(row=0, column=0, sticky="ew")
-        musubi_section.columnconfigure(1, weight=1)
+        backends_section = ttk.LabelFrame(general_tab, text="Backends", padding=8)
+        backends_section.grid(row=0, column=0, sticky="ew")
+        backends_section.columnconfigure(1, weight=1)
 
         captions_section = ttk.LabelFrame(general_tab, text="Captions", padding=8)
         captions_section.grid(row=1, column=0, sticky="ew", pady=(10, 0))
@@ -1421,7 +1560,10 @@ def launch_ui() -> int:
             for child in widget.winfo_children():
                 _bind_mousewheel(child)
 
-        selected_musubi_path = current_dir
+        selected_backends_root = current_backends_root
+        selected_musubi_main_path = current_main_dir
+        selected_musubi_ltx_path = current_ltx_dir
+        selected_sd_scripts_path = current_sd_scripts_dir
         selected_musubi_python = str(current_musubi_python_path) if current_musubi_python_path is not None else ""
 
         # pending_model_paths: model_name → {component: path_str}
@@ -1464,7 +1606,16 @@ def launch_ui() -> int:
             return sorted(names, key=str.casefold)
 
         preferred_preset_vars: dict[str, tk.StringVar] = {}
-        musubi_display_var = tk.StringVar(value=current_dir if current_dir else "(none)")
+        backends_root_var = tk.StringVar(value=selected_backends_root)
+        musubi_main_display_var = tk.StringVar(value=selected_musubi_main_path if selected_musubi_main_path else "(none)")
+        musubi_ltx_display_var = tk.StringVar(value=selected_musubi_ltx_path if selected_musubi_ltx_path else "(none)")
+        sd_scripts_display_var = tk.StringVar(value=selected_sd_scripts_path if selected_sd_scripts_path else "(none)")
+        musubi_main_status_var = tk.StringVar(value="")
+        musubi_ltx_status_var = tk.StringVar(value="")
+        sd_scripts_status_var = tk.StringVar(value="")
+        musubi_main_action_var = tk.StringVar(value="Auto Download")
+        musubi_ltx_action_var = tk.StringVar(value="Auto Download")
+        sd_scripts_action_var = tk.StringVar(value="Auto Download")
         default_caption_keyword_var = tk.StringVar(value=current_default_caption_keyword)
         compile_optimizations_var = tk.BooleanVar(value=current_compile_optimizations)
         cuda_allow_tf32_var = tk.BooleanVar(value=current_cuda_allow_tf32)
@@ -1478,15 +1629,105 @@ def launch_ui() -> int:
         auto_cleanup_states_var = tk.BooleanVar(value=current_auto_cleanup_states)
         train_save_every_default_var = tk.StringVar(value=current_train_save_every_n_steps)
 
-        ttk.Label(musubi_section, text="Musubi-Tuner folder:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        musubi_display = ttk.Label(
-            musubi_section, textvariable=musubi_display_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
-        )
-        musubi_display.grid(row=0, column=1, sticky="ew")
+        ttk.Label(backends_section, text="Backends root:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Label(
-            musubi_section,
-            text="Python interpreter is managed automatically by this app.",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+            backends_section,
+            textvariable=backends_root_var,
+            anchor="w",
+            style="PathDisplay.TLabel",
+            padding=(6, 4),
+        ).grid(row=0, column=1, sticky="ew")
+        ttk.Button(backends_section, text="Browse Root", command=lambda: browse_backends_root()).grid(
+            row=0,
+            column=2,
+            padx=(8, 0),
+        )
+
+        ttk.Label(backends_section, text="Musubi Main:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(
+            backends_section,
+            textvariable=musubi_main_display_var,
+            anchor="w",
+            style="PathDisplay.TLabel",
+            padding=(6, 4),
+        ).grid(row=1, column=1, sticky="ew", pady=(8, 0))
+        ttk.Button(backends_section, text="Browse", command=lambda: browse_backend("musubi-main")).grid(
+            row=1,
+            column=2,
+            padx=(8, 0),
+            pady=(8, 0),
+        )
+        ttk.Button(backends_section, textvariable=musubi_main_action_var, command=lambda: auto_download_backend("musubi-main")).grid(
+            row=1,
+            column=3,
+            padx=(8, 0),
+            pady=(8, 0),
+        )
+        ttk.Label(backends_section, textvariable=musubi_main_status_var).grid(row=2, column=1, sticky="w")
+        ttk.Label(
+            backends_section,
+            text="Used for: FLUX2, QWEN, ZIMAGE, WAN",
+            foreground=fg_muted,
+        ).grid(row=2, column=2, columnspan=2, sticky="w")
+
+        ttk.Label(backends_section, text="Musubi LTX:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(
+            backends_section,
+            textvariable=musubi_ltx_display_var,
+            anchor="w",
+            style="PathDisplay.TLabel",
+            padding=(6, 4),
+        ).grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        ttk.Button(backends_section, text="Browse", command=lambda: browse_backend("musubi-ltx")).grid(
+            row=3,
+            column=2,
+            padx=(8, 0),
+            pady=(8, 0),
+        )
+        ttk.Button(backends_section, textvariable=musubi_ltx_action_var, command=lambda: auto_download_backend("musubi-ltx")).grid(
+            row=3,
+            column=3,
+            padx=(8, 0),
+            pady=(8, 0),
+        )
+        ttk.Label(backends_section, textvariable=musubi_ltx_status_var).grid(row=4, column=1, sticky="w")
+        ttk.Label(
+            backends_section,
+            text="Used for: LTX",
+            foreground=fg_muted,
+        ).grid(row=4, column=2, columnspan=2, sticky="w")
+
+        ttk.Label(backends_section, text="sd-scripts:").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(
+            backends_section,
+            textvariable=sd_scripts_display_var,
+            anchor="w",
+            style="PathDisplay.TLabel",
+            padding=(6, 4),
+        ).grid(row=5, column=1, sticky="ew", pady=(8, 0))
+        ttk.Button(backends_section, text="Browse", command=lambda: browse_backend("sd-scripts")).grid(
+            row=5,
+            column=2,
+            padx=(8, 0),
+            pady=(8, 0),
+        )
+        ttk.Button(backends_section, textvariable=sd_scripts_action_var, command=lambda: auto_download_backend("sd-scripts")).grid(
+            row=5,
+            column=3,
+            padx=(8, 0),
+            pady=(8, 0),
+        )
+        ttk.Label(backends_section, textvariable=sd_scripts_status_var).grid(row=6, column=1, sticky="w")
+        ttk.Label(
+            backends_section,
+            text="Used for: ANIMA, FLUX, SDXL",
+            foreground=fg_muted,
+        ).grid(row=6, column=2, columnspan=2, sticky="w")
+
+        ttk.Label(
+            backends_section,
+            text="Model families are shown based on backend availability. Python interpreter is managed by this app.",
+        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         ttk.Label(captions_section, text="Default caption keyword:").grid(
             row=0,
@@ -1941,21 +2182,228 @@ def launch_ui() -> int:
 
             threading.Thread(target=_do_download, daemon=True).start()
 
-        def browse_musubi() -> None:
-            nonlocal selected_musubi_path, selected_musubi_python
+        def _refresh_backend_status_labels() -> None:
+            main_path = Path(selected_musubi_main_path).expanduser()
+            ltx_path = Path(selected_musubi_ltx_path).expanduser()
+            sd_path = Path(selected_sd_scripts_path).expanduser()
+            preferred_main = Path(selected_backends_root).expanduser() / "musubi-main"
+            preferred_ltx = Path(selected_backends_root).expanduser() / "musubi-ltx"
+            preferred_sd = Path(selected_backends_root).expanduser() / "sd-scripts"
+
+            main_ok = backend_is_valid("musubi-main", main_path)
+            ltx_ok = backend_is_valid("musubi-ltx", ltx_path)
+            sd_ok = backend_is_valid("sd-scripts", sd_path)
+            musubi_main_status_var.set("Configured" if main_ok else "Missing or invalid")
+            musubi_ltx_status_var.set("Configured" if ltx_ok else "Missing or invalid")
+            sd_scripts_status_var.set("Configured" if sd_ok else "Missing or invalid")
+
+            main_is_preferred = main_ok and main_path.resolve() == preferred_main.resolve()
+            ltx_is_preferred = ltx_ok and ltx_path.resolve() == preferred_ltx.resolve()
+            sd_is_preferred = sd_ok and sd_path.resolve() == preferred_sd.resolve()
+
+            musubi_main_action_var.set("Update" if main_is_preferred else "Auto Download")
+            musubi_ltx_action_var.set("Update" if ltx_is_preferred else "Auto Download")
+            sd_scripts_action_var.set("Update" if sd_is_preferred else "Auto Download")
+
+        def _persist_backend_paths() -> None:
+            settings_state[BACKENDS_ROOT_KEY] = str(Path(selected_backends_root).expanduser())
+            settings_state[MUSUBI_MAIN_DIR_KEY] = str(Path(selected_musubi_main_path).expanduser())
+            settings_state[MUSUBI_LTX_DIR_KEY] = str(Path(selected_musubi_ltx_path).expanduser())
+            settings_state[SD_SCRIPTS_DIR_KEY] = str(Path(selected_sd_scripts_path).expanduser())
+            # Backward compatibility for legacy single-musubi key.
+            settings_state[MUSUBI_DIR_KEY] = settings_state[MUSUBI_MAIN_DIR_KEY]
+            save_settings(settings_state)
+
+        def browse_backends_root() -> None:
+            nonlocal selected_backends_root, selected_musubi_main_path, selected_musubi_ltx_path, selected_sd_scripts_path
             picked = filedialog.askdirectory(
                 parent=dialog,
-                title="Select Musubi-Tuner folder",
-                initialdir=selected_musubi_path or str(Path.home()),
+                title="Select Backends root folder",
+                initialdir=selected_backends_root or str(default_backends_root()),
             )
-            if picked:
-                selected_musubi_path = picked
-                musubi_display_var.set(picked)
+            if not picked:
+                return
+
+            selected_backends_root = picked
+            backends_root_var.set(picked)
+
+            if not settings_state.get(MUSUBI_MAIN_DIR_KEY, "").strip():
+                selected_musubi_main_path = str(Path(picked) / "musubi-main")
+                musubi_main_display_var.set(selected_musubi_main_path)
+            if not settings_state.get(MUSUBI_LTX_DIR_KEY, "").strip():
+                selected_musubi_ltx_path = str(Path(picked) / "musubi-ltx")
+                musubi_ltx_display_var.set(selected_musubi_ltx_path)
+            if not settings_state.get(SD_SCRIPTS_DIR_KEY, "").strip():
+                selected_sd_scripts_path = str(Path(picked) / "sd-scripts")
+                sd_scripts_display_var.set(selected_sd_scripts_path)
+            _refresh_backend_status_labels()
+
+        def browse_backend(kind: str) -> None:
+            nonlocal selected_musubi_main_path, selected_musubi_ltx_path, selected_sd_scripts_path, selected_musubi_python
+            if kind == "musubi-main":
+                current = selected_musubi_main_path
+                title = "Select Musubi Main folder"
+            elif kind == "musubi-ltx":
+                current = selected_musubi_ltx_path
+                title = "Select Musubi LTX folder"
+            else:
+                current = selected_sd_scripts_path
+                title = "Select sd-scripts folder"
+
+            picked = filedialog.askdirectory(
+                parent=dialog,
+                title=title,
+                initialdir=current or str(Path.home()),
+            )
+            if not picked:
+                return
+
+            if kind == "musubi-main":
+                selected_musubi_main_path = picked
+                musubi_main_display_var.set(picked)
                 detected_python = resolve_musubi_python(Path(picked).expanduser())
-                if detected_python is not None:
-                    selected_musubi_python = str(detected_python)
+                selected_musubi_python = str(detected_python) if detected_python is not None else ""
+            elif kind == "musubi-ltx":
+                selected_musubi_ltx_path = picked
+                musubi_ltx_display_var.set(picked)
+            else:
+                selected_sd_scripts_path = picked
+                sd_scripts_display_var.set(picked)
+
+            _refresh_backend_status_labels()
+
+        def auto_download_backend(kind: str) -> None:
+            nonlocal selected_musubi_main_path, selected_musubi_ltx_path, selected_sd_scripts_path, selected_musubi_python
+            row_map = {row_kind: (label, repo_url, branch) for label, row_kind, _k, _d, repo_url, branch in backend_repo_rows()}
+            label, repo_url, branch = row_map[kind]
+            clone_confirmed = False
+
+            if kind == "musubi-main":
+                current_target = Path(selected_musubi_main_path).expanduser() if selected_musubi_main_path else Path(selected_backends_root) / "musubi-main"
+                preferred_target = Path(selected_backends_root).expanduser() / "musubi-main"
+            elif kind == "musubi-ltx":
+                current_target = Path(selected_musubi_ltx_path).expanduser() if selected_musubi_ltx_path else Path(selected_backends_root) / "musubi-ltx"
+                preferred_target = Path(selected_backends_root).expanduser() / "musubi-ltx"
+            else:
+                current_target = Path(selected_sd_scripts_path).expanduser() if selected_sd_scripts_path else Path(selected_backends_root) / "sd-scripts"
+                preferred_target = Path(selected_backends_root).expanduser() / "sd-scripts"
+
+            target = preferred_target
+
+            selected_is_preferred = False
+            if backend_is_valid(kind, current_target):
+                try:
+                    selected_is_preferred = current_target.resolve() == target.resolve()
+                except OSError:
+                    selected_is_preferred = False
+
+            def _apply_selected_backend(path: Path) -> None:
+                nonlocal selected_musubi_main_path, selected_musubi_ltx_path, selected_sd_scripts_path, selected_musubi_python
+                if kind == "musubi-main":
+                    selected_musubi_main_path = str(path)
+                    musubi_main_display_var.set(str(path))
+                    detected_python = resolve_musubi_python(path)
+                    selected_musubi_python = str(detected_python) if detected_python is not None else ""
+                elif kind == "musubi-ltx":
+                    selected_musubi_ltx_path = str(path)
+                    musubi_ltx_display_var.set(str(path))
                 else:
-                    selected_musubi_python = ""
+                    selected_sd_scripts_path = str(path)
+                    sd_scripts_display_var.set(str(path))
+                _refresh_backend_status_labels()
+                _persist_backend_paths()
+
+            if selected_is_preferred:
+                _settings_log(f"[Backends] {label}: update started")
+                confirm_update = messagebox.askyesno(
+                    "Update backend",
+                    f"Run git pull for {label}?\n\nTarget:\n{target}",
+                    parent=dialog,
+                )
+                if not confirm_update:
+                    _settings_log(f"[Backends] {label}: update cancelled")
+                    return
+
+                ok, output = update_backend_repo(target)
+                if ok:
+                    _apply_selected_backend(target)
+                    _settings_log(f"[Backends] {label}: update done")
+                    messagebox.showinfo(
+                        "Update complete",
+                        f"{label} updated successfully.\n\n{output}",
+                        parent=dialog,
+                    )
+                    return
+
+                _settings_log(f"[Backends] {label}: update failed")
+
+                reset_now = messagebox.askyesno(
+                    "Update failed",
+                    f"git pull failed for {label}:\n\n{output}\n\n"
+                    "Do you want to reset this backend (delete folder and re-download)?",
+                    parent=dialog,
+                )
+                if not reset_now:
+                    _settings_log(f"[Backends] {label}: reset cancelled")
+                    return
+
+                _settings_log(f"[Backends] {label}: reset started")
+                try:
+                    shutil.rmtree(target)
+                except OSError as exc:
+                    _settings_log(f"[Backends] {label}: reset failed")
+                    messagebox.showerror("Reset failed", f"Could not remove folder:\n{exc}", parent=dialog)
+                    return
+
+                ok, err = clone_backend_repo(target, repo_url, branch)
+                if not ok:
+                    _settings_log(f"[Backends] {label}: re-download failed")
+                    messagebox.showerror("Re-download failed", err, parent=dialog)
+                    return
+
+                _apply_selected_backend(target)
+                _settings_log(f"[Backends] {label}: reset done")
+                messagebox.showinfo("Reset complete", f"Re-downloaded {label}:\n{target}", parent=dialog)
+                return
+
+            if backend_is_valid(kind, target):
+                _apply_selected_backend(target)
+                return
+
+            if backend_is_valid(kind, current_target) and current_target.resolve() != target.resolve():
+                clone_here = messagebox.askyesno(
+                    "Download backend",
+                    f"{label} is currently configured outside Backends:\n{current_target}\n\n"
+                    f"Clone another copy into Backends and switch to it?\n\nTarget:\n{target}",
+                    parent=dialog,
+                )
+                if not clone_here:
+                    _apply_selected_backend(current_target)
+                    return
+                clone_confirmed = True
+
+            if not clone_confirmed:
+                confirm = messagebox.askyesno(
+                    "Download backend",
+                    f"Clone {label} into:\n{target}\n\nRepository:\n{repo_url}" + (f"\nBranch: {branch}" if branch else ""),
+                    parent=dialog,
+                )
+                if not confirm:
+                    _settings_log(f"[Backends] {label}: download cancelled")
+                    return
+
+            _settings_log(f"[Backends] {label}: download started")
+            ok, err = clone_backend_repo(target, repo_url, branch)
+            if not ok:
+                _settings_log(f"[Backends] {label}: download failed")
+                messagebox.showerror("Clone failed", err, parent=dialog)
+                return
+
+            _apply_selected_backend(target)
+            _settings_log(f"[Backends] {label}: download done")
+            messagebox.showinfo("Clone complete", f"Configured {label}:\n{target}", parent=dialog)
+
+        _refresh_backend_status_labels()
 
         def browse_file(current_path: str, initial_dir_hint: str, title: str) -> str | None:
             initial_dir = initial_dir_hint
@@ -1997,9 +2445,18 @@ def launch_ui() -> int:
             nonlocal result, settings_state
             # Force any focused entry widget to commit (triggers FocusOut → _save_path)
             dialog.focus_set()
-            if not selected_musubi_path:
-                messagebox.showerror("Missing folder", "Musubi-Tuner folder is not set.", parent=dialog)
-                return
+            main_dir = Path(selected_musubi_main_path).expanduser()
+            ltx_dir = Path(selected_musubi_ltx_path).expanduser()
+            sd_scripts_dir = Path(selected_sd_scripts_path).expanduser()
+
+            if required:
+                if not backend_is_valid("musubi-main", main_dir) and not backend_is_valid("musubi-ltx", ltx_dir):
+                    messagebox.showerror(
+                        "Missing backend",
+                        "Set at least one Musubi backend (Main or LTX) before continuing.",
+                        parent=dialog,
+                    )
+                    return
 
             try:
                 save_every_default_value = int(train_save_every_default_var.get().strip())
@@ -2013,12 +2470,11 @@ def launch_ui() -> int:
                 )
                 return
 
-            musubi_path = Path(selected_musubi_path).expanduser()
-            if not musubi_path.exists() or not musubi_path.is_dir():
-                messagebox.showerror("Invalid folder", "Choose a valid Musubi-Tuner folder.", parent=dialog)
+            if not main_dir.exists() or not main_dir.is_dir():
+                messagebox.showerror("Invalid folder", "Choose a valid Musubi Main folder.", parent=dialog)
                 return
 
-            musubi_python_path = resolve_musubi_python(musubi_path)
+            musubi_python_path = resolve_musubi_python(main_dir)
             if musubi_python_path is None:
                 messagebox.showerror(
                     "Python venv not found",
@@ -2028,7 +2484,11 @@ def launch_ui() -> int:
                 return
 
             import json as _json_save
-            settings_state[MUSUBI_DIR_KEY] = str(musubi_path)
+            settings_state[BACKENDS_ROOT_KEY] = str(Path(selected_backends_root).expanduser())
+            settings_state[MUSUBI_MAIN_DIR_KEY] = str(main_dir)
+            settings_state[MUSUBI_LTX_DIR_KEY] = str(ltx_dir)
+            settings_state[SD_SCRIPTS_DIR_KEY] = str(sd_scripts_dir)
+            settings_state[MUSUBI_DIR_KEY] = str(main_dir)
             settings_state[MUSUBI_PYTHON_KEY] = ""
             settings_state[MODEL_PATHS_KEY] = _json_save.dumps(pending_model_paths)
             # Backward compat: derive legacy keys from pending_model_paths
@@ -2096,7 +2556,6 @@ def launch_ui() -> int:
             dialog.destroy()
             root.after_idle(root.destroy)
 
-        ttk.Button(musubi_section, text="Browse Folder", command=browse_musubi).grid(row=0, column=2, padx=(8, 0))
         button_row = ttk.Frame(footer)
         button_row.grid(row=0, column=0, sticky="ew")
         button_row.columnconfigure(0, weight=1)
@@ -2126,22 +2585,23 @@ def launch_ui() -> int:
 
         return result
 
-    if runtime_config is None or not is_valid_musubi_tuner_dir(runtime_config.musubi_dir):
-        proceed = prompt_to_clone_or_select_musubi()
-        if not proceed:
+    if is_first_launch_unconfigured():
+        messagebox.showinfo(
+            "First launch setup",
+            "No model or backend settings were found yet.\n\n"
+            "Open Settings and set up at least one backend\n"
+            "for the model families you want to use.",
+            parent=root,
+        )
+        runtime_config = open_settings_dialog(required=False)
+        if runtime_config is None:
             root.destroy()
             return 1
-
-        if runtime_config is None or not is_valid_musubi_tuner_dir(runtime_config.musubi_dir):
-            messagebox.showinfo(
-                "First launch setup",
-                "Musubi-Tuner location is required before this app can run. Set it in Settings now.",
-                parent=root,
-            )
-            runtime_config = open_settings_dialog(required=True)
-            if runtime_config is None or not is_valid_musubi_tuner_dir(runtime_config.musubi_dir):
-                root.destroy()
-                return 1
+    elif runtime_config is None:
+        runtime_config = open_settings_dialog(required=False)
+        if runtime_config is None:
+            root.destroy()
+            return 1
 
     maybe_autostart_tensorboard()
 
@@ -3661,7 +4121,7 @@ def launch_ui() -> int:
         root.wait_window(dialog)
 
     def archive_root_dir() -> Path:
-        return datasets_root_dir().parent / "Archive"
+        return datasets_root_dir().parent / "Archives"
 
     def archive_dataset(dataset_name: str) -> None:
         src = dataset_dir_path(dataset_name)
@@ -3672,7 +4132,7 @@ def launch_ui() -> int:
         dest = dest_parent / dataset_name
         if not messagebox.askyesno(
             "Archive dataset",
-            f"Move dataset '{dataset_name}' to Archive/Datasets?\n\nThe folder will be moved out of the Datasets directory.",
+            f"Move dataset '{dataset_name}' to Archives/Datasets?\n\nThe folder will be moved out of the Datasets directory.",
             parent=root,
         ):
             return
@@ -3706,7 +4166,7 @@ def launch_ui() -> int:
         label = "\n".join(f"  • {n}" for n in names)
         if not messagebox.askyesno(
             "Archive Datasets",
-            f"Move {len(names)} dataset(s) to Archive/Datasets?\n\n{label}\n\nThe folders will be moved out of the Datasets directory.",
+            f"Move {len(names)} dataset(s) to Archives/Datasets?\n\n{label}\n\nThe folders will be moved out of the Datasets directory.",
             parent=root,
         ):
             return
@@ -5252,12 +5712,33 @@ def launch_ui() -> int:
         except Exception:
             pass
         _all_mn = [mn for fam in DOWNLOAD_MODEL_FAMILIES.values() for mn in fam]
-        _avail_models = [mn for mn in _all_mn if _mpaths_cj.get(mn, {}).get("dit")]
+        _backend_dirs = configured_backend_dirs()
+
+        def _backend_ready_for_model(mn: str) -> bool:
+            kind = backend_kind_for_model(mn)
+            path = _backend_dirs.get(kind)
+            if path is None:
+                return False
+            return backend_is_valid(kind, path)
+
+        _avail_models = [
+            mn for mn in _all_mn
+            if _mpaths_cj.get(mn, {}).get("dit") and _backend_ready_for_model(mn)
+        ]
         # Backward compat: legacy klein key
-        if not _avail_models and settings_state.get(KLEIN_DIT_KEY, "").strip():
+        if not _avail_models and settings_state.get(KLEIN_DIT_KEY, "").strip() and _backend_ready_for_model("klein-base-9b"):
             _avail_models = ["klein-base-9b"]
         if not _avail_models:
-            _avail_models = ["klein-base-9b"]
+            _avail_models = [mn for mn in _all_mn if _backend_ready_for_model(mn)]
+        if not _avail_models:
+            messagebox.showinfo(
+                "No models available",
+                "No model backend is currently available for Jobs.\n\n"
+                "Configure Musubi Main and/or Musubi LTX in Settings.",
+                parent=root,
+            )
+            dialog.destroy()
+            return
         if model_var.get() not in _avail_models:
             model_var.set(_avail_models[0])
         _display_values = [DOWNLOAD_MODEL_DISPLAY_NAMES.get(mn, mn) for mn in _avail_models]
