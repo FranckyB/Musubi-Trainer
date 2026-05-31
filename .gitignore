@@ -7,7 +7,8 @@ Datasets/*
 !Datasets/.gitkeep
 Archive/*
 !Archive/.gitkeep
-_activate_venv.bat
+Presets/*
+!Presets/.gitkeep
 
 # Python bytecode and caches
 __pycache__/
@@ -43,3 +44,4 @@ Thumbs.db
 Musubi-Trainer-Workspace.code-workspace
 settings.json
 src/settings.json
+Launch_Console.bat

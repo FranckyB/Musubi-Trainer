@@ -33,18 +33,13 @@ from .app_settings import (
     MUSUBI_DIR_KEY,
     MUSUBI_PYTHON_KEY,
     SETTINGS_FILE,
-    TRAIN_LEARNING_RATE_KEY,
     TRAIN_LOG_BACKEND_KEY,
     TRAIN_LOG_TRACKER_NAME_KEY,
     TRAIN_STREAM_TO_LOGGER_KEY,
     TRAIN_AUTO_START_TENSORBOARD_KEY,
     TRAIN_AUTO_CLEANUP_STATES_KEY,
-    TRAIN_NETWORK_ALPHA_KEY,
-    TRAIN_NETWORK_DIM_KEY,
-    TRAIN_OPTIMIZER_TYPE_KEY,
+    TRAIN_SAVE_EVERY_N_STEPS_KEY,
     TRAIN_ENABLE_LOGGING_KEY,
-    TRAIN_RESOLUTION_KEY,
-    TRAIN_STEPS_KEY,
     WINDOW_HEIGHT_KEY,
     WINDOW_WIDTH_KEY,
     WINDOW_X_KEY,
@@ -52,6 +47,9 @@ from .app_settings import (
     SASH_POSITION_KEY,
     MODEL_DOWNLOAD_LOCATION_KEY,
     HF_TOKEN_KEY,
+    MODEL_PATHS_KEY,
+    EXTRA_SEARCH_PATHS_KEY,
+    PREFERRED_PRESETS_BY_FAMILY_KEY,
     load_settings,
     parse_int_setting,
     load_window_size,
@@ -60,14 +58,18 @@ from .app_settings import (
 )
 from .download_models import (
     MODELS as DOWNLOAD_MODELS,
+    MODEL_FAMILIES as DOWNLOAD_MODEL_FAMILIES,
+    MODEL_DISPLAY_NAMES as DOWNLOAD_MODEL_DISPLAY_NAMES,
+    COMPONENT_FRIENDLY_NAMES as DOWNLOAD_COMPONENT_FRIENDLY_NAMES,
     DOWNLOAD_LOCATIONS,
     DOWNLOAD_LOCATION_MODELS_FOLDER,
     find_component,
+    find_in_extra_paths,
     auto_resolve_klein,
     workspace_root as download_workspace_root,
 )
-from .klein_runtime_config import KleinRuntimeConfig, klein_runtime_config_from_settings, resolve_musubi_python
-from .klein_train import (
+from .runtime_config import RuntimeConfig, runtime_config_from_settings, runtime_config_for_model, resolve_musubi_python
+from .train_utils import (
     DEFAULT_LEARNING_RATE,
     DEFAULT_NETWORK_ALPHA,
     DEFAULT_NETWORK_DIM,
@@ -75,10 +77,36 @@ from .klein_train import (
     DEFAULT_SAVE_EVERY_N_STEPS,
     DEFAULT_TRAIN_STEPS,
     JOB_EXIT_CANCELLED,
+    JOB_EXIT_FAILED,
     JOB_EXIT_SUCCESS,
-    run_job,
-    train_models,
 )
+from .train_flux2 import run_job as _run_job_flux2, train_models
+from .train_ltx import run_job as _run_job_ltx
+from .train_wan import run_job as _run_job_wan
+from .train_zimage import run_job as _run_job_zimage
+from .train_qwen import run_job as _run_job_qwen
+
+# Model name → run_job function
+_KLEIN_MODELS = {"flux2-dev", "klein-base-9b", "klein-9b", "klein-base-4b", "klein-4b"}
+_LTX_MODELS = {"ltx-2.3"}
+_WAN_MODELS = {"wan2.1-t2v-14b", "wan2.1-i2v-720p-14b", "wan2.1-i2v-480p-14b", "wan2.2-t2v-14b", "wan2.2-i2v-720p-14b", "wan2.2-i2v-480p-14b"}
+_ZIMAGE_MODELS = {"zimage-de-turbo"}
+_QWEN_MODELS = {"qwen-image", "qwen-image-edit", "qwen-image-edit-2509", "qwen-image-edit-2511", "qwen-image-layered"}
+
+
+def _run_job_for_model(model_name: str):
+    """Return the appropriate run_job function for a given model name."""
+    if model_name in _KLEIN_MODELS:
+        return _run_job_flux2
+    if model_name in _LTX_MODELS:
+        return _run_job_ltx
+    if model_name in _WAN_MODELS:
+        return _run_job_wan
+    if model_name in _ZIMAGE_MODELS:
+        return _run_job_zimage
+    if model_name in _QWEN_MODELS:
+        return _run_job_qwen
+    return None
 
 
 # Model files
@@ -87,12 +115,23 @@ LATENT_SUFFIX = "f2k9b"
 DATASET_ORDER_KEY = "dataset_order"
 DRAG_START_THRESHOLD_PX = 20
 DATASET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
-DATASET_SETTINGS_FILE_NAME = "settings.json"
-DATASET_USE_GLOBAL_TRAIN_KEY = "use_global_train_settings"
 TRAIN_DIM_ALPHA_CHOICES = ("16", "32", "64")
 RESOLUTION_CHOICES = (512, 768, 1024, 1280)
+OPTIMIZER_TYPE_CHOICES = (
+    "adamw8bit",
+    "prodigy",
+    "adamw",
+    "adafactor",
+    "pagedadamw8bit",
+    "pagedadam8bit",
+    "came8bit",
+)
+DEFAULT_PRODIGY_OPTIMIZER_ARGS = (
+    "safeguard_warmup=True use_bias_correction=True weight_decay=0.01 betas=(0.9,0.99)"
+)
 JOB_SETTINGS_FILE_NAME = "settings.json"
 JOBS_ORDER_FILE_NAME = "_order.json"
+JOB_PRESET_FILE_SUFFIX = ".preset.json"
 JOB_PROGRESS_FILE_NAME = "progress.json"
 INVALID_FOLDER_CHARS = set('<>:"/\\|?*')
 WINDOWS_RESERVED_NAMES = {
@@ -109,14 +148,11 @@ def get_positive_int_setting(settings: dict[str, str], key: str, fallback: int, 
     return value
 
 
-def get_learning_rate_setting(settings: dict[str, str]) -> str:
-    value = settings.get(TRAIN_LEARNING_RATE_KEY, "").strip()
-    return value if value else DEFAULT_LEARNING_RATE
-
-
-def get_train_optimizer_setting(settings: dict[str, str]) -> str:
-    value = settings.get(TRAIN_OPTIMIZER_TYPE_KEY, "").strip().lower()
-    return value if value in {"adamw8bit", "prodigy"} else "prodigy"
+def get_non_negative_int_setting(settings: dict[str, str], key: str, fallback: int) -> int:
+    value = parse_int_setting(settings, key)
+    if value is None or value < 0:
+        return fallback
+    return value
 
 
 def get_train_log_backend_setting(settings: dict[str, str]) -> str:
@@ -496,7 +532,22 @@ def launch_ui() -> int:
         fieldbackground=[("readonly", "#1f1f1f"), ("disabled", "#2a2a2a")],
         foreground=[("disabled", fg_muted)],
     )
+    # Ensure insertion caret is visible on dark entry backgrounds.
+    style.configure("TEntry", insertcolor=fg_text)
+    style.configure("Flat.TEntry", insertcolor=fg_text)
     style.configure("PathDisplay.TLabel", background="#1f1f1f", foreground=fg_text)
+    style.configure(
+        "FamilyHeader.TButton",
+        background="#2d2d2d",
+        foreground=fg_text,
+        font=("Segoe UI", 9, "bold"),
+        anchor="w",
+        padding=(8, 4),
+    )
+    style.map(
+        "FamilyHeader.TButton",
+        background=[("active", "#383838"), ("pressed", "#383838")],
+    )
     style.configure(
         "TCombobox",
         fieldbackground="#1f1f1f",
@@ -515,6 +566,10 @@ def launch_ui() -> int:
         selectbackground=[("readonly", "#2f4f66")],
         selectforeground=[("readonly", "#ffffff")],
     )
+    style.configure("TCombobox", insertcolor=fg_text)
+    # Option database fallbacks help classic tk.Entry and themed entries on some platforms.
+    root.option_add("*insertBackground", fg_text)
+    root.option_add("*insertWidth", 2)
     # Style ttk.Combobox dropdown list to avoid OS-default bright colors.
     root.option_add("*TCombobox*Listbox.background", "#1f1f1f")
     root.option_add("*TCombobox*Listbox.foreground", fg_text)
@@ -755,10 +810,9 @@ def launch_ui() -> int:
 
     vars_by_name: dict[str, tk.BooleanVar] = {}
     card_widgets: list[tk.Widget] = []
-    thumbnail_cache: dict[tuple[str, str, int, int, bool], ImageTk.PhotoImage] = {}
+    thumbnail_cache: dict[tuple[str, str, int, int], ImageTk.PhotoImage] = {}
     first_image_cache: dict[str, Path | None] = {}
     checkpoint_cache: dict[str, tuple[Path | None, int]] = {}
-    dataset_train_settings_cache: dict[str, dict[str, str]] = {}
     run_state_by_name: dict[str, str] = {}
     card_frame_by_name: dict[str, ttk.Frame] = {}
     card_thumb_by_name: dict[str, ImageTk.PhotoImage] = {}
@@ -788,7 +842,7 @@ def launch_ui() -> int:
     queue_row_dividers: dict[str, tk.Frame] = {}
     queue_col_dividers: list[tk.Frame] = []
     queue_thumb_by_item: dict[str, ImageTk.PhotoImage] = {}
-    runtime_config = klein_runtime_config_from_settings(settings_state)
+    runtime_config = runtime_config_from_settings(settings_state)
     tensorboard_host = "127.0.0.1"
     tensorboard_port = 6006
     tensorboard_url = f"http://{tensorboard_host}:{tensorboard_port}"
@@ -929,20 +983,6 @@ def launch_ui() -> int:
         save_dataset_order(settings_state, dataset_order)
         save_settings(settings_state)
 
-    def global_train_settings() -> dict[str, str]:
-        return {
-            TRAIN_RESOLUTION_KEY: str(
-                get_positive_int_setting(settings_state, TRAIN_RESOLUTION_KEY, DEFAULT_RESOLUTION, minimum=64)
-            ),
-            TRAIN_NETWORK_DIM_KEY: str(get_positive_int_setting(settings_state, TRAIN_NETWORK_DIM_KEY, DEFAULT_NETWORK_DIM)),
-            TRAIN_NETWORK_ALPHA_KEY: str(
-                get_positive_int_setting(settings_state, TRAIN_NETWORK_ALPHA_KEY, DEFAULT_NETWORK_ALPHA)
-            ),
-            TRAIN_OPTIMIZER_TYPE_KEY: get_train_optimizer_setting(settings_state),
-            TRAIN_LEARNING_RATE_KEY: get_learning_rate_setting(settings_state),
-            TRAIN_STEPS_KEY: str(get_positive_int_setting(settings_state, TRAIN_STEPS_KEY, DEFAULT_TRAIN_STEPS)),
-        }
-
     def datasets_root_dir() -> Path:
         return runtime_config.training_dir.parent / "Datasets"
 
@@ -964,6 +1004,7 @@ def launch_ui() -> int:
         dataset_name: str = "",
         resolution: int = DEFAULT_RESOLUTION,
         batch_size: int = 1,
+        model_name: str = "",
     ) -> tuple[Path, Path, int]:
         # Normalise: support legacy single-dataset callers via dataset_name=
         if not datasets:
@@ -979,9 +1020,18 @@ def launch_ui() -> int:
         created_captions = 0
         caption_text = default_caption_keyword.strip()
 
+        model_name_key = (model_name or "").strip().lower()
+        if model_name_key == "ltx-2.3":
+            if int(resolution) == 1280:
+                toml_width, toml_height = 1280, 720
+            else:
+                toml_width, toml_height = 1920, 1080
+        else:
+            toml_width, toml_height = int(resolution), int(resolution)
+
         toml_lines: list[str] = [
             "[general]",
-            f"resolution = [{resolution}, {resolution}]",
+            f"resolution = [{toml_width}, {toml_height}]",
             'caption_extension = ".txt"',
             f"batch_size = {batch_size}",
             "enable_bucket = true",
@@ -1022,88 +1072,11 @@ def launch_ui() -> int:
 
         return job_dir, output_dir, created_captions
 
-    def dataset_settings_path(dataset_name: str) -> Path:
-        if runtime_config is None:
-            return Path(DATASET_SETTINGS_FILE_NAME)
-        return dataset_dir_path(dataset_name) / DATASET_SETTINGS_FILE_NAME
-
-    def load_dataset_train_settings_raw(dataset_name: str, refresh: bool = False) -> dict[str, str]:
-        if not refresh and dataset_name in dataset_train_settings_cache:
-            return dict(dataset_train_settings_cache[dataset_name])
-
-        path = dataset_settings_path(dataset_name)
-        if not path.exists() or not path.is_file():
-            dataset_train_settings_cache[dataset_name] = {}
-            return {}
-
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            dataset_train_settings_cache[dataset_name] = {}
-            return {}
-
-        if not isinstance(loaded, dict):
-            dataset_train_settings_cache[dataset_name] = {}
-            return {}
-
-        normalized = {str(k): str(v) for k, v in loaded.items()}
-        dataset_train_settings_cache[dataset_name] = normalized
-        return dict(normalized)
-
-    def save_dataset_train_settings_raw(dataset_name: str, raw_settings: dict[str, str]) -> None:
-        path = dataset_settings_path(dataset_name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(raw_settings, indent=2), encoding="utf-8")
-        dataset_train_settings_cache[dataset_name] = dict(raw_settings)
-
-    def effective_train_settings_for_dataset(dataset_name: str) -> dict[str, str]:
-        global_values = global_train_settings()
-        raw = load_dataset_train_settings_raw(dataset_name)
-        use_global = is_truthy(raw.get(DATASET_USE_GLOBAL_TRAIN_KEY), default=True)
-
-        if use_global:
-            return {
-                DATASET_USE_GLOBAL_TRAIN_KEY: "1",
-                **global_values,
-            }
-
-        return {
-            DATASET_USE_GLOBAL_TRAIN_KEY: "0",
-            TRAIN_RESOLUTION_KEY: str(
-                get_positive_int_setting(raw, TRAIN_RESOLUTION_KEY, int(global_values[TRAIN_RESOLUTION_KEY]), minimum=64)
-            ),
-            TRAIN_NETWORK_DIM_KEY: str(
-                get_positive_int_setting(raw, TRAIN_NETWORK_DIM_KEY, int(global_values[TRAIN_NETWORK_DIM_KEY]))
-            ),
-            TRAIN_NETWORK_ALPHA_KEY: str(
-                get_positive_int_setting(raw, TRAIN_NETWORK_ALPHA_KEY, int(global_values[TRAIN_NETWORK_ALPHA_KEY]))
-            ),
-            TRAIN_OPTIMIZER_TYPE_KEY: (
-                raw.get(TRAIN_OPTIMIZER_TYPE_KEY, "").strip().lower()
-                if raw.get(TRAIN_OPTIMIZER_TYPE_KEY, "").strip().lower() in {"adamw8bit", "prodigy"}
-                else global_values[TRAIN_OPTIMIZER_TYPE_KEY]
-            ),
-            TRAIN_LEARNING_RATE_KEY: raw.get(TRAIN_LEARNING_RATE_KEY, "").strip() or global_values[TRAIN_LEARNING_RATE_KEY],
-            TRAIN_STEPS_KEY: str(get_positive_int_setting(raw, TRAIN_STEPS_KEY, int(global_values[TRAIN_STEPS_KEY]))),
-        }
-
-    def dataset_has_train_override(dataset_name: str) -> bool:
-        raw = load_dataset_train_settings_raw(dataset_name)
-        return not is_truthy(raw.get(DATASET_USE_GLOBAL_TRAIN_KEY), default=True)
-
-    def open_settings_dialog(required: bool) -> KleinRuntimeConfig | None:
+    def open_settings_dialog(required: bool) -> RuntimeConfig | None:
         current_dir = ""
         if runtime_config is not None:
             current_dir = str(runtime_config.musubi_dir)
         current_musubi_python = settings_state.get(MUSUBI_PYTHON_KEY, "").strip()
-        current_klein_model_version = settings_state.get(KLEIN_MODEL_VERSION_KEY, "").strip() or "klein-base-9b"
-        current_klein_dit = settings_state.get(KLEIN_DIT_KEY, "").strip()
-        current_klein_vae = settings_state.get(KLEIN_VAE_KEY, "").strip()
-        current_klein_text_encoder = settings_state.get(KLEIN_TEXT_ENCODER_KEY, "").strip()
-        current_ltx_model_version = settings_state.get(LTX_MODEL_VERSION_KEY, "").strip()
-        current_ltx_dit = settings_state.get(LTX_DIT_KEY, "").strip()
-        current_ltx_vae = settings_state.get(LTX_VAE_KEY, "").strip()
-        current_ltx_text_encoder = settings_state.get(LTX_TEXT_ENCODER_KEY, "").strip()
         current_default_caption_keyword = settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, "")
         current_compile_optimizations = settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0").strip().lower() in {
             "1",
@@ -1129,29 +1102,6 @@ def launch_ui() -> int:
             "yes",
             "on",
         }
-        current_train_resolution = get_positive_int_setting(
-            settings_state,
-            TRAIN_RESOLUTION_KEY,
-            DEFAULT_RESOLUTION,
-            minimum=64,
-        )
-        current_train_network_dim = get_positive_int_setting(
-            settings_state,
-            TRAIN_NETWORK_DIM_KEY,
-            DEFAULT_NETWORK_DIM,
-        )
-        current_train_network_alpha = get_positive_int_setting(
-            settings_state,
-            TRAIN_NETWORK_ALPHA_KEY,
-            DEFAULT_NETWORK_ALPHA,
-        )
-        current_train_optimizer = get_train_optimizer_setting(settings_state)
-        current_train_learning_rate = get_learning_rate_setting(settings_state)
-        current_train_steps = get_positive_int_setting(
-            settings_state,
-            TRAIN_STEPS_KEY,
-            DEFAULT_TRAIN_STEPS,
-        )
         current_enable_training_logging = settings_state.get(
             TRAIN_ENABLE_LOGGING_KEY,
             "1",
@@ -1189,6 +1139,14 @@ def launch_ui() -> int:
             "yes",
             "on",
         }
+        current_train_save_every_n_steps = str(
+            get_positive_int_setting(
+                settings_state,
+                TRAIN_SAVE_EVERY_N_STEPS_KEY,
+                DEFAULT_SAVE_EVERY_N_STEPS,
+                minimum=1,
+            )
+        )
         current_gc_cpu_offload = settings_state.get(
             ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY,
             "0",
@@ -1199,7 +1157,7 @@ def launch_ui() -> int:
             "on",
         }
 
-        result: KleinRuntimeConfig | None = None
+        result: RuntimeConfig | None = None
         dialog = tk.Toplevel(root)
         dialog.withdraw()
         dialog.title("Settings")
@@ -1260,54 +1218,144 @@ def launch_ui() -> int:
         ttk.Entry(model_loc_frame, textvariable=hf_token_var, show="*", width=36, style="Flat.TEntry").grid(row=0, column=3, sticky="ew")
         model_loc_frame.columnconfigure(3, weight=1)
 
-        klein_section = ttk.LabelFrame(models_tab, text="Klein", padding=8)
-        klein_section.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        klein_section.columnconfigure(1, weight=1)
+        # ── ComfyUI path + scan ───────────────────────────────────────────
+        _raw_extra = settings_state.get(EXTRA_SEARCH_PATHS_KEY, "")
+        import json as _json_extra
+        try:
+            _extra_paths_list: list[str] = _json_extra.loads(_raw_extra) if _raw_extra else []
+        except Exception:
+            _extra_paths_list = []
 
-        ltx_section = ttk.LabelFrame(models_tab, text="LTX", padding=8)
-        ltx_section.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        ltx_section.columnconfigure(1, weight=1)
+        extra_paths_frame = ttk.Frame(models_tab)
+        extra_paths_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        extra_paths_frame.columnconfigure(1, weight=1)
+        ttk.Label(extra_paths_frame, text="ComfyUI models path:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        extra_path_var = tk.StringVar(value=_extra_paths_list[0] if _extra_paths_list else "")
+        ttk.Entry(extra_paths_frame, textvariable=extra_path_var, style="Flat.TEntry").grid(row=0, column=1, sticky="ew")
+
+        def _browse_extra_path() -> None:
+            picked = filedialog.askdirectory(
+                parent=dialog,
+                title="Select ComfyUI models folder",
+                initialdir=extra_path_var.get().strip() or str(Path.home()),
+            )
+            if picked:
+                extra_path_var.set(picked)
+
+        def _scan_all_sources() -> None:
+            """Scan Models folder, HF cache, and optionally the ComfyUI path for any missing files."""
+            ws_root = download_workspace_root()
+            comfy_dir = extra_path_var.get().strip()
+            extra = [comfy_dir] if comfy_dir and Path(comfy_dir).is_dir() else []
+            found_count = 0
+            for mn, comps in DOWNLOAD_MODELS.items():
+                for comp in comps:
+                    if pending_model_paths.get(mn, {}).get(comp):
+                        continue  # already set
+                    hit = find_component(mn, comp, ws_root, extra or None)
+                    if hit is not None:
+                        pending_model_paths.setdefault(mn, {})[comp] = str(hit)
+                        found_count += 1
+            # Refresh all entry StringVars and status labels
+            for mn in DOWNLOAD_MODELS:
+                for comp, cpv in _comp_path_vars_all.get(mn, {}).items():
+                    new_val = pending_model_paths.get(mn, {}).get(comp, "")
+                    if cpv.get() != new_val:
+                        cpv.set(new_val)
+                _refresh_status(mn)
+            if found_count:
+                messagebox.showinfo("Scan complete", f"Found {found_count} new file(s). Click Save to apply.", parent=dialog)
+            else:
+                messagebox.showinfo("Scan complete", "No new files found.", parent=dialog)
+
+        ttk.Button(extra_paths_frame, text="Browse…", command=_browse_extra_path).grid(row=0, column=2, padx=(6, 0))
+        ttk.Button(extra_paths_frame, text="Scan for models", command=_scan_all_sources).grid(row=0, column=3, padx=(6, 0))
+
+        # Registry of all component StringVars so _scan_extra_path can update them
+        _comp_path_vars_all: dict[str, dict[str, tk.StringVar]] = {}
+
+        models_canvas = tk.Canvas(models_tab, bg=bg_panel, highlightthickness=0)
+        models_scrollbar = ttk.Scrollbar(models_tab, orient="vertical", command=models_canvas.yview)
+        models_canvas.configure(yscrollcommand=models_scrollbar.set)
+        models_canvas.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        models_scrollbar.grid(row=2, column=1, sticky="ns", pady=(10, 0))
+        models_tab.rowconfigure(2, weight=1)
+
+        models_inner = ttk.Frame(models_canvas)
+        models_inner.columnconfigure(0, weight=1)
+        _mw_id = models_canvas.create_window((0, 0), window=models_inner, anchor="nw")
+
+        def _on_models_inner_configure(event: tk.Event) -> None:
+            models_canvas.configure(scrollregion=models_canvas.bbox("all"))
+
+        def _on_models_canvas_configure(event: tk.Event) -> None:
+            models_canvas.itemconfig(_mw_id, width=event.width)
+
+        models_inner.bind("<Configure>", _on_models_inner_configure)
+        models_canvas.bind("<Configure>", _on_models_canvas_configure)
+
+        def _bind_mousewheel(widget: tk.Widget) -> None:
+            widget.bind("<MouseWheel>", lambda e: models_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+            for child in widget.winfo_children():
+                _bind_mousewheel(child)
 
         selected_musubi_path = current_dir
         selected_musubi_python = current_musubi_python
-        selected_klein_dit = current_klein_dit
-        selected_klein_vae = current_klein_vae
-        selected_klein_text_encoder = current_klein_text_encoder
-        selected_ltx_dit = current_ltx_dit
-        selected_ltx_vae = current_ltx_vae
-        selected_ltx_text_encoder = current_ltx_text_encoder
 
+        # pending_model_paths: model_name → {component: path_str}
+        import json as _json_settings
+        _raw_model_paths = settings_state.get(MODEL_PATHS_KEY, "")
+        try:
+            pending_model_paths: dict[str, dict[str, str]] = _json_settings.loads(_raw_model_paths) if _raw_model_paths else {}
+        except Exception:
+            pending_model_paths = {}
+        preset_none_label = "---------"
+        _raw_preferred_presets = settings_state.get(PREFERRED_PRESETS_BY_FAMILY_KEY, "")
+        try:
+            _preferred_presets_loaded = _json_settings.loads(_raw_preferred_presets) if _raw_preferred_presets else {}
+        except Exception:
+            _preferred_presets_loaded = {}
+        preferred_preset_by_family: dict[str, str] = {}
+        if isinstance(_preferred_presets_loaded, dict):
+            preferred_preset_by_family = {
+                str(k): str(v)
+                for k, v in _preferred_presets_loaded.items()
+                if isinstance(k, str) and isinstance(v, str)
+            }
+
+        def _preset_names_for_family_settings(family_name: str) -> list[str]:
+            names: set[str] = set()
+            presets_dir = download_workspace_root() / "Presets"
+            if not presets_dir.exists() or not presets_dir.is_dir():
+                return []
+            for path in sorted(presets_dir.glob(f"*{JOB_PRESET_FILE_SUFFIX}"), key=lambda p: p.name.casefold()):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                payload_family = str(payload.get("family", "")).strip()
+                preset_name = str(payload.get("name", "")).strip()
+                if payload_family == family_name and preset_name:
+                    names.add(preset_name)
+            return sorted(names, key=str.casefold)
+
+        preferred_preset_vars: dict[str, tk.StringVar] = {}
         musubi_display_var = tk.StringVar(value=current_dir if current_dir else "(none)")
         musubi_python_display_var = tk.StringVar(value=current_musubi_python if current_musubi_python else "(auto)")
-        klein_model_version_var = tk.StringVar(value=current_klein_model_version)
-        klein_dit_var = tk.StringVar(value=current_klein_dit if current_klein_dit else "(none)")
-        klein_vae_var = tk.StringVar(value=current_klein_vae if current_klein_vae else "(none)")
-        klein_text_encoder_var = tk.StringVar(value=current_klein_text_encoder if current_klein_text_encoder else "(none)")
-        ltx_model_version_var = tk.StringVar(value=current_ltx_model_version)
-        ltx_dit_var = tk.StringVar(value=current_ltx_dit if current_ltx_dit else "(none)")
-        ltx_vae_var = tk.StringVar(value=current_ltx_vae if current_ltx_vae else "(none)")
-        ltx_text_encoder_var = tk.StringVar(value=current_ltx_text_encoder if current_ltx_text_encoder else "(none)")
         default_caption_keyword_var = tk.StringVar(value=current_default_caption_keyword)
         compile_optimizations_var = tk.BooleanVar(value=current_compile_optimizations)
         cuda_allow_tf32_var = tk.BooleanVar(value=current_cuda_allow_tf32)
         cuda_cudnn_benchmark_var = tk.BooleanVar(value=current_cuda_cudnn_benchmark)
         fp8_dit_var = tk.BooleanVar(value=current_fp8_dit)
         gc_cpu_offload_var = tk.BooleanVar(value=current_gc_cpu_offload)
-        train_resolution_var = tk.StringVar(value=str(current_train_resolution))
-        train_network_dim_var = tk.StringVar(
-            value=str(current_train_network_dim) if str(current_train_network_dim) in TRAIN_DIM_ALPHA_CHOICES else "32"
-        )
-        train_network_alpha_var = tk.StringVar(
-            value=str(current_train_network_alpha) if str(current_train_network_alpha) in TRAIN_DIM_ALPHA_CHOICES else "32"
-        )
-        train_optimizer_var = tk.StringVar(value=current_train_optimizer)
-        train_learning_rate_var = tk.StringVar(value=current_train_learning_rate)
-        train_steps_var = tk.StringVar(value=str(current_train_steps))
         enable_training_logging_var = tk.BooleanVar(value=current_enable_training_logging)
         train_log_tracker_name_var = tk.StringVar(value=current_train_log_tracker_name)
         stream_to_logger_var = tk.BooleanVar(value=current_train_stream_to_logger)
         auto_start_tensorboard_var = tk.BooleanVar(value=current_auto_start_tensorboard)
         auto_cleanup_states_var = tk.BooleanVar(value=current_auto_cleanup_states)
+        train_save_every_default_var = tk.StringVar(value=current_train_save_every_n_steps)
 
         ttk.Label(musubi_section, text="Musubi-Tuner folder:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         musubi_display = ttk.Label(
@@ -1344,63 +1392,15 @@ def launch_ui() -> int:
             pady=(6, 0),
         )
 
-        training_settings_section = ttk.LabelFrame(advanced_section, text="Training settings", padding=8)
-        training_settings_section.grid(row=0, column=0, columnspan=4, sticky="ew")
-        training_settings_section.columnconfigure(0, weight=0)
-        training_settings_section.columnconfigure(1, weight=1)
-        training_settings_section.columnconfigure(2, weight=0)
-        training_settings_section.columnconfigure(3, weight=1)
-
-        ttk.Label(training_settings_section, text="Optimizer type:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        train_optimizer_combo = ttk.Combobox(
-            training_settings_section,
-            textvariable=train_optimizer_var,
-            values=("adamw8bit", "prodigy"),
-            state="readonly",
-            width=16,
-        )
-        train_optimizer_combo.grid(row=0, column=1, sticky="ew")
-        ttk.Label(training_settings_section, text="Training steps:").grid(row=0, column=2, sticky="w", padx=(12, 8))
-        ttk.Entry(training_settings_section, textvariable=train_steps_var, style="Flat.TEntry").grid(row=0, column=3, sticky="ew")
-
-        ttk.Label(training_settings_section, text="Learning rate:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        train_learning_rate_entry = ttk.Entry(training_settings_section, textvariable=train_learning_rate_var, style="Flat.TEntry")
-        train_learning_rate_entry.grid(row=1, column=1, sticky="ew", pady=(6, 0))
-        ttk.Label(training_settings_section, text="LoRA network dim:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
-        ttk.Combobox(
-            training_settings_section,
-            textvariable=train_network_dim_var,
-            values=TRAIN_DIM_ALPHA_CHOICES,
-            state="readonly",
-            width=10,
-        ).grid(row=1, column=3, sticky="ew", pady=(6, 0))
-
-        ttk.Label(training_settings_section, text="Dataset resolution:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Entry(training_settings_section, textvariable=train_resolution_var, style="Flat.TEntry").grid(
-            row=2,
+        training_defaults_section = ttk.LabelFrame(advanced_section, text="Training defaults", padding=8)
+        training_defaults_section.grid(row=0, column=0, columnspan=4, sticky="ew")
+        training_defaults_section.columnconfigure(1, weight=1)
+        ttk.Label(training_defaults_section, text="Save every N steps:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(training_defaults_section, textvariable=train_save_every_default_var, style="Flat.TEntry").grid(
+            row=0,
             column=1,
-            sticky="ew",
-            pady=(6, 0),
+            sticky="w",
         )
-        ttk.Label(training_settings_section, text="LoRA network alpha:").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
-        ttk.Combobox(
-            training_settings_section,
-            textvariable=train_network_alpha_var,
-            values=TRAIN_DIM_ALPHA_CHOICES,
-            state="readonly",
-            width=10,
-        ).grid(row=2, column=3, sticky="ew", pady=(6, 0))
-
-        ttk.Checkbutton(
-            training_settings_section,
-            text="Enable FP8 (Lower VRAM)",
-            variable=fp8_dit_var,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(
-            training_settings_section,
-            text="Enable Gradient Checkpointing (Lower VRAM)",
-            variable=gc_cpu_offload_var,
-        ).grid(row=3, column=2, columnspan=2, sticky="w", pady=(8, 0))
 
         flags_section = ttk.LabelFrame(advanced_section, text="Advanced flags", padding=8)
         flags_section.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10, 0))
@@ -1427,6 +1427,16 @@ def launch_ui() -> int:
             text="Auto-clean resume state folders",
             variable=auto_cleanup_states_var,
         ).grid(row=1, column=1, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            flags_section,
+            text="Enable FP8 (Lower VRAM)",
+            variable=fp8_dit_var,
+        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            flags_section,
+            text="Enable Gradient Checkpointing (Lower VRAM)",
+            variable=gc_cpu_offload_var,
+        ).grid(row=2, column=1, sticky="w", pady=(6, 0))
 
         logging_section = ttk.LabelFrame(advanced_section, text="Logging & metadata", padding=8)
         logging_section.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(10, 0))
@@ -1463,103 +1473,237 @@ def launch_ui() -> int:
             text="Logs are stored per job under each Training/<job>/logs folder and can be viewed via TensorBoard.",
         ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
-        def sync_optimizer_controls() -> None:
-            if train_optimizer_var.get() == "prodigy":
-                train_learning_rate_var.set("1")
-                train_learning_rate_entry.configure(state="disabled")
+        # ── Model family sections ──────────────────────────────────────
+        _status_vars: dict[str, tk.StringVar] = {}
+
+        _COMPONENT_LABELS: dict[str, str] = {
+            "dit": "Model",
+            "vae": "VAE",
+            "text_encoder": "Text Encoder",
+            "t5": "T5",
+            "clip": "CLIP",
+        }
+
+        def _model_status_str(model_name: str) -> str:
+            components = list(DOWNLOAD_MODELS.get(model_name, {}).keys())
+            if not components:
+                return "Unknown"
+            from pathlib import Path as _P
+            stored = pending_model_paths.get(model_name, {})
+            found = sum(1 for c in components if stored.get(c) and _P(stored[c]).is_file())
+            if found == 0:
+                return "Not configured"
+            if found < len(components):
+                return f"Partial ({found}/{len(components)})"
+            return "✓ Ready"
+
+        def _refresh_status(model_name: str) -> None:
+            sv = _status_vars.get(model_name)
+            if sv:
+                sv.set(_model_status_str(model_name))
+
+        def _apply_status_color(lbl: ttk.Label, sv: tk.StringVar, *_a: object) -> None:
+            val = sv.get()
+            if val.startswith("✓"):
+                lbl.configure(foreground="#6fcf6f")
+            elif val.startswith("Partial"):
+                lbl.configure(foreground="#f0b429")
             else:
-                train_learning_rate_entry.configure(state="normal")
+                lbl.configure(foreground=fg_muted)
 
-        train_optimizer_var.trace_add("write", lambda *_args: sync_optimizer_controls())
-        sync_optimizer_controls()
+        def _make_family_section(parent: ttk.Frame, family_name: str, model_names: list[str], row: int, expanded: bool) -> None:
+            section_frame = ttk.Frame(parent)
+            section_frame.grid(row=row, column=0, sticky="ew", pady=(0, 6))
+            section_frame.columnconfigure(0, weight=1)
 
-        ttk.Label(klein_section, text="Model version:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        klein_model_version_entry = ttk.Entry(klein_section, textvariable=klein_model_version_var, style="Flat.TEntry")
-        klein_model_version_entry.grid(row=0, column=1, sticky="ew")
-        ttk.Button(klein_section, text="Auto-download", command=lambda: auto_download_klein()).grid(row=0, column=2, padx=(8, 0))
+            fam_expanded_var = tk.BooleanVar(value=expanded)
 
-        ttk.Label(klein_section, text="Model:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        klein_dit_display = ttk.Label(
-            klein_section, textvariable=klein_dit_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
-        )
-        klein_dit_display.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+            fam_header_btn = ttk.Button(
+                section_frame,
+                text=f"{'▼' if expanded else '▶'}  {family_name}",
+                style="FamilyHeader.TButton",
+                command=lambda: _toggle_family(fam_header_btn, fam_body, fam_expanded_var, family_name),
+            )
+            fam_header_btn.grid(row=0, column=0, sticky="ew")
 
-        ttk.Label(klein_section, text="VAE:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        klein_vae_display = ttk.Label(
-            klein_section, textvariable=klein_vae_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
-        )
-        klein_vae_display.grid(row=2, column=1, sticky="ew", pady=(8, 0))
+            fam_body = ttk.Frame(section_frame, padding=(4, 2, 4, 2))
+            fam_body.columnconfigure(0, weight=1)
+            if expanded:
+                fam_body.grid(row=1, column=0, sticky="ew")
 
-        ttk.Label(klein_section, text="Text Encoder:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        klein_text_encoder_display = ttk.Label(
-            klein_section, textvariable=klein_text_encoder_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
-        )
-        klein_text_encoder_display.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+            family_preset_names = _preset_names_for_family_settings(family_name)
+            preferred_initial = preferred_preset_by_family.get(family_name, "").strip()
+            if preferred_initial and preferred_initial not in family_preset_names:
+                preferred_initial = ""
+            preferred_var = tk.StringVar(value=(preferred_initial or preset_none_label))
+            preferred_preset_vars[family_name] = preferred_var
 
-        ttk.Label(ltx_section, text="Model version:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ltx_model_version_entry = ttk.Entry(ltx_section, textvariable=ltx_model_version_var, style="Flat.TEntry")
-        ltx_model_version_entry.grid(row=0, column=1, sticky="ew")
+            preset_row = ttk.Frame(fam_body)
+            preset_row.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+            preset_row.columnconfigure(1, weight=1)
+            ttk.Label(preset_row, text="Preferred Preset:").grid(row=0, column=0, sticky="w", padx=(22, 8))
+            ttk.Combobox(
+                preset_row,
+                textvariable=preferred_var,
+                values=[preset_none_label] + family_preset_names,
+                state="readonly",
+                width=28,
+            ).grid(row=0, column=1, sticky="w")
 
-        ttk.Label(ltx_section, text="Model:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ltx_dit_display = ttk.Label(
-            ltx_section, textvariable=ltx_dit_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
-        )
-        ltx_dit_display.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+            for r, mn in enumerate(model_names, start=1):
+                display_name = DOWNLOAD_MODEL_DISPLAY_NAMES.get(mn, mn)
+                sv = tk.StringVar(value=_model_status_str(mn))
+                _status_vars[mn] = sv
 
-        ttk.Label(ltx_section, text="VAE:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ltx_vae_display = ttk.Label(
-            ltx_section, textvariable=ltx_vae_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
-        )
-        ltx_vae_display.grid(row=2, column=1, sticky="ew", pady=(8, 0))
+                model_block = ttk.Frame(fam_body)
+                model_block.grid(row=r, column=0, sticky="ew", pady=(1, 0))
+                model_block.columnconfigure(0, weight=1)
 
-        ttk.Label(ltx_section, text="Text Encoder:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ltx_text_encoder_display = ttk.Label(
-            ltx_section, textvariable=ltx_text_encoder_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
-        )
-        ltx_text_encoder_display.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+                # ─ Model header row ─────────────────────────────────
+                hdr = ttk.Frame(model_block)
+                hdr.grid(row=0, column=0, sticky="ew")
+                hdr.columnconfigure(1, weight=1)
 
-        def auto_download_klein() -> None:
-            model_name = klein_model_version_var.get().strip() or "klein-base-9b"
-            if model_name not in DOWNLOAD_MODELS:
-                messagebox.showerror(
-                    "Unknown model",
-                    f"No download configuration for model version '{model_name}'.\n"
-                    f"Supported: {', '.join(DOWNLOAD_MODELS.keys())}",
-                    parent=dialog,
-                )
-                return
+                detail_expanded_var = tk.BooleanVar(value=False)
+                detail_frame = ttk.Frame(model_block, padding=(20, 2, 0, 2))
+                detail_frame.columnconfigure(1, weight=1)
+                # detail_frame is NOT gridded yet (hidden by default)
 
+                expand_btn = ttk.Button(hdr, text="▶", width=2)
+                expand_btn.grid(row=0, column=0, padx=(0, 4))
+
+                ttk.Label(hdr, text=display_name, width=28, anchor="w").grid(row=0, column=1, sticky="w")
+
+                status_lbl = ttk.Label(hdr, textvariable=sv, anchor="w", width=18)
+                status_lbl.grid(row=0, column=2, padx=(8, 0), sticky="w")
+                sv.trace_add("write", lambda *a, lbl=status_lbl, s=sv: _apply_status_color(lbl, s))
+                _apply_status_color(status_lbl, sv)
+
+                ttk.Button(
+                    hdr, text="Auto-download",
+                    command=lambda mn=mn: _auto_download_model(mn),
+                ).grid(row=0, column=3, padx=(8, 0))
+
+                # ─ Detail rows (component paths) ─────────────────────
+                components = list(DOWNLOAD_MODELS.get(mn, {}).keys())
+                _comp_path_vars: dict[str, tk.StringVar] = {}
+
+                for cr, comp in enumerate(components):
+                    comp_label = _COMPONENT_LABELS.get(comp, comp.capitalize())
+                    # Derive the friendly name for this specific component slot
+                    comp_info = DOWNLOAD_MODELS.get(mn, {}).get(comp, {})
+                    folder_name = comp_info.get("folder_name", "")
+                    friendly = DOWNLOAD_COMPONENT_FRIENDLY_NAMES.get(folder_name, "")
+                    label_text = f"{comp_label} ({friendly}):" if friendly else f"{comp_label}:"
+
+                    stored_path = pending_model_paths.get(mn, {}).get(comp, "")
+                    cpv = tk.StringVar(value=stored_path)
+                    _comp_path_vars[comp] = cpv
+
+                    ttk.Label(detail_frame, text=label_text, anchor="e").grid(
+                        row=cr, column=0, sticky="e", padx=(0, 6), pady=1
+                    )
+                    path_entry = ttk.Entry(
+                        detail_frame, textvariable=cpv, style="Flat.TEntry",
+                    )
+                    path_entry.grid(row=cr, column=1, sticky="ew", pady=1)
+
+                    def _save_path(mn: str = mn, comp: str = comp, cpv: tk.StringVar = cpv) -> None:
+                        val = cpv.get().strip()
+                        if val:
+                            pending_model_paths.setdefault(mn, {})[comp] = val
+                        elif mn in pending_model_paths and comp in pending_model_paths[mn]:
+                            del pending_model_paths[mn][comp]
+                        _refresh_status(mn)
+
+                    path_entry.bind("<FocusOut>", lambda e, mn=mn, comp=comp, cpv=cpv: _save_path(mn, comp, cpv))
+                    path_entry.bind("<Return>", lambda e, mn=mn, comp=comp, cpv=cpv: _save_path(mn, comp, cpv))
+
+                    def _browse_comp(mn: str = mn, comp: str = comp, cpv: tk.StringVar = cpv, friendly: str = friendly) -> None:
+                        cur = cpv.get().strip()
+                        initial = str(Path(cur).parent) if cur and Path(cur).parent.exists() else str(default_models_dir if default_models_dir.exists() else Path.home())
+                        title_label = friendly or _COMPONENT_LABELS.get(comp, comp)
+                        picked = filedialog.askopenfilename(
+                            parent=dialog,
+                            title=f"Select {title_label} for {DOWNLOAD_MODEL_DISPLAY_NAMES.get(mn, mn)}",
+                            initialdir=initial,
+                            filetypes=[("Safetensors / PTH", "*.safetensors *.pth"), ("All files", "*.*")],
+                        )
+                        if picked:
+                            pending_model_paths.setdefault(mn, {})[comp] = picked
+                            cpv.set(picked)
+                            _refresh_status(mn)
+
+                    ttk.Button(detail_frame, text="Browse", command=_browse_comp).grid(
+                        row=cr, column=2, padx=(6, 0), pady=1
+                    )
+
+                # Register vars so _scan_extra_path can update them
+                _comp_path_vars_all[mn] = _comp_path_vars
+
+                def _toggle_detail(
+                    btn: ttk.Button = expand_btn,
+                    det: ttk.Frame = detail_frame,
+                    var: tk.BooleanVar = detail_expanded_var,
+                ) -> None:
+                    if var.get():
+                        det.grid_remove()
+                        var.set(False)
+                        btn.configure(text="▶")
+                    else:
+                        det.grid(row=1, column=0, sticky="ew")
+                        var.set(True)
+                        btn.configure(text="▼")
+
+                expand_btn.configure(command=_toggle_detail)
+                _bind_mousewheel(hdr)
+                _bind_mousewheel(detail_frame)
+
+            _bind_mousewheel(fam_body)
+
+        def _toggle_family(
+            btn: ttk.Button,
+            body: ttk.Frame,
+            var: tk.BooleanVar,
+            family_name: str,
+        ) -> None:
+            if var.get():
+                body.grid_remove()
+                var.set(False)
+                btn.configure(text=f"▶  {family_name}")
+            else:
+                body.grid(row=1, column=0, sticky="ew")
+                var.set(True)
+                btn.configure(text=f"▼  {family_name}")
+
+        _family_row = 0
+        for _fam_name, _fam_models in DOWNLOAD_MODEL_FAMILIES.items():
+            _make_family_section(models_inner, _fam_name, _fam_models, _family_row, expanded=(_fam_name == "FLUX.2"))
+            _family_row += 1
+
+        _bind_mousewheel(models_inner)
+
+        # ── Auto-download handler ──────────────────────────────────────
+        def _auto_download_model(model_name: str) -> None:
             location = model_location_var.get()
             ws_root = download_workspace_root()
             hf_token = hf_token_var.get().strip() or None
+            components = list(DOWNLOAD_MODELS.get(model_name, {}).keys())
 
-            # Check whether all files are already present anywhere.
-            dit_path = find_component(model_name, "dit", ws_root)
-            vae_path = find_component(model_name, "vae", ws_root)
-            te_path = find_component(model_name, "text_encoder", ws_root)
+            from pathlib import Path as _P
+            missing = [c for c in components if find_component(model_name, c, ws_root) is None]
+            # Also check pending_model_paths
+            stored = pending_model_paths.get(model_name, {})
+            missing = [c for c in missing if not (stored.get(c) and _P(stored.get(c, "")).is_file())]
 
-            if dit_path and vae_path and te_path:
-                nonlocal selected_klein_dit, selected_klein_vae, selected_klein_text_encoder
-                selected_klein_dit = str(dit_path)
-                selected_klein_vae = str(vae_path)
-                selected_klein_text_encoder = str(te_path)
-                klein_dit_var.set(selected_klein_dit)
-                klein_vae_var.set(selected_klein_vae)
-                klein_text_encoder_var.set(selected_klein_text_encoder)
+            if not missing:
                 messagebox.showinfo(
                     "Models found",
-                    f"All '{model_name}' files were found locally and paths have been set.",
+                    f"All '{model_name}' files are already available.",
                     parent=dialog,
                 )
+                _refresh_status(model_name)
                 return
-
-            missing = []
-            if not dit_path:
-                missing.append("Model (DiT)")
-            if not vae_path:
-                missing.append("VAE")
-            if not te_path:
-                missing.append("Text Encoder")
 
             confirmed = messagebox.askyesno(
                 "Download models",
@@ -1571,74 +1715,104 @@ def launch_ui() -> int:
             if not confirmed:
                 return
 
-            # ── Progress window ──────────────────────────────────────────
-            progress_win = tk.Toplevel(dialog)
-            progress_win.title("Downloading models…")
-            progress_win.transient(dialog)
-            progress_win.grab_set()
-            progress_win.configure(bg=bg_panel)
-            progress_win.resizable(False, False)
-            set_dark_title_bar(progress_win)
-            progress_win.columnconfigure(0, weight=1)
-            ttk.Label(progress_win, text=f"Downloading '{model_name}' models…").grid(
-                row=0, column=0, padx=20, pady=(16, 4), sticky="w"
-            )
-            progress_status_var = tk.StringVar(value="Starting…")
-            ttk.Label(
-                progress_win, textvariable=progress_status_var, style="CardMeta.TLabel"
-            ).grid(row=1, column=0, padx=20, pady=(0, 16), sticky="w")
-            progress_win.update_idletasks()
-            center_window(progress_win)
-            progress_win.deiconify()
-
-            def _update_status(msg: str) -> None:
-                try:
-                    progress_status_var.set(msg)
-                    progress_win.update_idletasks()
-                except Exception:
-                    pass
+            # Resolve which Python to use — prefer the configured Musubi-Tuner venv
+            # so that huggingface_hub is available and the process has a real stdout.
+            python_exe = selected_musubi_python or sys.executable
+            cli_script = str(Path(__file__).parent / "download_cli.py")
 
             error_holder: list[str] = []
             result_holder: dict[str, object] = {}
 
-            def _do_download() -> None:
-                try:
-                    paths = auto_resolve_klein(
-                        model_name=model_name,
-                        location=location,
-                        ws_root=ws_root,
-                        progress=_update_status,
-                        download_if_missing=True,
-                        token=hf_token,
-                    )
-                    result_holder.update(paths)
-                except Exception as exc:
-                    error_holder.append(str(exc))
-                finally:
-                    dialog.after(0, _on_download_done)
+            log(f"━━━ Downloading {model_name} ({', '.join(missing)}) ━━━")
 
-            def _on_download_done() -> None:
-                nonlocal selected_klein_dit, selected_klein_vae, selected_klein_text_encoder
-                try:
-                    progress_win.destroy()
-                except Exception:
-                    pass
+            def _do_download() -> None:
+                for comp in missing:
+                    cmd = [
+                        python_exe, cli_script,
+                        "--model", model_name,
+                        "--component", comp,
+                        "--ws-root", str(ws_root) if ws_root else "",
+                        "--location", location,
+                    ]
+                    if hf_token:
+                        cmd += ["--token", hf_token]
+
+                    log(f"  ↓ {comp}…")
+                    try:
+                        proc = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                        )
+                        comp_result: str | None = None
+                        assert proc.stdout is not None
+                        # Read with \r awareness so tqdm in-place updates stream through.
+                        _buf = ""
+                        while True:
+                            chunk = proc.stdout.read(256)
+                            if not chunk:
+                                break
+                            _buf += chunk
+                            while True:
+                                nl = _buf.find("\n")
+                                cr = _buf.find("\r")
+                                if nl == -1 and cr == -1:
+                                    break
+                                if cr != -1 and (nl == -1 or cr < nl):
+                                    line = _buf[:cr]
+                                    _buf = _buf[cr + 1:]
+                                    if line.startswith("RESULT:"):
+                                        comp_result = line[7:]
+                                    elif line.strip():
+                                        log(f"\r    {line.strip()}")
+                                else:
+                                    line = _buf[:nl].rstrip("\r")
+                                    _buf = _buf[nl + 1:]
+                                    if line.startswith("RESULT:"):
+                                        comp_result = line[7:]
+                                    elif line.strip():
+                                        log(f"    {line.strip()}")
+                        if _buf.strip():
+                            log(f"    {_buf.strip()}")
+                        proc.wait()
+                        if proc.returncode != 0:
+                            error_holder.append(
+                                f"Download of '{comp}' failed (exit {proc.returncode})"
+                            )
+                            break
+                        if comp_result:
+                            result_holder[comp] = comp_result
+                            # Persist each component immediately after it downloads.
+                            def _save_comp(c: str = comp, p: str = comp_result) -> None:
+                                import json as _json_save
+                                pending_model_paths.setdefault(model_name, {})[c] = p
+                                settings_state[MODEL_PATHS_KEY] = _json_save.dumps(pending_model_paths)
+                                save_settings(settings_state)
+                                _refresh_status(model_name)
+                                # Update entry box if the registry has a StringVar for it
+                                sv = _comp_path_vars_all.get(model_name, {}).get(c)
+                                if sv is not None:
+                                    sv.set(p)
+                            dialog.after(0, _save_comp)
+                    except Exception as exc:
+                        error_holder.append(str(exc))
+                        break
+
+                dialog.after(0, _on_dl_done)
+
+            def _on_dl_done() -> None:
                 if error_holder:
+                    log(f"[ERROR] {error_holder[0]}")
                     messagebox.showerror("Download failed", error_holder[0], parent=dialog)
                     return
-                from pathlib import Path as _Path
-                if result_holder.get("dit"):
-                    selected_klein_dit = str(result_holder["dit"])
-                    klein_dit_var.set(selected_klein_dit)
-                if result_holder.get("vae"):
-                    selected_klein_vae = str(result_holder["vae"])
-                    klein_vae_var.set(selected_klein_vae)
-                if result_holder.get("text_encoder"):
-                    selected_klein_text_encoder = str(result_holder["text_encoder"])
-                    klein_text_encoder_var.set(selected_klein_text_encoder)
+                _refresh_status(model_name)
+                log(f"━━━ Complete: {model_name} ━━━")
                 messagebox.showinfo(
                     "Download complete",
-                    f"All '{model_name}' files downloaded. Click Save to apply.",
+                    f"'{model_name}' is ready.",
                     parent=dialog,
                 )
 
@@ -1700,56 +1874,6 @@ def launch_ui() -> int:
             )
             return picked if picked else None
 
-        def browse_klein_dit() -> None:
-            nonlocal selected_klein_dit
-            picked = browse_file(selected_klein_dit, selected_musubi_path, "Select Klein model file")
-            if picked:
-                selected_klein_dit = picked
-                klein_dit_var.set(picked)
-
-        def browse_klein_vae() -> None:
-            nonlocal selected_klein_vae
-            picked = browse_file(selected_klein_vae, selected_musubi_path, "Select Klein VAE file")
-            if picked:
-                selected_klein_vae = picked
-                klein_vae_var.set(picked)
-
-        def browse_klein_text_encoder() -> None:
-            nonlocal selected_klein_text_encoder
-            picked = browse_file(
-                selected_klein_text_encoder,
-                selected_musubi_path,
-                "Select Klein text encoder file",
-            )
-            if picked:
-                selected_klein_text_encoder = picked
-                klein_text_encoder_var.set(picked)
-
-        def browse_ltx_dit() -> None:
-            nonlocal selected_ltx_dit
-            picked = browse_file(selected_ltx_dit, selected_musubi_path, "Select LTX model file")
-            if picked:
-                selected_ltx_dit = picked
-                ltx_dit_var.set(picked)
-
-        def browse_ltx_vae() -> None:
-            nonlocal selected_ltx_vae
-            picked = browse_file(selected_ltx_vae, selected_musubi_path, "Select LTX VAE file")
-            if picked:
-                selected_ltx_vae = picked
-                ltx_vae_var.set(picked)
-
-        def browse_ltx_text_encoder() -> None:
-            nonlocal selected_ltx_text_encoder
-            picked = browse_file(
-                selected_ltx_text_encoder,
-                selected_musubi_path,
-                "Select LTX text encoder file",
-            )
-            if picked:
-                selected_ltx_text_encoder = picked
-                ltx_text_encoder_var.set(picked)
-
         def normalize_model_checkpoint_path(raw_path: str | None) -> str:
             if not raw_path:
                 return ""
@@ -1773,8 +1897,22 @@ def launch_ui() -> int:
 
         def save_and_close() -> None:
             nonlocal result, settings_state, selected_musubi_python
+            # Force any focused entry widget to commit (triggers FocusOut → _save_path)
+            dialog.focus_set()
             if not selected_musubi_path:
                 messagebox.showerror("Missing folder", "Musubi-Tuner folder is not set.", parent=dialog)
+                return
+
+            try:
+                save_every_default_value = int(train_save_every_default_var.get().strip())
+                if save_every_default_value < 1:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid value",
+                    "Training default 'Save every N steps' must be a positive integer.",
+                    parent=dialog,
+                )
                 return
 
             musubi_path = Path(selected_musubi_path).expanduser()
@@ -1801,131 +1939,47 @@ def launch_ui() -> int:
                         parent=dialog,
                     )
 
-            klein_model_version = klein_model_version_var.get().strip()
-            if not klein_model_version:
-                messagebox.showerror("Missing value", "Klein model version is required.", parent=dialog)
-                return
-
-            try:
-                train_resolution = int(train_resolution_var.get().strip())
-            except ValueError:
-                messagebox.showerror("Invalid value", "Dataset resolution must be an integer.", parent=dialog)
-                return
-            if train_resolution < 64:
-                messagebox.showerror("Invalid value", "Dataset resolution must be 64 or higher.", parent=dialog)
-                return
-
-            try:
-                train_network_dim = int(train_network_dim_var.get().strip())
-            except ValueError:
-                messagebox.showerror("Invalid value", "LoRA network dim must be an integer.", parent=dialog)
-                return
-            if train_network_dim < 1:
-                messagebox.showerror("Invalid value", "LoRA network dim must be 1 or higher.", parent=dialog)
-                return
-
-            try:
-                train_network_alpha = int(train_network_alpha_var.get().strip())
-            except ValueError:
-                messagebox.showerror("Invalid value", "LoRA network alpha must be an integer.", parent=dialog)
-                return
-            if train_network_alpha < 1:
-                messagebox.showerror("Invalid value", "LoRA network alpha must be 1 or higher.", parent=dialog)
-                return
-
-            train_optimizer = train_optimizer_var.get().strip().lower()
-            if train_optimizer not in {"adamw8bit", "prodigy"}:
-                messagebox.showerror("Invalid value", "Optimizer type must be adamw8bit or prodigy.", parent=dialog)
-                return
-
-            train_learning_rate = train_learning_rate_var.get().strip()
-            if train_optimizer == "prodigy":
-                train_learning_rate = "1"
-                train_learning_rate_var.set("1")
-            if not train_learning_rate:
-                messagebox.showerror("Invalid value", "Learning rate is required.", parent=dialog)
-                return
-            try:
-                learning_rate_number = float(train_learning_rate)
-            except ValueError:
-                messagebox.showerror("Invalid value", "Learning rate must be numeric (example: 1e-4).", parent=dialog)
-                return
-            if learning_rate_number <= 0:
-                messagebox.showerror("Invalid value", "Learning rate must be greater than 0.", parent=dialog)
-                return
-
-            try:
-                train_steps = int(train_steps_var.get().strip())
-            except ValueError:
-                messagebox.showerror("Invalid value", "Train steps must be an integer.", parent=dialog)
-                return
-            if train_steps < 1:
-                messagebox.showerror("Invalid value", "Train steps must be 1 or higher.", parent=dialog)
-                return
-
-            normalized_klein_dit = normalize_model_checkpoint_path(selected_klein_dit)
-            normalized_klein_vae = normalize_model_checkpoint_path(selected_klein_vae)
-            normalized_klein_text_encoder = normalize_model_checkpoint_path(selected_klein_text_encoder)
-            normalized_ltx_dit = normalize_model_checkpoint_path(selected_ltx_dit)
-            normalized_ltx_vae = normalize_model_checkpoint_path(selected_ltx_vae)
-            normalized_ltx_text_encoder = normalize_model_checkpoint_path(selected_ltx_text_encoder)
-
-            for label, raw_path in (
-                ("Klein Model", normalized_klein_dit),
-                ("Klein VAE", normalized_klein_vae),
-                ("Klein Text Encoder", normalized_klein_text_encoder),
-            ):
-                if not raw_path:
-                    continue
-                resolved = Path(raw_path).expanduser()
-                if not resolved.exists() or not resolved.is_file():
-                    messagebox.showerror("Invalid file", f"Choose a valid file for {label}.", parent=dialog)
-                    return
-
-            for label, raw_path in (
-                ("LTX Model", normalized_ltx_dit),
-                ("LTX VAE", normalized_ltx_vae),
-                ("LTX Text Encoder", normalized_ltx_text_encoder),
-            ):
-                if not raw_path:
-                    continue
-                resolved = Path(raw_path).expanduser()
-                if not resolved.exists() or not resolved.is_file():
-                    messagebox.showerror("Invalid file", f"Choose a valid file for {label}.", parent=dialog)
-                    return
-
+            import json as _json_save
             settings_state[MUSUBI_DIR_KEY] = str(musubi_path)
             settings_state[MUSUBI_PYTHON_KEY] = str(musubi_python_path) if musubi_python_path is not None else ""
-            settings_state[KLEIN_MODEL_VERSION_KEY] = klein_model_version
-            settings_state[KLEIN_DIT_KEY] = normalized_klein_dit
-            settings_state[KLEIN_VAE_KEY] = normalized_klein_vae
-            settings_state[KLEIN_TEXT_ENCODER_KEY] = normalized_klein_text_encoder
-            settings_state[LTX_MODEL_VERSION_KEY] = ltx_model_version_var.get().strip()
-            settings_state[LTX_DIT_KEY] = normalized_ltx_dit
-            settings_state[LTX_VAE_KEY] = normalized_ltx_vae
-            settings_state[LTX_TEXT_ENCODER_KEY] = normalized_ltx_text_encoder
+            settings_state[MODEL_PATHS_KEY] = _json_save.dumps(pending_model_paths)
+            # Backward compat: derive legacy keys from pending_model_paths
+            _active_klein = settings_state.get(KLEIN_MODEL_VERSION_KEY, "klein-base-9b") or "klein-base-9b"
+            _kpaths = pending_model_paths.get(_active_klein, {})
+            settings_state[KLEIN_MODEL_VERSION_KEY] = _active_klein
+            settings_state[KLEIN_DIT_KEY] = _kpaths.get("dit", "")
+            settings_state[KLEIN_VAE_KEY] = _kpaths.get("vae", "")
+            settings_state[KLEIN_TEXT_ENCODER_KEY] = _kpaths.get("text_encoder", "")
+            _ltx_paths = pending_model_paths.get("ltx-2.3", {})
+            settings_state[LTX_MODEL_VERSION_KEY] = "ltx-2.3" if _ltx_paths else ""
+            settings_state[LTX_DIT_KEY] = _ltx_paths.get("dit", "")
+            settings_state[LTX_VAE_KEY] = _ltx_paths.get("vae", "")
+            settings_state[LTX_TEXT_ENCODER_KEY] = _ltx_paths.get("text_encoder", "")
             settings_state[DEFAULT_CAPTION_KEYWORD_KEY] = default_caption_keyword_var.get().strip()
             settings_state[ENABLE_COMPILE_OPTIMIZATIONS_KEY] = "1" if compile_optimizations_var.get() else "0"
             settings_state[ENABLE_CUDA_ALLOW_TF32_KEY] = "1" if cuda_allow_tf32_var.get() else "0"
             settings_state[ENABLE_CUDA_CUDNN_BENCHMARK_KEY] = "1" if cuda_cudnn_benchmark_var.get() else "0"
             settings_state[ENABLE_FP8_DIT_KEY] = "1" if fp8_dit_var.get() else "0"
             settings_state[ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY] = "1" if gc_cpu_offload_var.get() else "0"
-            settings_state[TRAIN_RESOLUTION_KEY] = str(train_resolution)
-            settings_state[TRAIN_NETWORK_DIM_KEY] = str(train_network_dim)
-            settings_state[TRAIN_NETWORK_ALPHA_KEY] = str(train_network_alpha)
-            settings_state[TRAIN_OPTIMIZER_TYPE_KEY] = train_optimizer
-            settings_state[TRAIN_LEARNING_RATE_KEY] = train_learning_rate
-            settings_state[TRAIN_STEPS_KEY] = str(train_steps)
             settings_state[TRAIN_ENABLE_LOGGING_KEY] = "1" if enable_training_logging_var.get() else "0"
             settings_state[TRAIN_LOG_BACKEND_KEY] = "tensorboard"
             settings_state[TRAIN_LOG_TRACKER_NAME_KEY] = train_log_tracker_name_var.get().strip()
             settings_state[TRAIN_STREAM_TO_LOGGER_KEY] = "1" if stream_to_logger_var.get() else "0"
             settings_state[TRAIN_AUTO_START_TENSORBOARD_KEY] = "1" if auto_start_tensorboard_var.get() else "0"
             settings_state[TRAIN_AUTO_CLEANUP_STATES_KEY] = "1" if auto_cleanup_states_var.get() else "0"
+            settings_state[TRAIN_SAVE_EVERY_N_STEPS_KEY] = str(save_every_default_value)
+            preferred_to_save = {
+                family_name: var.get().strip()
+                for family_name, var in preferred_preset_vars.items()
+                if var.get().strip() and var.get().strip() != preset_none_label
+            }
+            settings_state[PREFERRED_PRESETS_BY_FAMILY_KEY] = _json_save.dumps(preferred_to_save)
             settings_state[MODEL_DOWNLOAD_LOCATION_KEY] = model_location_var.get()
             settings_state[HF_TOKEN_KEY] = hf_token_var.get().strip()
+            _ep = extra_path_var.get().strip()
+            settings_state[EXTRA_SEARCH_PATHS_KEY] = _json_save.dumps([_ep] if _ep else [])
             save_settings(settings_state)
-            result = klein_runtime_config_from_settings(settings_state)
+            result = runtime_config_from_settings(settings_state)
             dialog.destroy()
 
         def cancel_and_close() -> None:
@@ -1958,22 +2012,6 @@ def launch_ui() -> int:
         ttk.Button(musubi_section, text="Browse File", command=browse_musubi_python).grid(
             row=1, column=2, padx=(8, 0), pady=(8, 0)
         )
-        ttk.Button(klein_section, text="Browse File", command=browse_klein_dit).grid(row=1, column=2, padx=(8, 0), pady=(8, 0))
-        ttk.Button(klein_section, text="Browse File", command=browse_klein_vae).grid(row=2, column=2, padx=(8, 0), pady=(8, 0))
-        ttk.Button(klein_section, text="Browse File", command=browse_klein_text_encoder).grid(
-            row=3, column=2, padx=(8, 0), pady=(8, 0)
-        )
-
-        ttk.Button(ltx_section, text="Browse File", command=browse_ltx_dit).grid(row=1, column=2, padx=(8, 0), pady=(8, 0))
-        ttk.Button(ltx_section, text="Browse File", command=browse_ltx_vae).grid(row=2, column=2, padx=(8, 0), pady=(8, 0))
-        ttk.Button(ltx_section, text="Browse File", command=browse_ltx_text_encoder).grid(
-            row=3, column=2, padx=(8, 0), pady=(8, 0)
-        )
-
-        ttk.Label(models_tab, text="LTX path is saved for future support.", foreground=fg_muted).grid(
-            row=3, column=0, sticky="w", pady=(10, 8)
-        )
-
         button_row = ttk.Frame(footer)
         button_row.grid(row=0, column=0, sticky="ew")
         button_row.columnconfigure(0, weight=1)
@@ -2561,235 +2599,6 @@ def launch_ui() -> int:
 
         center_window(dialog)
         dialog.deiconify()
-        root.wait_window(dialog)
-
-    def open_dataset_config_dialog(dataset_name: str) -> None:
-        effective = effective_train_settings_for_dataset(dataset_name)
-        global_values = global_train_settings()
-        image_count = len(dataset_image_files(datasets_root_dir(), dataset_name))
-
-        dialog = tk.Toplevel(root)
-        dialog.withdraw()
-        dialog.title(f"Dataset Configure - {dataset_name}")
-        dialog.transient(root)
-        dialog.grab_set()
-        dialog.resizable(False, False)
-        dialog.configure(bg=bg_panel)
-        set_dark_title_bar(dialog)
-        dialog.columnconfigure(0, weight=1)
-        dialog.rowconfigure(0, weight=1)
-
-        frame = ttk.Frame(dialog, padding=10)
-        frame.grid(row=0, column=0, sticky="nsew")
-        frame.columnconfigure(0, weight=1)
-
-        section = ttk.LabelFrame(frame, text=f"Train settings for {dataset_name}", padding=8)
-        section.grid(row=0, column=0, sticky="ew")
-        section.columnconfigure(0, weight=0)
-        section.columnconfigure(1, weight=1)
-        section.columnconfigure(2, weight=0)
-        section.columnconfigure(3, weight=1)
-
-        use_global_var = tk.BooleanVar(value=is_truthy(effective.get(DATASET_USE_GLOBAL_TRAIN_KEY), default=True))
-        train_optimizer_var = tk.StringVar(value=effective[TRAIN_OPTIMIZER_TYPE_KEY])
-        train_steps_var = tk.StringVar(value=effective[TRAIN_STEPS_KEY])
-        train_learning_rate_var = tk.StringVar(value=effective[TRAIN_LEARNING_RATE_KEY])
-        train_network_dim_var = tk.StringVar(
-            value=effective[TRAIN_NETWORK_DIM_KEY]
-            if effective[TRAIN_NETWORK_DIM_KEY] in TRAIN_DIM_ALPHA_CHOICES
-            else "32"
-        )
-        train_network_alpha_var = tk.StringVar(
-            value=effective[TRAIN_NETWORK_ALPHA_KEY]
-            if effective[TRAIN_NETWORK_ALPHA_KEY] in TRAIN_DIM_ALPHA_CHOICES
-            else "32"
-        )
-        train_resolution_var = tk.StringVar(value=effective[TRAIN_RESOLUTION_KEY])
-
-        ttk.Checkbutton(
-            section,
-            text="Use global values",
-            variable=use_global_var,
-        ).grid(row=0, column=0, columnspan=4, sticky="w")
-
-        ttk.Label(section, text="Optimizer type:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        train_optimizer_combo = ttk.Combobox(
-            section,
-            textvariable=train_optimizer_var,
-            values=("adamw8bit", "prodigy"),
-            state="readonly",
-            width=14,
-        )
-        train_optimizer_combo.grid(row=1, column=1, sticky="ew", pady=(8, 0))
-        ttk.Label(section, text="Training steps:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(8, 0))
-        train_steps_entry = ttk.Entry(section, textvariable=train_steps_var, style="Flat.TEntry")
-        train_steps_entry.grid(row=1, column=3, sticky="ew", pady=(8, 0))
-
-        ttk.Label(section, text="Learning rate:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        train_learning_rate_entry = ttk.Entry(section, textvariable=train_learning_rate_var, style="Flat.TEntry")
-        train_learning_rate_entry.grid(row=2, column=1, sticky="ew", pady=(8, 0))
-        ttk.Label(section, text="LoRA network dim:").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=(8, 0))
-        train_network_dim_combo = ttk.Combobox(
-            section,
-            textvariable=train_network_dim_var,
-            values=TRAIN_DIM_ALPHA_CHOICES,
-            state="readonly",
-            width=10,
-        )
-        train_network_dim_combo.grid(row=2, column=3, sticky="ew", pady=(8, 0))
-
-        ttk.Label(section, text="Dataset resolution:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        train_resolution_entry = ttk.Entry(section, textvariable=train_resolution_var, style="Flat.TEntry")
-        train_resolution_entry.grid(row=3, column=1, sticky="ew", pady=(6, 0))
-        ttk.Label(section, text="LoRA network alpha:").grid(row=3, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
-        train_network_alpha_combo = ttk.Combobox(
-            section,
-            textvariable=train_network_alpha_var,
-            values=TRAIN_DIM_ALPHA_CHOICES,
-            state="readonly",
-            width=10,
-        )
-        train_network_alpha_combo.grid(row=3, column=3, sticky="ew", pady=(6, 0))
-
-        help_label = ttk.Label(
-            section,
-            text="When Use global values is on, this dataset follows Settings > Advanced values.",
-        )
-        help_label.grid(row=4, column=0, columnspan=4, sticky="w", pady=(8, 0))
-        ttk.Label(section, text=f"Images found: {image_count}").grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
-
-        def sync_optimizer_controls() -> None:
-            if train_optimizer_var.get() == "prodigy":
-                train_learning_rate_var.set("1")
-                train_learning_rate_entry.configure(state="disabled")
-            else:
-                train_learning_rate_entry.configure(state="normal")
-
-        def sync_entry_state() -> None:
-            if use_global_var.get():
-                train_optimizer_combo.configure(state="disabled")
-                train_steps_entry.configure(state="disabled")
-                train_learning_rate_entry.configure(state="disabled")
-                train_network_dim_combo.configure(state="disabled")
-                train_network_alpha_combo.configure(state="disabled")
-                train_resolution_entry.configure(state="disabled")
-                return
-
-            train_optimizer_combo.configure(state="readonly")
-            train_steps_entry.configure(state="normal")
-            train_network_dim_combo.configure(state="readonly")
-            train_network_alpha_combo.configure(state="readonly")
-            train_resolution_entry.configure(state="normal")
-            sync_optimizer_controls()
-
-        def reset_to_global_defaults() -> None:
-            train_optimizer_var.set(global_values[TRAIN_OPTIMIZER_TYPE_KEY])
-            train_steps_var.set(global_values[TRAIN_STEPS_KEY])
-            train_learning_rate_var.set(global_values[TRAIN_LEARNING_RATE_KEY])
-            train_network_dim_var.set(global_values[TRAIN_NETWORK_DIM_KEY])
-            train_network_alpha_var.set(global_values[TRAIN_NETWORK_ALPHA_KEY])
-            train_resolution_var.set(global_values[TRAIN_RESOLUTION_KEY])
-            use_global_var.set(False)
-            sync_entry_state()
-
-        def save_and_close() -> None:
-            raw_to_save: dict[str, str] = {
-                DATASET_USE_GLOBAL_TRAIN_KEY: "1" if use_global_var.get() else "0",
-            }
-
-            if not use_global_var.get():
-                try:
-                    train_steps = int(train_steps_var.get().strip())
-                except ValueError:
-                    messagebox.showerror("Invalid value", "Training steps must be an integer.", parent=dialog)
-                    return
-                if train_steps < 1:
-                    messagebox.showerror("Invalid value", "Training steps must be 1 or higher.", parent=dialog)
-                    return
-
-                train_optimizer = train_optimizer_var.get().strip().lower()
-                if train_optimizer not in {"adamw8bit", "prodigy"}:
-                    messagebox.showerror("Invalid value", "Optimizer type must be adamw8bit or prodigy.", parent=dialog)
-                    return
-
-                train_learning_rate = train_learning_rate_var.get().strip()
-                if train_optimizer == "prodigy":
-                    train_learning_rate = "1"
-                    train_learning_rate_var.set("1")
-                if not train_learning_rate:
-                    messagebox.showerror("Invalid value", "Learning rate is required.", parent=dialog)
-                    return
-                try:
-                    learning_rate_number = float(train_learning_rate)
-                except ValueError:
-                    messagebox.showerror("Invalid value", "Learning rate must be numeric (example: 1e-4).", parent=dialog)
-                    return
-                if learning_rate_number <= 0:
-                    messagebox.showerror("Invalid value", "Learning rate must be greater than 0.", parent=dialog)
-                    return
-
-                try:
-                    network_dim = int(train_network_dim_var.get().strip())
-                except ValueError:
-                    messagebox.showerror("Invalid value", "LoRA network dim must be an integer.", parent=dialog)
-                    return
-                if network_dim < 1:
-                    messagebox.showerror("Invalid value", "LoRA network dim must be 1 or higher.", parent=dialog)
-                    return
-
-                try:
-                    network_alpha = int(train_network_alpha_var.get().strip())
-                except ValueError:
-                    messagebox.showerror("Invalid value", "LoRA network alpha must be an integer.", parent=dialog)
-                    return
-                if network_alpha < 1:
-                    messagebox.showerror("Invalid value", "LoRA network alpha must be 1 or higher.", parent=dialog)
-                    return
-
-                try:
-                    resolution = int(train_resolution_var.get().strip())
-                except ValueError:
-                    messagebox.showerror("Invalid value", "Dataset resolution must be an integer.", parent=dialog)
-                    return
-                if resolution < 64:
-                    messagebox.showerror("Invalid value", "Dataset resolution must be 64 or higher.", parent=dialog)
-                    return
-
-                raw_to_save[TRAIN_STEPS_KEY] = str(train_steps)
-                raw_to_save[TRAIN_OPTIMIZER_TYPE_KEY] = train_optimizer
-                raw_to_save[TRAIN_LEARNING_RATE_KEY] = train_learning_rate
-                raw_to_save[TRAIN_NETWORK_DIM_KEY] = str(network_dim)
-                raw_to_save[TRAIN_NETWORK_ALPHA_KEY] = str(network_alpha)
-                raw_to_save[TRAIN_RESOLUTION_KEY] = str(resolution)
-
-            try:
-                save_dataset_train_settings_raw(dataset_name, raw_to_save)
-            except OSError as exc:
-                messagebox.showerror("Save failed", f"Could not save dataset settings:\n{exc}", parent=dialog)
-                return
-
-            checkpoint_cache.pop(dataset_name, None)
-            rebuild_folder_list(force=True)
-            dialog.destroy()
-
-        button_row = ttk.Frame(frame)
-        button_row.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        button_row.columnconfigure(0, weight=1)
-
-        ttk.Button(button_row, text="Reset", command=reset_to_global_defaults).grid(row=0, column=0, sticky="w")
-        ttk.Button(button_row, text="Cancel", command=dialog.destroy).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(button_row, text="Save", command=save_and_close).grid(row=0, column=2)
-
-        use_global_var.trace_add("write", lambda *_args: sync_entry_state())
-        train_optimizer_var.trace_add("write", lambda *_args: sync_entry_state())
-        sync_entry_state()
-
-        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
-        dialog.update_idletasks()
-        dialog.geometry(f"{max(740, dialog.winfo_reqwidth())}x{dialog.winfo_reqheight()}")
-        center_window(dialog)
-        dialog.deiconify()
-        dialog.focus_set()
         root.wait_window(dialog)
 
     def dataset_output_safetensors(dataset_name: str) -> list[Path]:
@@ -4229,6 +4038,18 @@ def launch_ui() -> int:
     log_progress_active = False
     log_progress_mark = "log_progress_line_start"
 
+    def _show_log_context_menu(event: "tk.Event[tk.Text]") -> None:
+        menu = tk.Menu(
+            root, tearoff=0,
+            bg=bg_card, fg=fg_text,
+            activebackground="#3a3f4b", activeforeground=fg_text,
+            bd=0, relief="flat",
+        )
+        menu.add_command(label="Clear console", command=lambda: log_box.delete("1.0", "end"))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    log_box.bind("<Button-3>", _show_log_context_menu)
+
     def is_log_scrolled_to_bottom() -> bool:
         _first, last = log_box.yview()
         return last >= 0.999
@@ -4275,6 +4096,19 @@ def launch_ui() -> int:
     def jobs_order_file_path() -> Path:
         return jobs_storage_dir() / JOBS_ORDER_FILE_NAME
 
+    def presets_storage_dir() -> Path:
+        return download_workspace_root() / "Presets"
+
+    def _slugify_preset_token(value: str) -> str:
+        token = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
+        token = token.strip("-._")
+        return token or "preset"
+
+    def job_preset_file_path(family_name: str, preset_name: str) -> Path:
+        family_token = _slugify_preset_token(family_name)
+        preset_token = _slugify_preset_token(preset_name)
+        return presets_storage_dir() / f"{family_token}__{preset_token}{JOB_PRESET_FILE_SUFFIX}"
+
     def job_settings_file_path(training_name: str) -> Path:
         return training_job_dir_path(training_name) / JOB_SETTINGS_FILE_NAME
 
@@ -4285,6 +4119,52 @@ def launch_ui() -> int:
         ensure_jobs_storage()
         order = [job.get("training_name", "").strip() for job in job_queue if job.get("training_name", "").strip()]
         jobs_order_file_path().write_text(json.dumps(order, indent=2), encoding="utf-8")
+
+    def load_job_presets_from_disk() -> dict[str, dict[str, object]]:
+        cleaned: dict[str, dict[str, object]] = {}
+
+        def _ingest_record(record: dict[str, object], source_path: Path) -> None:
+            model_name = str(record.get("model", "")).strip()
+            family_name = str(record.get("family", "")).strip()
+            preset_name = str(record.get("name", "")).strip()
+            values = record.get("values", {})
+            if not isinstance(values, dict):
+                values = {}
+            if not preset_name or (not model_name and not family_name):
+                return
+            key_scope = family_name or model_name
+            key = f"{key_scope}::{preset_name}"
+            cleaned[key] = {
+                "model": model_name,
+                "family": family_name,
+                "name": preset_name,
+                "values": {str(k): str(v) for k, v in values.items() if isinstance(k, str)},
+                "file": str(source_path),
+            }
+
+        presets_dir = presets_storage_dir()
+        if presets_dir.exists() and presets_dir.is_dir():
+            for path in sorted(presets_dir.glob(f"*{JOB_PRESET_FILE_SUFFIX}"), key=lambda p: p.name.casefold()):
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if isinstance(raw, dict):
+                    _ingest_record(raw, path)
+
+        return cleaned
+
+    def save_job_preset_to_disk(model_name: str, family_name: str, preset_name: str, values: dict[str, str]) -> Path:
+        presets_storage_dir().mkdir(parents=True, exist_ok=True)
+        target = job_preset_file_path(family_name, preset_name)
+        payload = {
+            "model": model_name,
+            "family": family_name,
+            "name": preset_name,
+            "values": values,
+        }
+        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return target
 
     def save_job_to_disk(job: dict[str, str]) -> None:
         ensure_jobs_storage()
@@ -4561,7 +4441,6 @@ def launch_ui() -> int:
         return ""
 
     def build_recovered_job_from_training_dir(job_dir: Path) -> dict[str, str]:
-        train_settings = global_train_settings()
         training_name = job_dir.name.strip()
         dataset_name = infer_dataset_name_from_training_dir(job_dir).strip() or training_name
         output_dir = (job_dir / "output").expanduser()
@@ -4573,12 +4452,20 @@ def launch_ui() -> int:
             "job_name": training_name,
             "model": "Klein",
             "output_dir": str(output_dir),
-            "resolution": train_settings[TRAIN_RESOLUTION_KEY],
-            "network_dim": train_settings[TRAIN_NETWORK_DIM_KEY],
-            "network_alpha": train_settings[TRAIN_NETWORK_ALPHA_KEY],
-            "optimizer_type": train_settings[TRAIN_OPTIMIZER_TYPE_KEY],
-            "learning_rate": train_settings[TRAIN_LEARNING_RATE_KEY],
-            "train_steps": train_settings[TRAIN_STEPS_KEY],
+            "resolution": str(DEFAULT_RESOLUTION),
+            "network_dim": str(DEFAULT_NETWORK_DIM),
+            "network_alpha": str(DEFAULT_NETWORK_ALPHA),
+            "optimizer_type": "prodigy",
+            "learning_rate": DEFAULT_LEARNING_RATE,
+            "train_steps": str(DEFAULT_TRAIN_STEPS),
+            "save_every_n_steps": str(
+                get_positive_int_setting(
+                    settings_state,
+                    TRAIN_SAVE_EVERY_N_STEPS_KEY,
+                    DEFAULT_SAVE_EVERY_N_STEPS,
+                    minimum=1,
+                )
+            ),
             "enable_compile": settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0"),
             "enable_tf32": settings_state.get(ENABLE_CUDA_ALLOW_TF32_KEY, "1"),
             "enable_cudnn": settings_state.get(ENABLE_CUDA_CUDNN_BENCHMARK_KEY, "1"),
@@ -4600,8 +4487,7 @@ def launch_ui() -> int:
         if has_name_mismatch:
             return "broken"
 
-        global_train_steps = get_positive_int_setting(settings_state, TRAIN_STEPS_KEY, DEFAULT_TRAIN_STEPS)
-        target_steps = get_positive_int_setting(job, "train_steps", global_train_steps)
+        target_steps = get_positive_int_setting(job, "train_steps", DEFAULT_TRAIN_STEPS)
         progress_step, has_resume_data = job_resume_progress(job)
         has_finished_output = any((output_dir / f"{name}.safetensors").exists() for name in output_names)
 
@@ -4978,6 +4864,7 @@ def launch_ui() -> int:
                 datasets=dup_datasets,
                 resolution=resolution_value,
                 default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+                model_name=source.get("model", ""),
             )
         except Exception as exc:
             messagebox.showerror("Duplicate failed", str(exc), parent=root)
@@ -5136,8 +5023,6 @@ def launch_ui() -> int:
             else:
                 initial_datasets = [{"name": dataset_name, "num_repeats": 1}]
 
-        effective = effective_train_settings_for_dataset(dataset_name)
-
         dialog = tk.Toplevel(root)
         dialog.withdraw()
         dialog.title("Edit Job" if existing_job is not None else "Create Job")
@@ -5160,16 +5045,125 @@ def launch_ui() -> int:
         header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         header_frame.columnconfigure(1, weight=1)
 
-        default_job_name = f"{dataset_name}_Klein"
+        def _fit_create_job_dialog_to_content() -> None:
+            if not dialog.winfo_exists():
+                return
+            dialog.update_idletasks()
+            target_width = max(820, dialog.winfo_reqwidth())
+            target_height = dialog.winfo_reqheight()
+            if dialog.state() == "withdrawn":
+                dialog.geometry(f"{target_width}x{target_height}")
+            else:
+                pos_x = dialog.winfo_x()
+                pos_y = dialog.winfo_y()
+                dialog.geometry(f"{target_width}x{target_height}+{pos_x}+{pos_y}")
+
+        _model_to_family: dict[str, str] = {
+            mn: fam
+            for fam, models in DOWNLOAD_MODEL_FAMILIES.items()
+            for mn in models
+        }
+
+        _KLEIN_MODELS = {"klein-base-9b", "klein-9b", "klein-base-4b", "klein-4b"}
+
+        def _family_label(mn: str) -> str:
+            if mn in _KLEIN_MODELS:
+                return "Klein"
+            fam = _model_to_family.get(mn, "")
+            if fam == "FLUX.2":
+                return "Flux2"
+            return fam or mn
+
+        model_var = tk.StringVar(value=(existing_job or {}).get("model", "klein-base-9b"))
+        ltx_mode_var = tk.StringVar(value=(existing_job or {}).get("ltx_mode", "video"))
+        default_job_name = f"{dataset_name}_{_family_label(model_var.get())}"
         if existing_job is not None:
             default_job_name = existing_job.get("job_name", default_job_name)
         job_name_var = tk.StringVar(value=default_job_name)
-        model_var = tk.StringVar(value=(existing_job or {}).get("model", "Klein"))
+        _job_name_user_edited = [existing_job is not None]  # track manual edits
+
+        # Build available model list from saved paths
+        import json as _json_cj
+        _mpaths_cj: dict[str, dict[str, str]] = {}
+        try:
+            _mpaths_cj = _json_cj.loads(settings_state.get(MODEL_PATHS_KEY, "{}"))
+        except Exception:
+            pass
+        _all_mn = [mn for fam in DOWNLOAD_MODEL_FAMILIES.values() for mn in fam]
+        _avail_models = [mn for mn in _all_mn if _mpaths_cj.get(mn, {}).get("dit")]
+        # Backward compat: legacy klein key
+        if not _avail_models and settings_state.get(KLEIN_DIT_KEY, "").strip():
+            _avail_models = ["klein-base-9b"]
+        if not _avail_models:
+            _avail_models = ["klein-base-9b"]
+        if model_var.get() not in _avail_models:
+            model_var.set(_avail_models[0])
+        _display_values = [DOWNLOAD_MODEL_DISPLAY_NAMES.get(mn, mn) for mn in _avail_models]
+        _ltx_mode_display_to_value = {"Image Training": "video"}
+        _ltx_mode_value_to_display = {
+            value: key for key, value in _ltx_mode_display_to_value.items()
+        }
+        _ltx_image_lora_target_choices = (
+            "t2v",
+            "v2v",
+            "video_sa",
+            "video_sa_ff",
+            "video_sa_ca_ff",
+            "full",
+            "lycoris",
+        )
+
+        def _normalize_ltx_mode_ui(value: str) -> str:
+            mode = (value or "video").strip().lower()
+            if mode in {"video", "v", "image"}:
+                return "video"
+            if mode in {"av", "va"}:
+                return "av"
+            if mode in {"audio", "a"}:
+                return "audio"
+            return "video"
+
+        ltx_mode_var.set(_normalize_ltx_mode_ui(ltx_mode_var.get()))
+
+        _preferred_presets_raw = settings_state.get(PREFERRED_PRESETS_BY_FAMILY_KEY, "")
+        try:
+            _preferred_presets_loaded = json.loads(_preferred_presets_raw) if _preferred_presets_raw else {}
+        except Exception:
+            _preferred_presets_loaded = {}
+        preferred_preset_by_family: dict[str, str] = {}
+        if isinstance(_preferred_presets_loaded, dict):
+            preferred_preset_by_family = {
+                str(k): str(v)
+                for k, v in _preferred_presets_loaded.items()
+                if isinstance(k, str) and isinstance(v, str)
+            }
 
         ttk.Label(header_frame, text="LoRA name:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(header_frame, textvariable=job_name_var, style="Flat.TEntry").grid(row=0, column=1, sticky="ew")
+        _lora_name_entry = ttk.Entry(header_frame, textvariable=job_name_var, style="Flat.TEntry")
+        _lora_name_entry.grid(row=0, column=1, sticky="ew")
+        _lora_name_entry.bind("<Key>", lambda _e: _job_name_user_edited.__setitem__(0, True))
         ttk.Label(header_frame, text="Model:").grid(row=0, column=2, sticky="w", padx=(12, 8))
-        ttk.Combobox(header_frame, textvariable=model_var, values=("Klein",), state="readonly", width=10).grid(row=0, column=3, sticky="w")
+        _model_display_var = tk.StringVar(value=DOWNLOAD_MODEL_DISPLAY_NAMES.get(model_var.get(), model_var.get()))
+
+        def _on_model_display_change(*_a: object) -> None:
+            disp = _model_display_var.get()
+            for mn, dn in DOWNLOAD_MODEL_DISPLAY_NAMES.items():
+                if dn == disp:
+                    model_var.set(mn)
+                    break
+            else:
+                model_var.set(disp)
+            # Auto-update job name suffix if the user hasn't manually edited it
+            if not _job_name_user_edited[0]:
+                current = job_name_var.get()
+                # Replace suffix after the last underscore with the new family label
+                base = current.rsplit("_", 1)[0] if "_" in current else current
+                job_name_var.set(f"{base}_{_family_label(model_var.get())}")
+            _sync_model_specific_controls()
+            _refresh_preset_combo()
+
+        _model_display_var.trace_add("write", _on_model_display_change)
+        ttk.Combobox(header_frame, textvariable=_model_display_var, values=_display_values, state="readonly", width=28).grid(row=0, column=3, sticky="w")
 
         # ── Notebook ───────────────────────────────────────────────────────
         notebook = ttk.Notebook(outer)
@@ -5182,23 +5176,45 @@ def launch_ui() -> int:
         notebook.add(training_tab, text="  Training  ")
 
         train_optimizer_var = tk.StringVar(
-            value=(existing_job or {}).get("optimizer_type", get_train_optimizer_setting(effective))
+            value=(existing_job or {}).get("optimizer_type", "prodigy")
+        )
+        train_optimizer_args_var = tk.StringVar(
+            value=(existing_job or {}).get("optimizer_args", "")
         )
         train_learning_rate_var = tk.StringVar(
-            value=(existing_job or {}).get("learning_rate", effective.get(TRAIN_LEARNING_RATE_KEY, DEFAULT_LEARNING_RATE))
+            value=(existing_job or {}).get("learning_rate", DEFAULT_LEARNING_RATE)
         )
         train_steps_var = tk.StringVar(
-            value=(existing_job or {}).get("train_steps", effective.get(TRAIN_STEPS_KEY, str(DEFAULT_TRAIN_STEPS)))
+            value=(existing_job or {}).get("train_steps", str(DEFAULT_TRAIN_STEPS))
+        )
+        _default_save_every_from_settings = str(
+            get_positive_int_setting(
+                settings_state,
+                TRAIN_SAVE_EVERY_N_STEPS_KEY,
+                DEFAULT_SAVE_EVERY_N_STEPS,
+                minimum=1,
+            )
         )
         train_save_every_var = tk.StringVar(
-            value=(existing_job or {}).get("save_every_n_steps", str(DEFAULT_SAVE_EVERY_N_STEPS))
+            value=(existing_job or {}).get("save_every_n_steps", _default_save_every_from_settings)
         )
         train_network_dim_var = tk.StringVar(
-            value=(existing_job or {}).get("network_dim", effective.get(TRAIN_NETWORK_DIM_KEY, str(DEFAULT_NETWORK_DIM)))
+            value=(existing_job or {}).get("network_dim", str(DEFAULT_NETWORK_DIM))
         )
         train_network_alpha_var = tk.StringVar(
-            value=(existing_job or {}).get("network_alpha", effective.get(TRAIN_NETWORK_ALPHA_KEY, str(DEFAULT_NETWORK_ALPHA)))
+            value=(existing_job or {}).get("network_alpha", str(DEFAULT_NETWORK_ALPHA))
         )
+        lr_scheduler_var = tk.StringVar(value=(existing_job or {}).get("lr_scheduler", "constant"))
+        lr_warmup_steps_var = tk.StringVar(value=(existing_job or {}).get("lr_warmup_steps", "0"))
+        gradient_accumulation_steps_var = tk.StringVar(value=(existing_job or {}).get("gradient_accumulation_steps", "1"))
+        blocks_to_swap_var = tk.StringVar(value=(existing_job or {}).get("blocks_to_swap", "0"))
+        timestep_sampling_var = tk.StringVar(value=(existing_job or {}).get("timestep_sampling", "sigma"))
+        ltx_lora_target_preset_var = tk.StringVar(value=(existing_job or {}).get("ltx_lora_target_preset", "full"))
+        ltx_first_frame_conditioning_p_var = tk.StringVar(value=(existing_job or {}).get("ltx_first_frame_conditioning_p", "0.5"))
+
+        job_presets = load_job_presets_from_disk()
+        preset_none_label = "---------"
+        preset_name_var = tk.StringVar(value=preset_none_label)
         compile_var = tk.BooleanVar(
             value=flag_to_bool((existing_job or {}).get("enable_compile", bool_to_flag(is_truthy(settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY), default=False))))
         )
@@ -5215,35 +5231,404 @@ def launch_ui() -> int:
             value=flag_to_bool((existing_job or {}).get("enable_gc", bool_to_flag(is_truthy(settings_state.get(ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY), default=False))))
         )
 
+        def _collect_preset_values() -> dict[str, str]:
+            return {
+                "optimizer_type": train_optimizer_var.get().strip().lower(),
+                "optimizer_args": train_optimizer_args_var.get().strip(),
+                "learning_rate": train_learning_rate_var.get().strip(),
+                "train_steps": train_steps_var.get().strip(),
+                "save_every_n_steps": train_save_every_var.get().strip(),
+                "network_dim": train_network_dim_var.get().strip(),
+                "network_alpha": train_network_alpha_var.get().strip(),
+                "resolution": train_resolution_var.get().strip(),
+                "batch_size": train_batch_var.get().strip(),
+                "lr_scheduler": lr_scheduler_var.get().strip(),
+                "lr_warmup_steps": lr_warmup_steps_var.get().strip(),
+                "gradient_accumulation_steps": gradient_accumulation_steps_var.get().strip(),
+                "blocks_to_swap": blocks_to_swap_var.get().strip(),
+                "timestep_sampling": timestep_sampling_var.get().strip(),
+                "ltx_mode": _normalize_ltx_mode_ui(ltx_mode_var.get()),
+                "ltx_lora_target_preset": ltx_lora_target_preset_var.get().strip(),
+                "ltx_first_frame_conditioning_p": ltx_first_frame_conditioning_p_var.get().strip(),
+            }
+
+        def _apply_preset_values(values: dict[str, str]) -> None:
+            if "optimizer_type" in values:
+                train_optimizer_var.set(values["optimizer_type"])
+            if "optimizer_args" in values:
+                train_optimizer_args_var.set(values["optimizer_args"])
+            if "learning_rate" in values:
+                train_learning_rate_var.set(values["learning_rate"])
+            if "train_steps" in values:
+                train_steps_var.set(values["train_steps"])
+            if "save_every_n_steps" in values:
+                train_save_every_var.set(values["save_every_n_steps"])
+            if "network_dim" in values:
+                train_network_dim_var.set(values["network_dim"])
+            if "network_alpha" in values:
+                train_network_alpha_var.set(values["network_alpha"])
+            if "resolution" in values:
+                train_resolution_var.set(values["resolution"])
+            if "batch_size" in values:
+                train_batch_var.set(values["batch_size"])
+            if "lr_scheduler" in values:
+                lr_scheduler_var.set(values["lr_scheduler"])
+            if "lr_warmup_steps" in values:
+                lr_warmup_steps_var.set(values["lr_warmup_steps"])
+            if "gradient_accumulation_steps" in values:
+                gradient_accumulation_steps_var.set(values["gradient_accumulation_steps"])
+            if "blocks_to_swap" in values:
+                blocks_to_swap_var.set(values["blocks_to_swap"])
+            if "timestep_sampling" in values:
+                timestep_sampling_var.set(values["timestep_sampling"])
+            if "ltx_mode" in values:
+                ltx_mode_var.set(_normalize_ltx_mode_ui(values["ltx_mode"]))
+            if "ltx_lora_target_preset" in values:
+                ltx_lora_target_preset_var.set(values["ltx_lora_target_preset"])
+            if "ltx_first_frame_conditioning_p" in values:
+                ltx_first_frame_conditioning_p_var.set(values["ltx_first_frame_conditioning_p"])
+
+        def _preset_names_for_model(model_name: str) -> list[str]:
+            selected_family = _model_to_family.get(model_name, "")
+            names = {
+                str(payload.get("name", "")).strip()
+                for payload in job_presets.values()
+                if isinstance(payload, dict)
+                and (
+                    str(payload.get("family", "")).strip() == selected_family
+                    or str(payload.get("model", "")).strip() == model_name
+                    or (
+                        not str(payload.get("family", "")).strip()
+                        and _model_to_family.get(str(payload.get("model", "")).strip(), "") == selected_family
+                    )
+                )
+            }
+            return sorted([name for name in names if name], key=str.casefold)
+
+        def _preset_payload_for_model_name(model_name: str, preset_name: str) -> dict[str, object] | None:
+            selected_family = _model_to_family.get(model_name, "")
+            for payload in job_presets.values():
+                if not isinstance(payload, dict):
+                    continue
+                if str(payload.get("name", "")).strip() != preset_name:
+                    continue
+                payload_family = str(payload.get("family", "")).strip()
+                payload_model = str(payload.get("model", "")).strip()
+                if payload_family == selected_family:
+                    return payload
+                if payload_model == model_name:
+                    return payload
+                if not payload_family and _model_to_family.get(payload_model, "") == selected_family:
+                    return payload
+            return None
+
+        preset_section = ttk.LabelFrame(training_tab, text="Preset", padding=8)
+        preset_section.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 10))
+        preset_section.columnconfigure(1, weight=1)
+        ttk.Label(preset_section, text="Preset:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        preset_combo = ttk.Combobox(preset_section, textvariable=preset_name_var, state="readonly")
+        preset_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+
+        def _refresh_preset_combo() -> None:
+            nonlocal job_presets
+            job_presets = load_job_presets_from_disk()
+            names = [preset_none_label] + _preset_names_for_model(model_var.get().strip())
+            preset_combo.configure(values=names)
+            if preset_name_var.get() not in names:
+                preset_name_var.set(preset_none_label)
+
+        def _on_preset_selected(*_args: object) -> None:
+            selected_name = preset_name_var.get().strip()
+            if selected_name == preset_none_label:
+                return
+            payload = _preset_payload_for_model_name(model_var.get().strip(), selected_name)
+            if not isinstance(payload, dict):
+                return
+            values = payload.get("values", {})
+            if isinstance(values, dict):
+                _apply_preset_values({str(k): str(v) for k, v in values.items() if isinstance(k, str)})
+                _sync_resolution_controls()
+                _sync_model_specific_controls()
+
+        preset_name_var.trace_add("write", _on_preset_selected)
+
+        def _save_preset() -> None:
+            current_model = model_var.get().strip()
+            current_family = _model_to_family.get(current_model, "") or current_model
+            initial_name = preset_name_var.get().strip()
+            if not initial_name or initial_name == preset_none_label:
+                initial_name = f"{current_family} preset"
+            preset_name = simpledialog.askstring(
+                "Save preset",
+                "Preset name:",
+                initialvalue=initial_name,
+                parent=dialog,
+            )
+            if preset_name is None:
+                return
+            preset_name = preset_name.strip()
+            if not preset_name:
+                messagebox.showerror("Invalid preset", "Preset name is required.", parent=dialog)
+                return
+            if _preset_payload_for_model_name(current_model, preset_name) is not None:
+                if not messagebox.askyesno(
+                    "Overwrite preset",
+                    f"Preset '{preset_name}' already exists for family {current_family}. Overwrite it?",
+                    parent=dialog,
+                ):
+                    return
+            save_job_preset_to_disk(current_model, current_family, preset_name, _collect_preset_values())
+            _refresh_preset_combo()
+            preset_name_var.set(preset_name)
+
+        def _reload_presets() -> None:
+            _refresh_preset_combo()
+
+        def _delete_preset() -> None:
+            selected_name = preset_name_var.get().strip()
+            if not selected_name or selected_name == preset_none_label:
+                messagebox.showerror("Delete preset", "Select a preset to delete.", parent=dialog)
+                return
+
+            current_model = model_var.get().strip()
+            payload = _preset_payload_for_model_name(current_model, selected_name)
+            if not isinstance(payload, dict):
+                messagebox.showerror("Delete preset", "Preset could not be found on disk.", parent=dialog)
+                return
+
+            payload_family = str(payload.get("family", "")).strip() or _model_to_family.get(current_model, "")
+            file_path_raw = str(payload.get("file", "")).strip()
+            target_path = Path(file_path_raw) if file_path_raw else job_preset_file_path(payload_family, selected_name)
+
+            if not messagebox.askyesno(
+                "Delete preset",
+                f"Delete preset '{selected_name}' for family {payload_family}?",
+                parent=dialog,
+            ):
+                return
+
+            try:
+                if target_path.exists():
+                    target_path.unlink()
+            except OSError as exc:
+                messagebox.showerror("Delete preset", f"Could not delete preset:\n{exc}", parent=dialog)
+                return
+
+            _refresh_preset_combo()
+            preset_name_var.set(preset_none_label)
+
+        _reload_preset_button = ttk.Button(preset_section, text="\u21bb", command=_reload_presets, width=3)
+        _reload_preset_button.grid(row=0, column=2, sticky="e")
+        _save_preset_button = ttk.Button(preset_section, text="Save preset", command=_save_preset)
+        _save_preset_button.grid(row=0, column=3, sticky="e", padx=(6, 0))
+        _delete_preset_button = ttk.Button(preset_section, text="\U0001F5D1", command=_delete_preset, width=3)
+        _delete_preset_button.grid(row=0, column=4, sticky="e", padx=(6, 0))
+        attach_hover_tooltip(_reload_preset_button, "Reload presets from disk")
+        attach_hover_tooltip(_delete_preset_button, "Delete selected preset")
+
+        def _attach_field_tooltip(label_widget: tk.Widget, input_widget: tk.Widget, text: str) -> None:
+            attach_hover_tooltip(label_widget, text)
+            attach_hover_tooltip(input_widget, text)
+
         options = ttk.LabelFrame(training_tab, text="Training settings", padding=8)
-        options.grid(row=0, column=0, columnspan=4, sticky="ew")
+        options.grid(row=1, column=0, columnspan=4, sticky="ew")
         options.columnconfigure(1, weight=1)
         options.columnconfigure(3, weight=1)
 
-        ttk.Label(options, text="Optimizer type:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        _optimizer_label = ttk.Label(options, text="Optimizer type:")
+        _optimizer_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
         train_optimizer_combo = ttk.Combobox(
-            options, textvariable=train_optimizer_var, values=("adamw8bit", "prodigy"), state="readonly"
+            options, textvariable=train_optimizer_var, values=OPTIMIZER_TYPE_CHOICES, state="readonly"
         )
         train_optimizer_combo.grid(row=0, column=1, sticky="ew")
-        ttk.Label(options, text="Training steps:").grid(row=0, column=2, sticky="w", padx=(12, 8))
-        ttk.Entry(options, textvariable=train_steps_var, style="Flat.TEntry").grid(row=0, column=3, sticky="ew")
+        _steps_label = ttk.Label(options, text="Training steps:")
+        _steps_label.grid(row=0, column=2, sticky="w", padx=(12, 8))
+        _steps_entry = ttk.Entry(options, textvariable=train_steps_var, style="Flat.TEntry")
+        _steps_entry.grid(row=0, column=3, sticky="ew")
 
-        ttk.Label(options, text="Learning rate:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        _learning_rate_label = ttk.Label(options, text="Learning rate:")
+        _learning_rate_label.grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
         train_learning_rate_entry = ttk.Entry(options, textvariable=train_learning_rate_var, style="Flat.TEntry")
         train_learning_rate_entry.grid(row=1, column=1, sticky="ew", pady=(6, 0))
-        ttk.Label(options, text="LoRA network dim:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
-        ttk.Combobox(options, textvariable=train_network_dim_var, values=TRAIN_DIM_ALPHA_CHOICES, state="readonly").grid(
+        _network_dim_label = ttk.Label(options, text="LoRA network dim:")
+        _network_dim_label.grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        _network_dim_combo = ttk.Combobox(options, textvariable=train_network_dim_var, values=TRAIN_DIM_ALPHA_CHOICES, state="readonly")
+        _network_dim_combo.grid(
             row=1, column=3, sticky="ew", pady=(6, 0)
         )
-        ttk.Label(options, text="Save every N steps:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Entry(options, textvariable=train_save_every_var, style="Flat.TEntry").grid(row=2, column=1, sticky="ew", pady=(6, 0))
-        ttk.Label(options, text="LoRA network alpha:").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
-        ttk.Combobox(options, textvariable=train_network_alpha_var, values=TRAIN_DIM_ALPHA_CHOICES, state="readonly").grid(
+        _save_steps_label = ttk.Label(options, text="Save every N steps:")
+        _save_steps_label.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        _save_steps_entry = ttk.Entry(options, textvariable=train_save_every_var, style="Flat.TEntry")
+        _save_steps_entry.grid(row=2, column=1, sticky="ew", pady=(6, 0))
+        _network_alpha_label = ttk.Label(options, text="LoRA network alpha:")
+        _network_alpha_label.grid(row=2, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        _network_alpha_combo = ttk.Combobox(options, textvariable=train_network_alpha_var, values=TRAIN_DIM_ALPHA_CHOICES, state="readonly")
+        _network_alpha_combo.grid(
             row=2, column=3, sticky="ew", pady=(6, 0)
         )
 
+        _optimizer_args_label = ttk.Label(options, text="Optimizer args:")
+        _optimizer_args_label.grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        _optimizer_args_entry = ttk.Entry(options, textvariable=train_optimizer_args_var, style="Flat.TEntry")
+        _optimizer_args_entry.grid(row=3, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+
+        _attach_field_tooltip(
+            _optimizer_label,
+            train_optimizer_combo,
+            "Optimizer algorithm for LoRA training. Prodigy uses lr=1 in this UI; other optimizers use the entered learning rate.",
+        )
+        _attach_field_tooltip(
+            _steps_label,
+            _steps_entry,
+            "Total update steps to run. Higher values train longer and can improve fit at the cost of overfit risk.",
+        )
+        _attach_field_tooltip(
+            _learning_rate_label,
+            train_learning_rate_entry,
+            "Main step size for updates. For Prodigy, this value is ignored and Musubi uses 1 automatically.",
+        )
+        _attach_field_tooltip(
+            _optimizer_args_label,
+            _optimizer_args_entry,
+            "Optional optimizer key=value args separated by spaces. Example (Prodigy): safeguard_warmup=True use_bias_correction=True weight_decay=0.01 betas=(0.9,0.99)",
+        )
+        _attach_field_tooltip(
+            _network_dim_label,
+            _network_dim_combo,
+            "LoRA rank (capacity). Higher rank can capture more detail but uses more VRAM and may overfit faster.",
+        )
+        _attach_field_tooltip(
+            _save_steps_label,
+            _save_steps_entry,
+            "Checkpoint interval. Saves model/state every N steps so you can resume or pick the best checkpoint.",
+        )
+        _attach_field_tooltip(
+            _network_alpha_label,
+            _network_alpha_combo,
+            "LoRA scaling value. Commonly kept equal to dim for balanced behavior.",
+        )
+
+        common_advanced = ttk.LabelFrame(training_tab, text="Advanced settings", padding=8)
+        common_advanced.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        common_advanced.columnconfigure(1, weight=1)
+        common_advanced.columnconfigure(3, weight=1)
+
+        _lr_scheduler_label = ttk.Label(common_advanced, text="LR scheduler:")
+        _lr_scheduler_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        _lr_scheduler_combo = ttk.Combobox(
+            common_advanced,
+            textvariable=lr_scheduler_var,
+            values=("constant", "constant_with_warmup", "linear", "cosine", "cosine_with_restarts", "polynomial"),
+            state="readonly",
+        )
+        _lr_scheduler_combo.grid(row=0, column=1, sticky="ew")
+        _lr_warmup_label = ttk.Label(common_advanced, text="LR warmup steps:")
+        _lr_warmup_label.grid(row=0, column=2, sticky="w", padx=(12, 8))
+        _lr_warmup_entry = ttk.Entry(common_advanced, textvariable=lr_warmup_steps_var, style="Flat.TEntry")
+        _lr_warmup_entry.grid(row=0, column=3, sticky="ew")
+
+        _grad_accum_label = ttk.Label(common_advanced, text="Grad accumulation:")
+        _grad_accum_label.grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        _grad_accum_entry = ttk.Entry(common_advanced, textvariable=gradient_accumulation_steps_var, style="Flat.TEntry")
+        _grad_accum_entry.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        _blocks_to_swap_label = ttk.Label(common_advanced, text="Blocks to swap:")
+        _blocks_to_swap_label.grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        _blocks_to_swap_entry = ttk.Entry(common_advanced, textvariable=blocks_to_swap_var, style="Flat.TEntry")
+        _blocks_to_swap_entry.grid(row=1, column=3, sticky="ew", pady=(6, 0))
+
+        _timestep_sampling_label = ttk.Label(common_advanced, text="Timestep sampling:")
+        _timestep_sampling_label.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        _timestep_sampling_combo = ttk.Combobox(
+            common_advanced,
+            textvariable=timestep_sampling_var,
+            values=("sigma", "uniform", "sigmoid", "shift", "flux_shift", "flux2_shift", "qwen_shift", "logsnr", "shifted_logit_normal"),
+            state="readonly",
+        )
+        _timestep_sampling_combo.grid(row=2, column=1, sticky="ew", pady=(6, 0))
+
+        _attach_field_tooltip(
+            _lr_scheduler_label,
+            _lr_scheduler_combo,
+            "Learning-rate decay strategy over training. constant keeps LR fixed; warmup/linear/cosine vary it by step.",
+        )
+        _attach_field_tooltip(
+            _lr_warmup_label,
+            _lr_warmup_entry,
+            "Number of initial steps used to ramp LR up. Helpful when using warmup schedulers.",
+        )
+        _attach_field_tooltip(
+            _grad_accum_label,
+            _grad_accum_entry,
+            "Accumulate gradients across N steps before optimizer update. Increases effective batch size.",
+        )
+        _attach_field_tooltip(
+            _blocks_to_swap_label,
+            _blocks_to_swap_entry,
+            "Model-specific memory/perf tuning knob from Musubi scripts. Keep at profile default unless needed.",
+        )
+        _attach_field_tooltip(
+            _timestep_sampling_label,
+            _timestep_sampling_combo,
+            "How timesteps are sampled during flow-matching training. Recommended values are model-family dependent.",
+        )
+
+        model_specific = ttk.LabelFrame(training_tab, text="Model-specific settings", padding=8)
+        model_specific.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        model_specific.columnconfigure(1, weight=1)
+        model_specific.columnconfigure(3, weight=1)
+
+        ltx_specific_frame = ttk.Frame(model_specific)
+        ltx_specific_frame.grid(row=0, column=0, columnspan=4, sticky="ew")
+        ltx_specific_frame.columnconfigure(1, weight=1)
+        ltx_specific_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(ltx_specific_frame, text="LTX mode:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        _ltx_mode_display_var = tk.StringVar(
+            value=_ltx_mode_value_to_display.get(_normalize_ltx_mode_ui(ltx_mode_var.get()), "Image Training")
+        )
+
+        def _on_ltx_mode_display_change(*_args: object) -> None:
+            ltx_mode_var.set(_ltx_mode_display_to_value.get(_ltx_mode_display_var.get(), "video"))
+
+        _ltx_mode_display_var.trace_add("write", _on_ltx_mode_display_change)
+        _ltx_mode_combo = ttk.Combobox(
+            ltx_specific_frame,
+            textvariable=_ltx_mode_display_var,
+            values=list(_ltx_mode_display_to_value.keys()),
+            state="readonly",
+        )
+        _ltx_mode_combo.grid(row=0, column=1, sticky="ew", pady=(6, 0))
+
+        ttk.Label(ltx_specific_frame, text="LoRA target preset:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        _ltx_lora_target_combo = ttk.Combobox(
+            ltx_specific_frame,
+            textvariable=ltx_lora_target_preset_var,
+            values=_ltx_image_lora_target_choices,
+            state="readonly",
+        )
+        _ltx_lora_target_combo.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+
+        ttk.Label(ltx_specific_frame, text="First-frame conditioning p:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        _ltx_first_frame_entry = ttk.Entry(ltx_specific_frame, textvariable=ltx_first_frame_conditioning_p_var, style="Flat.TEntry")
+        _ltx_first_frame_entry.grid(row=1, column=3, sticky="ew", pady=(6, 0))
+
+        attach_hover_tooltip(
+            _ltx_lora_target_combo,
+            (
+                "LoRA target preset controls which parts of the LTX model receive LoRA adapters.\n"
+                "For image-training workflows, presets are limited to video/image-relevant targets."
+            ),
+        )
+        attach_hover_tooltip(
+            _ltx_first_frame_entry,
+            (
+                "First-frame conditioning probability.\n"
+                "Higher values bias training to preserve frame-0 identity/composition guidance."
+            ),
+        )
+
         flags = ttk.LabelFrame(training_tab, text="Advanced flags", padding=8)
-        flags.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        flags.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         ttk.Checkbutton(flags, text="Enable Torch Compile", variable=compile_var).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(flags, text="Enable Allow TF32", variable=tf32_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
         ttk.Checkbutton(flags, text="Enable cuDNN Benchmark", variable=cudnn_var).grid(row=0, column=2, sticky="w", padx=(12, 0))
@@ -5253,14 +5638,34 @@ def launch_ui() -> int:
         )
 
         def sync_optimizer_controls() -> None:
-            if train_optimizer_var.get().strip().lower() == "prodigy":
-                train_learning_rate_var.set("1")
-                train_learning_rate_entry.configure(state="disabled")
+            optimizer_value = train_optimizer_var.get().strip().lower()
+            if optimizer_value == "prodigy":
+                if not train_optimizer_args_var.get().strip():
+                    train_optimizer_args_var.set(DEFAULT_PRODIGY_OPTIMIZER_ARGS)
             else:
-                train_learning_rate_entry.configure(state="normal")
+                if train_optimizer_args_var.get().strip() == DEFAULT_PRODIGY_OPTIMIZER_ARGS:
+                    train_optimizer_args_var.set("")
+
+        def _sync_model_specific_controls() -> None:
+            model_name = model_var.get().strip()
+            is_ltx = _model_to_family.get(model_name, "") == "LTX"
+            if is_ltx:
+                model_specific.grid()
+                ltx_specific_frame.grid()
+                _ltx_mode_combo.configure(state="disabled")
+                ltx_mode_var.set("video")
+                _ltx_mode_display_var.set(_ltx_mode_value_to_display["video"])
+                if ltx_lora_target_preset_var.get().strip() not in _ltx_image_lora_target_choices:
+                    ltx_lora_target_preset_var.set("full")
+            else:
+                model_specific.grid_remove()
+                ltx_specific_frame.grid_remove()
+            _fit_create_job_dialog_to_content()
 
         train_optimizer_var.trace_add("write", lambda *_args: sync_optimizer_controls())
         sync_optimizer_controls()
+        _sync_model_specific_controls()
+        _refresh_preset_combo()
 
         # ── Tab 2: Datasets ────────────────────────────────────────────────
         datasets_tab = ttk.Frame(notebook, padding=10)
@@ -5271,19 +5676,176 @@ def launch_ui() -> int:
         # Resolution + Batch row (both written to [general] section of dataset.toml)
         res_row = ttk.Frame(datasets_tab)
         res_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        _saved_res = int((existing_job or {}).get("resolution", effective.get(TRAIN_RESOLUTION_KEY, str(DEFAULT_RESOLUTION))))
+        _saved_res = int((existing_job or {}).get("resolution", str(DEFAULT_RESOLUTION)))
         _saved_res_str = str(_saved_res) if _saved_res in RESOLUTION_CHOICES else str(RESOLUTION_CHOICES[RESOLUTION_CHOICES.index(1024)])
         train_resolution_var = tk.StringVar(value=_saved_res_str)
+        _ltx_resolution_choices = (1280, 1920)
+        _ltx_resolution_choice_values = [str(r) for r in _ltx_resolution_choices]
+        _default_resolution_choice_values = [str(r) for r in RESOLUTION_CHOICES]
         _saved_batch = (existing_job or {}).get("batch_size", "1")
         train_batch_var = tk.StringVar(value=str(_saved_batch))
         ttk.Label(res_row, text="Resolution:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Combobox(
+        _resolution_combo = ttk.Combobox(
             res_row, textvariable=train_resolution_var,
-            values=[str(r) for r in RESOLUTION_CHOICES],
+            values=_default_resolution_choice_values,
             state="readonly", width=7,
-        ).grid(row=0, column=1, sticky="w")
+        )
+        _resolution_combo.grid(row=0, column=1, sticky="w")
         ttk.Label(res_row, text="Batch size:").grid(row=0, column=2, sticky="w", padx=(16, 8))
         ttk.Entry(res_row, textvariable=train_batch_var, style="Flat.TEntry", width=5).grid(row=0, column=3, sticky="w")
+
+        def _sync_resolution_controls() -> None:
+            model_name = model_var.get().strip()
+            is_ltx = _model_to_family.get(model_name, "") == "LTX"
+            allowed_values = _ltx_resolution_choice_values if is_ltx else _default_resolution_choice_values
+            _resolution_combo.configure(values=allowed_values)
+
+            current_value = train_resolution_var.get().strip()
+            if current_value not in allowed_values:
+                train_resolution_var.set("1920" if is_ltx else _saved_res_str)
+
+        _family_default_profiles: dict[str, dict[str, str]] = {
+            "FLUX.2": {
+                "optimizer_type": "prodigy",
+                "optimizer_args": DEFAULT_PRODIGY_OPTIMIZER_ARGS,
+                "learning_rate": DEFAULT_LEARNING_RATE,
+                "train_steps": str(DEFAULT_TRAIN_STEPS),
+                "save_every_n_steps": _default_save_every_from_settings,
+                "network_dim": str(DEFAULT_NETWORK_DIM),
+                "network_alpha": str(DEFAULT_NETWORK_ALPHA),
+                "lr_scheduler": "constant",
+                "lr_warmup_steps": "0",
+                "gradient_accumulation_steps": "1",
+                "blocks_to_swap": "0",
+                "timestep_sampling": "flux2_shift",
+                "resolution": str(DEFAULT_RESOLUTION),
+                "batch_size": "1",
+            },
+            "LTX": {
+                "optimizer_type": "adamw8bit",
+                "optimizer_args": "",
+                "learning_rate": DEFAULT_LEARNING_RATE,
+                "train_steps": "400",
+                "save_every_n_steps": _default_save_every_from_settings,
+                "network_dim": "16",
+                "network_alpha": "16",
+                "lr_scheduler": "constant_with_warmup",
+                "lr_warmup_steps": "100",
+                "gradient_accumulation_steps": "1",
+                "blocks_to_swap": "1",
+                "timestep_sampling": "shifted_logit_normal",
+                "resolution": "1920",
+                "batch_size": "1",
+                "ltx_lora_target_preset": "full",
+                "ltx_first_frame_conditioning_p": "0.5",
+            },
+            "Wan": {
+                "optimizer_type": "prodigy",
+                "optimizer_args": DEFAULT_PRODIGY_OPTIMIZER_ARGS,
+                "learning_rate": DEFAULT_LEARNING_RATE,
+                "train_steps": str(DEFAULT_TRAIN_STEPS),
+                "save_every_n_steps": _default_save_every_from_settings,
+                "network_dim": str(DEFAULT_NETWORK_DIM),
+                "network_alpha": str(DEFAULT_NETWORK_ALPHA),
+                "lr_scheduler": "constant",
+                "lr_warmup_steps": "0",
+                "gradient_accumulation_steps": "1",
+                "blocks_to_swap": "0",
+                "timestep_sampling": "shift",
+                "resolution": str(DEFAULT_RESOLUTION),
+                "batch_size": "1",
+            },
+            "Z-Image": {
+                "optimizer_type": "prodigy",
+                "optimizer_args": DEFAULT_PRODIGY_OPTIMIZER_ARGS,
+                "learning_rate": DEFAULT_LEARNING_RATE,
+                "train_steps": str(DEFAULT_TRAIN_STEPS),
+                "save_every_n_steps": _default_save_every_from_settings,
+                "network_dim": str(DEFAULT_NETWORK_DIM),
+                "network_alpha": str(DEFAULT_NETWORK_ALPHA),
+                "lr_scheduler": "constant",
+                "lr_warmup_steps": "0",
+                "gradient_accumulation_steps": "1",
+                "blocks_to_swap": "0",
+                "timestep_sampling": "shift",
+                "resolution": str(DEFAULT_RESOLUTION),
+                "batch_size": "1",
+            },
+            "Qwen-Image": {
+                "optimizer_type": "prodigy",
+                "optimizer_args": DEFAULT_PRODIGY_OPTIMIZER_ARGS,
+                "learning_rate": DEFAULT_LEARNING_RATE,
+                "train_steps": str(DEFAULT_TRAIN_STEPS),
+                "save_every_n_steps": _default_save_every_from_settings,
+                "network_dim": str(DEFAULT_NETWORK_DIM),
+                "network_alpha": str(DEFAULT_NETWORK_ALPHA),
+                "lr_scheduler": "constant",
+                "lr_warmup_steps": "0",
+                "gradient_accumulation_steps": "1",
+                "blocks_to_swap": "0",
+                "timestep_sampling": "qwen_shift",
+                "resolution": str(DEFAULT_RESOLUTION),
+                "batch_size": "1",
+            },
+        }
+
+        def _apply_family_defaults_if_needed() -> None:
+            if existing_job is not None:
+                return
+            if preset_name_var.get().strip() != preset_none_label:
+                return
+
+            model_name = model_var.get().strip()
+            family_name = _model_to_family.get(model_name, "")
+
+            preferred_name = preferred_preset_by_family.get(family_name, "").strip()
+            if preferred_name:
+                preferred_payload = _preset_payload_for_model_name(model_name, preferred_name)
+                if isinstance(preferred_payload, dict):
+                    preferred_values = preferred_payload.get("values", {})
+                    if isinstance(preferred_values, dict):
+                        _apply_preset_values({str(k): str(v) for k, v in preferred_values.items() if isinstance(k, str)})
+                        preset_name_var.set(preferred_name)
+                        return
+                # Preferred preset may have been deleted/renamed; fall back to family defaults.
+                preferred_preset_by_family.pop(family_name, None)
+
+            profile = _family_default_profiles.get(family_name)
+            if not profile:
+                return
+
+            train_optimizer_var.set(profile["optimizer_type"])
+            train_optimizer_args_var.set(profile.get("optimizer_args", ""))
+            train_learning_rate_var.set(profile["learning_rate"])
+            train_steps_var.set(profile["train_steps"])
+            train_save_every_var.set(profile["save_every_n_steps"])
+            train_network_dim_var.set(profile["network_dim"])
+            train_network_alpha_var.set(profile["network_alpha"])
+            lr_scheduler_var.set(profile["lr_scheduler"])
+            lr_warmup_steps_var.set(profile["lr_warmup_steps"])
+            gradient_accumulation_steps_var.set(profile["gradient_accumulation_steps"])
+            blocks_to_swap_var.set(profile["blocks_to_swap"])
+            timestep_sampling_var.set(profile["timestep_sampling"])
+            train_resolution_var.set(profile["resolution"])
+            train_batch_var.set(profile["batch_size"])
+            if "ltx_lora_target_preset" in profile:
+                ltx_lora_target_preset_var.set(profile["ltx_lora_target_preset"])
+            if "ltx_first_frame_conditioning_p" in profile:
+                ltx_first_frame_conditioning_p_var.set(profile["ltx_first_frame_conditioning_p"])
+
+        def _on_model_change_for_defaults(*_args: object) -> None:
+            _sync_resolution_controls()
+            _apply_family_defaults_if_needed()
+            _sync_resolution_controls()
+
+        def _on_preset_change_for_defaults(*_args: object) -> None:
+            _apply_family_defaults_if_needed()
+
+        model_var.trace_add("write", _on_model_change_for_defaults)
+        preset_name_var.trace_add("write", _on_preset_change_for_defaults)
+        _sync_resolution_controls()
+        _apply_family_defaults_if_needed()
+        _sync_resolution_controls()
 
         # Dataset list
         list_host = ttk.LabelFrame(datasets_tab, text="Datasets", padding=8)
@@ -5418,14 +5980,21 @@ def launch_ui() -> int:
                 return
 
             train_optimizer = train_optimizer_var.get().strip().lower()
-            if train_optimizer not in {"adamw8bit", "prodigy"}:
-                messagebox.showerror("Invalid value", "Optimizer type must be adamw8bit or prodigy.", parent=dialog)
+            if train_optimizer not in set(OPTIMIZER_TYPE_CHOICES):
+                messagebox.showerror(
+                    "Invalid value",
+                    "Optimizer type must be one of: " + ", ".join(OPTIMIZER_TYPE_CHOICES),
+                    parent=dialog,
+                )
                 return
+            train_optimizer_args = train_optimizer_args_var.get().strip()
+            if train_optimizer == "prodigy" and not train_optimizer_args:
+                train_optimizer_args = DEFAULT_PRODIGY_OPTIMIZER_ARGS
+                train_optimizer_args_var.set(train_optimizer_args)
 
             train_learning_rate = train_learning_rate_var.get().strip()
             if train_optimizer == "prodigy":
                 train_learning_rate = "1"
-                train_learning_rate_var.set("1")
             if not train_learning_rate:
                 messagebox.showerror("Invalid value", "Learning rate is required.", parent=dialog)
                 return
@@ -5436,6 +6005,41 @@ def launch_ui() -> int:
                 return
             if learning_rate_number <= 0:
                 messagebox.showerror("Invalid value", "Learning rate must be greater than 0.", parent=dialog)
+                return
+
+            lr_scheduler_value = lr_scheduler_var.get().strip().lower() or "constant"
+            try:
+                lr_warmup_steps_value = int(lr_warmup_steps_var.get().strip())
+                if lr_warmup_steps_value < 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Invalid value", "LR warmup steps must be a non-negative integer.", parent=dialog)
+                return
+
+            try:
+                grad_accum_value = int(gradient_accumulation_steps_var.get().strip())
+                if grad_accum_value < 1:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Invalid value", "Gradient accumulation must be a positive integer.", parent=dialog)
+                return
+
+            try:
+                blocks_to_swap_value = int(blocks_to_swap_var.get().strip())
+                if blocks_to_swap_value < 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Invalid value", "Blocks to swap must be a non-negative integer.", parent=dialog)
+                return
+
+            timestep_sampling_value = timestep_sampling_var.get().strip().lower() or "sigma"
+            ltx_lora_target_preset_value = ltx_lora_target_preset_var.get().strip().lower() or "t2v"
+            try:
+                ltx_first_frame_conditioning_p_value = float(ltx_first_frame_conditioning_p_var.get().strip())
+                if ltx_first_frame_conditioning_p_value < 0 or ltx_first_frame_conditioning_p_value > 1:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Invalid value", "First-frame conditioning p must be a number between 0 and 1.", parent=dialog)
                 return
 
             # Validate and collect per-dataset config
@@ -5513,6 +6117,7 @@ def launch_ui() -> int:
                     resolution=resolution_value,
                     batch_size=batch_size_value,
                     default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+                    model_name=model_var.get().strip(),
                 )
             except Exception as exc:
                 messagebox.showerror("Create job failed", str(exc), parent=dialog)
@@ -5529,6 +6134,7 @@ def launch_ui() -> int:
                 "training_dir": str(training_dir_path),
                 "job_name": job_name,
                 "model": model_var.get().strip() or "Klein",
+                "ltx_mode": _normalize_ltx_mode_ui(ltx_mode_var.get()),
                 "output_dir": str(output_root),
                 "resolution": str(resolution_value),
                 "batch_size": str(batch_size_value),
@@ -5536,8 +6142,16 @@ def launch_ui() -> int:
                 "network_dim": train_network_dim_var.get().strip(),
                 "network_alpha": train_network_alpha_var.get().strip(),
                 "optimizer_type": train_optimizer,
+                "optimizer_args": train_optimizer_args,
                 "learning_rate": train_learning_rate,
                 "train_steps": train_steps_var.get().strip(),
+                "lr_scheduler": lr_scheduler_value,
+                "lr_warmup_steps": str(lr_warmup_steps_value),
+                "gradient_accumulation_steps": str(grad_accum_value),
+                "blocks_to_swap": str(blocks_to_swap_value),
+                "timestep_sampling": timestep_sampling_value,
+                "ltx_lora_target_preset": ltx_lora_target_preset_value,
+                "ltx_first_frame_conditioning_p": str(ltx_first_frame_conditioning_p_value),
                 "enable_compile": bool_to_flag(compile_var.get()),
                 "enable_tf32": bool_to_flag(tf32_var.get()),
                 "enable_cudnn": bool_to_flag(cudnn_var.get()),
@@ -5599,7 +6213,7 @@ def launch_ui() -> int:
         ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(buttons, text="Save" if existing_job is not None else "Create Job", command=create_job).grid(row=0, column=1)
 
-        dialog.update_idletasks()
+        _fit_create_job_dialog_to_content()
         center_window(dialog)
         dialog.deiconify()
         root.wait_window(dialog)
@@ -5614,7 +6228,7 @@ def launch_ui() -> int:
         first_image_cache[dataset_name] = chosen
         return chosen
 
-    def make_thumbnail(image_path: Path | None, run_state: str, thumb_px: int, has_override: bool = False) -> ImageTk.PhotoImage:
+    def make_thumbnail(image_path: Path | None, run_state: str, thumb_px: int) -> ImageTk.PhotoImage:
         thumb_size = (thumb_px, thumb_px)
         cache_path = "__none__"
         cache_mtime_ns = 0
@@ -5625,7 +6239,7 @@ def launch_ui() -> int:
             except OSError:
                 cache_mtime_ns = 0
 
-        cache_key = (cache_path, run_state, thumb_px, cache_mtime_ns, has_override)
+        cache_key = (cache_path, run_state, thumb_px, cache_mtime_ns)
         cached_thumb = thumbnail_cache.get(cache_key)
         if cached_thumb is not None:
             return cached_thumb
@@ -5683,11 +6297,6 @@ def launch_ui() -> int:
                 return None
 
         image = image.convert("RGBA")
-        if has_override:
-            badge = _load_badge_pil("settings")
-            if badge is not None:
-                image.paste(badge, (badge_margin, badge_margin), badge)
-
         if run_state == "done":
             badge = _load_badge_pil("ok")
             if badge is not None:
@@ -5828,7 +6437,6 @@ def launch_ui() -> int:
             first_image_cache.clear()
             thumbnail_cache.clear()
             checkpoint_cache.clear()
-            dataset_train_settings_cache.clear()
 
         for widget in card_widgets:
             widget.destroy()
@@ -5845,7 +6453,6 @@ def launch_ui() -> int:
         for stale_name in stale_names:
             first_image_cache.pop(stale_name, None)
             checkpoint_cache.pop(stale_name, None)
-            dataset_train_settings_cache.pop(stale_name, None)
 
         if not names:
             empty_label = ttk.Label(inner, text="No datasets found.")
@@ -5866,8 +6473,6 @@ def launch_ui() -> int:
             inner.columnconfigure(col, minsize=card_width + gap, weight=0)
 
         for idx, name in enumerate(names):
-            effective_train = effective_train_settings_for_dataset(name)
-            has_train_override = dataset_has_train_override(name)
             train_state = "pending"
             run_state_by_name[name] = train_state
 
@@ -5884,7 +6489,7 @@ def launch_ui() -> int:
             card_frame_by_name[name] = card
 
             image_path = first_image_path(name)
-            thumb = make_thumbnail(image_path, train_state, thumb_px, has_override=has_train_override)
+            thumb = make_thumbnail(image_path, train_state, thumb_px)
             card_thumb_by_name[name] = thumb
 
             title_style = "DoneCardTitle.TLabel" if train_state == "done" else "CardTitle.TLabel"
@@ -6116,10 +6721,13 @@ def launch_ui() -> int:
 
                     root.after(0, mark_running)
 
-                    if job.get("model", "Klein") != "Klein":
-                        log(f"[Queue] Unsupported model '{job.get('model')}' for job {job_name}.")
-                        exit_code = 1
+                    model_name = job.get("model", "klein-base-9b") or "klein-base-9b"
+                    job_run_fn = _run_job_for_model(model_name)
+                    if job_run_fn is None:
+                        log(f"[Queue] Unsupported model '{model_name}' for job {job_name}.")
+                        exit_code = JOB_EXIT_FAILED
                     else:
+                        job_runtime_config = runtime_config_for_model(settings_state, model_name) or runtime_config
                         training_name = job.get("training_name", "").strip() or job_name
                         dataset_source_name = job.get("dataset_name", "").strip()
                         resolution_value = get_positive_int_setting(job, "resolution", DEFAULT_RESOLUTION, minimum=64)
@@ -6141,6 +6749,7 @@ def launch_ui() -> int:
                                 resolution=resolution_value,
                                 batch_size=batch_size_value,
                                 default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+                                model_name=model_name,
                             )
                             if captions_added > 0:
                                 ds_label = ", ".join(d["name"] for d in runner_datasets)
@@ -6159,37 +6768,53 @@ def launch_ui() -> int:
                                 nonlocal job_error_details
                                 job_error_details = message
 
-                            exit_code = run_job(
-                                runtime_config,
-                                dataset_name=training_name,
-                                output_name=job_name,
-                                output_dir=output_dir,
-                                default_caption_keyword=settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
-                                resolution=resolution_value,
-                                network_dim=get_positive_int_setting(job, "network_dim", DEFAULT_NETWORK_DIM),
-                                network_alpha=get_positive_int_setting(job, "network_alpha", DEFAULT_NETWORK_ALPHA),
-                                optimizer_type=job.get("optimizer_type", "prodigy"),
-                                learning_rate=job.get("learning_rate", DEFAULT_LEARNING_RATE),
-                                train_steps=get_positive_int_setting(job, "train_steps", DEFAULT_TRAIN_STEPS),
-                                save_every_n_steps=get_positive_int_setting(job, "save_every_n_steps", DEFAULT_SAVE_EVERY_N_STEPS, minimum=1),
-                                enable_compile_optimizations=flag_to_bool(job.get("enable_compile", "0")),
-                                enable_cuda_allow_tf32=flag_to_bool(job.get("enable_tf32", "1")),
-                                enable_cuda_cudnn_benchmark=flag_to_bool(job.get("enable_cudnn", "1")),
-                                enable_fp8_dit=flag_to_bool(job.get("enable_fp8", "0")),
-                                enable_gradient_checkpointing_cpu_offload=flag_to_bool(job.get("enable_gc", "0")),
-                                enable_training_logging=is_truthy(settings_state.get(TRAIN_ENABLE_LOGGING_KEY), default=True),
-                                training_log_backend=get_train_log_backend_setting(settings_state),
-                                training_log_tracker_name=settings_state.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip(),
-                                stream_training_output=is_truthy(settings_state.get(TRAIN_STREAM_TO_LOGGER_KEY), default=False),
-                                auto_cleanup_states=is_truthy(settings_state.get(TRAIN_AUTO_CLEANUP_STATES_KEY), default=True),
-                                logger=log,
-                                do_prep_dataset=True,
-                                do_cache_latents=True,
-                                do_cache_text=True,
-                                do_train=True,
-                                cancel_requested=(lambda: run_cancel_event is not None and run_cancel_event.is_set()),
-                                on_error=capture_job_error,
-                            )
+                            run_job_kwargs = {
+                                "dataset_name": training_name,
+                                "output_name": job_name,
+                                "output_dir": output_dir,
+                                "default_caption_keyword": settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
+                                "resolution": resolution_value,
+                                "network_dim": get_positive_int_setting(job, "network_dim", DEFAULT_NETWORK_DIM),
+                                "network_alpha": get_positive_int_setting(job, "network_alpha", DEFAULT_NETWORK_ALPHA),
+                                "optimizer_type": job.get("optimizer_type", "prodigy"),
+                                "optimizer_args": str(job.get("optimizer_args", "") or ""),
+                                "learning_rate": job.get("learning_rate", DEFAULT_LEARNING_RATE),
+                                "train_steps": get_positive_int_setting(job, "train_steps", DEFAULT_TRAIN_STEPS),
+                                "save_every_n_steps": get_positive_int_setting(job, "save_every_n_steps", DEFAULT_SAVE_EVERY_N_STEPS, minimum=1),
+                                "enable_compile_optimizations": flag_to_bool(job.get("enable_compile", "0")),
+                                "enable_cuda_allow_tf32": flag_to_bool(job.get("enable_tf32", "1")),
+                                "enable_cuda_cudnn_benchmark": flag_to_bool(job.get("enable_cudnn", "1")),
+                                "enable_fp8_dit": flag_to_bool(job.get("enable_fp8", "0")),
+                                "enable_gradient_checkpointing_cpu_offload": flag_to_bool(job.get("enable_gc", "0")),
+                                "enable_training_logging": is_truthy(settings_state.get(TRAIN_ENABLE_LOGGING_KEY), default=True),
+                                "training_log_backend": get_train_log_backend_setting(settings_state),
+                                "training_log_tracker_name": settings_state.get(TRAIN_LOG_TRACKER_NAME_KEY, "").strip(),
+                                "stream_training_output": is_truthy(settings_state.get(TRAIN_STREAM_TO_LOGGER_KEY), default=False),
+                                "auto_cleanup_states": is_truthy(settings_state.get(TRAIN_AUTO_CLEANUP_STATES_KEY), default=True),
+                                "logger": log,
+                                "do_prep_dataset": True,
+                                "do_cache_latents": True,
+                                "do_cache_text": True,
+                                "do_train": True,
+                                "cancel_requested": (lambda: run_cancel_event is not None and run_cancel_event.is_set()),
+                                "on_error": capture_job_error,
+                            }
+                            if job_run_fn is _run_job_ltx:
+                                run_job_kwargs["ltx_mode"] = str(job.get("ltx_mode", "video"))
+                                run_job_kwargs["lr_scheduler"] = str(job.get("lr_scheduler", "constant"))
+                                run_job_kwargs["lr_warmup_steps"] = get_non_negative_int_setting(job, "lr_warmup_steps", 0)
+                                run_job_kwargs["gradient_accumulation_steps"] = get_positive_int_setting(job, "gradient_accumulation_steps", 1, minimum=1)
+                                run_job_kwargs["blocks_to_swap"] = get_non_negative_int_setting(job, "blocks_to_swap", 0)
+                                run_job_kwargs["timestep_sampling"] = str(job.get("timestep_sampling", "sigma") or "sigma")
+                                run_job_kwargs["ltx_lora_target_preset"] = str(job.get("ltx_lora_target_preset", "t2v") or "t2v")
+                                try:
+                                    run_job_kwargs["ltx_first_frame_conditioning_p"] = float(
+                                        str(job.get("ltx_first_frame_conditioning_p", "0.1") or "0.1")
+                                    )
+                                except ValueError:
+                                    run_job_kwargs["ltx_first_frame_conditioning_p"] = 0.1
+
+                            exit_code = job_run_fn(job_runtime_config, **run_job_kwargs)
 
                             if (
                                 exit_code != 0
@@ -6653,7 +7278,7 @@ def main() -> int:
 
     if args.names:
         settings = load_settings()
-        runtime_config = klein_runtime_config_from_settings(settings)
+        runtime_config = runtime_config_from_settings(settings)
         if runtime_config is None:
             print(f"Missing settings file: {SETTINGS_FILE}")
             print("Run without CLI args once to set Musubi-Tuner location.")
@@ -6670,12 +7295,13 @@ def main() -> int:
             runtime_config,
             model_names,
             default_caption_keyword=settings.get(DEFAULT_CAPTION_KEYWORD_KEY, ""),
-            resolution=get_positive_int_setting(settings, TRAIN_RESOLUTION_KEY, DEFAULT_RESOLUTION, minimum=64),
-            network_dim=get_positive_int_setting(settings, TRAIN_NETWORK_DIM_KEY, DEFAULT_NETWORK_DIM),
-            network_alpha=get_positive_int_setting(settings, TRAIN_NETWORK_ALPHA_KEY, DEFAULT_NETWORK_ALPHA),
-            optimizer_type=get_train_optimizer_setting(settings),
-            learning_rate=get_learning_rate_setting(settings),
-            train_steps=get_positive_int_setting(settings, TRAIN_STEPS_KEY, DEFAULT_TRAIN_STEPS),
+            resolution=DEFAULT_RESOLUTION,
+            network_dim=DEFAULT_NETWORK_DIM,
+            network_alpha=DEFAULT_NETWORK_ALPHA,
+            optimizer_type="prodigy",
+            optimizer_args=DEFAULT_PRODIGY_OPTIMIZER_ARGS,
+            learning_rate=DEFAULT_LEARNING_RATE,
+            train_steps=DEFAULT_TRAIN_STEPS,
             enable_compile_optimizations=(
                 settings.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0").strip().lower() in {"1", "true", "yes", "on"}
             ),

@@ -1,723 +1,69 @@
-import subprocess
+﻿"""FLUX.2 family training — dev, klein-base-9b, klein-9b, klein-base-4b, klein-4b."""
+from __future__ import annotations
+
 import re
-import time
-import tempfile
-import os
+import shlex
 import shutil
-import json
-from datetime import datetime
-from collections import deque
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 
-from .klein_runtime_config import KleinRuntimeConfig
+from .runtime_config import RuntimeConfig
+from .train_utils import (  # noqa: F401  (re-exported for backward compat)
+    DEFAULT_LEARNING_RATE,
+    DEFAULT_NETWORK_ALPHA,
+    DEFAULT_NETWORK_DIM,
+    DEFAULT_RESOLUTION,
+    DEFAULT_SAVE_EVERY_N_STEPS,
+    DEFAULT_TRAIN_STEPS,
+    JOB_EXIT_CANCELLED,
+    JOB_EXIT_FAILED,
+    JOB_EXIT_SUCCESS,
+    JOB_PROGRESS_FILE_NAME,
+    SHARDED_SAFETENSORS_NAME_RE,
+    VALID_IMAGE_EXTENSIONS,
+    TrainingCancelledError,
+    _step_state_dirs,
+    centralized_logs_root,
+    cleanup_step_states_for_cancel_output,
+    cleanup_step_states_for_completed_output,
+    dataset_image_directory_from_config,
+    dataset_image_files,
+    finished_checkpoint_for_output,
+    format_command_for_log,
+    latest_checkpoint_for_output,
+    latest_resume_state_for_output,
+    module_available,
+    next_dataset_log_run_dir,
+    normalize_model_checkpoint_path,
+    prep_dataset_minimal,
+    progress_metadata_path_for_output,
+    read_recorded_completed_steps,
+    remap_resume_artifacts_for_output,
+    require_model_file,
+    run_command,
+    toml_quote,
+    toml_string_list,
+    write_recorded_completed_steps,
+)
 
-DEFAULT_RESOLUTION = 1024
-DEFAULT_NETWORK_DIM = 32
-DEFAULT_NETWORK_ALPHA = 32
-DEFAULT_LEARNING_RATE = "1e-4"
-DEFAULT_TRAIN_STEPS = 3000
-DEFAULT_SAVE_EVERY_N_STEPS = 250
-JOB_EXIT_SUCCESS = 0
-JOB_EXIT_FAILED = 1
-JOB_EXIT_CANCELLED = 2
-
-VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+# ---------------------------------------------------------------------------
+# FLUX.2-specific constants
+# ---------------------------------------------------------------------------
 LATENT_SUFFIX = "f2k9b"
-SHARDED_SAFETENSORS_NAME_RE = re.compile(r".+-\d{5}-of-\d{5}\.safetensors$", re.IGNORECASE)
-JOB_PROGRESS_FILE_NAME = "progress.json"
 
 
-def centralized_logs_root(training_dir: Path) -> Path:
-    return training_dir
 
-
-def next_dataset_log_run_dir(training_dir: Path, dataset_name: str) -> tuple[Path, str]:
-    logs_root = centralized_logs_root(training_dir) / dataset_name / "logs"
-    logs_root.mkdir(parents=True, exist_ok=True)
-
-    date_tag = datetime.now().strftime("%y%m%d")
-    escaped_dataset = re.escape(dataset_name)
-    run_pattern = re.compile(rf"^{escaped_dataset}_{date_tag}_(\d{{2}})$", re.IGNORECASE)
-
-    max_index = 0
-    for child in logs_root.iterdir():
-        if not child.is_dir():
-            continue
-        match = run_pattern.match(child.name)
-        if not match:
-            continue
-        max_index = max(max_index, int(match.group(1)))
-
-    while True:
-        run_index = max_index + 1
-        run_name = f"{dataset_name}_{date_tag}_{run_index:02d}"
-        run_dir = logs_root / run_name
-        if not run_dir.exists():
-            run_dir.mkdir(parents=True, exist_ok=False)
-            return run_dir, run_name
-        max_index += 1
-
-
-class TrainingCancelledError(RuntimeError):
-    pass
-
-
-def latest_checkpoint_for_dataset(training_dir: Path, dataset_name: str) -> tuple[Path | None, int]:
-    output_dir = training_dir / dataset_name / "output"
-    output_name = f"{dataset_name}_Klein"
-    return latest_checkpoint_for_output(output_dir, output_name)
-
-
-def latest_checkpoint_for_output(output_dir: Path, output_name: str) -> tuple[Path | None, int]:
-    if not output_dir.exists():
-        return None, 0
-
-    pattern = re.compile(rf"^{re.escape(output_name)}-step(\d+)\.safetensors$", re.IGNORECASE)
-    latest_step = 0
-    latest_path: Path | None = None
-
-    for checkpoint_path in output_dir.glob("*.safetensors"):
-        match = pattern.match(checkpoint_path.name)
-        if not match:
-            continue
-        step = int(match.group(1))
-        if step > latest_step:
-            latest_step = step
-            latest_path = checkpoint_path
-
-    return latest_path, latest_step
-
-
-def progress_metadata_path_for_output(output_dir: Path) -> Path:
-    return output_dir.parent / JOB_PROGRESS_FILE_NAME
-
-
-def read_recorded_completed_steps(output_dir: Path, output_name: str) -> int:
-    metadata_path = progress_metadata_path_for_output(output_dir)
-    if not metadata_path.exists() or not metadata_path.is_file():
-        return 0
-
-    try:
-        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except Exception:
-        return 0
-
-    if not isinstance(payload, dict):
-        return 0
-
-    raw_value = payload.get("completed_step", 0)
-    try:
-        completed_step = int(raw_value)
-    except (TypeError, ValueError):
-        return 0
-
-    return completed_step if completed_step > 0 else 0
-
-
-def write_recorded_completed_steps(output_dir: Path, output_name: str, completed_step: int, target_steps: int) -> None:
-    metadata_path = progress_metadata_path_for_output(output_dir)
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "output_name": output_name,
-        "completed_step": int(max(0, completed_step)),
-        "target_steps": int(max(0, target_steps)),
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def finished_checkpoint_for_dataset(training_dir: Path, dataset_name: str) -> Path | None:
-    output_dir = training_dir / dataset_name / "output"
-    output_name = f"{dataset_name}_Klein"
-    return finished_checkpoint_for_output(output_dir, output_name)
-
-
-def finished_checkpoint_for_output(output_dir: Path, output_name: str) -> Path | None:
-    if not output_dir.exists():
-        return None
-
-    finished_path = output_dir / f"{output_name}.safetensors"
-    if finished_path.is_file():
-        return finished_path
-
-    return None
-
-
-def latest_resume_state_for_dataset(training_dir: Path, dataset_name: str, checkpoint_step: int) -> tuple[Path | None, int]:
-    output_dir = training_dir / dataset_name / "output"
-    output_name = f"{dataset_name}_Klein"
-    return latest_resume_state_for_output(output_dir, output_name, checkpoint_step)
-
-
-def latest_resume_state_for_output(output_dir: Path, output_name: str, checkpoint_step: int) -> tuple[Path | None, int]:
-    if not output_dir.exists():
-        return None, 0
-
-    # Preferred: step-aligned state dir for the latest known checkpoint step.
-    if checkpoint_step > 0:
-        step_state_dir = output_dir / f"{output_name}-step{checkpoint_step:08d}-state"
-        if step_state_dir.is_dir() and (step_state_dir / "scheduler.bin").exists():
-            return step_state_dir, checkpoint_step
-
-    # Fallback: final train-end state dir (no step in folder name).
-    last_state_dir = output_dir / f"{output_name}-state"
-    if last_state_dir.is_dir() and (last_state_dir / "scheduler.bin").exists():
-        return last_state_dir, checkpoint_step
-
-    return None, 0
-
-
-def dataset_image_directory_from_config(training_dir: Path, dataset_name: str) -> Path | None:
-    dataset_toml = training_dir / dataset_name / "dataset.toml"
-    if not dataset_toml.exists() or not dataset_toml.is_file():
-        return None
-
-    try:
-        content = dataset_toml.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-
-    match = re.search(r'^\s*image_directory\s*=\s*"([^"]+)"', content, flags=re.MULTILINE)
-    if match is None:
-        return None
-
-    raw_path = match.group(1).strip()
-    if not raw_path:
-        return None
-
-    candidate = Path(raw_path).expanduser()
-    if not candidate.is_absolute():
-        candidate = (dataset_toml.parent / candidate).resolve()
-
-    return candidate
-
-
-def dataset_image_files(training_dir: Path, dataset_name: str) -> list[Path]:
-    images_dir = training_dir / dataset_name / "images"
-    if images_dir.exists() and images_dir.is_dir():
-        return sorted([p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTENSIONS])
-
-    configured_images_dir = dataset_image_directory_from_config(training_dir, dataset_name)
-    if configured_images_dir is None:
-        return []
-    if not configured_images_dir.exists() or not configured_images_dir.is_dir():
-        return []
-
-    return sorted([p for p in configured_images_dir.iterdir() if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTENSIONS])
-
-
-def is_step1_ready(training_dir: Path, dataset_name: str) -> bool:
-    dataset_dir = training_dir / dataset_name
-    dataset_toml_exists = (dataset_dir / "dataset.toml").exists()
-    image_files = dataset_image_files(training_dir, dataset_name)
-
-    if not dataset_toml_exists or not image_files:
-        return False
-
-    return all(image_path.with_suffix(".txt").exists() for image_path in image_files)
-
-
-def is_step2_ready(training_dir: Path, dataset_name: str) -> bool:
-    image_files = dataset_image_files(training_dir, dataset_name)
-    cache_dir = training_dir / dataset_name / "cache"
-
-    if not image_files or not cache_dir.exists():
-        return False
-
-    for image_path in image_files:
-        pattern = f"{image_path.stem}_*_{LATENT_SUFFIX}.safetensors"
-        if not any(cache_dir.glob(pattern)):
-            return False
-
-    return True
-
-
-def is_step3_ready(training_dir: Path, dataset_name: str) -> bool:
-    image_files = dataset_image_files(training_dir, dataset_name)
-    cache_dir = training_dir / dataset_name / "cache"
-
-    if not image_files or not cache_dir.exists():
-        return False
-
-    for image_path in image_files:
-        expected = cache_dir / f"{image_path.stem}_{LATENT_SUFFIX}_te.safetensors"
-        if not expected.exists():
-            return False
-
-    return True
-
-
-def dataset_status(training_dir: Path, dataset_name: str) -> dict[str, bool]:
-    step1 = is_step1_ready(training_dir, dataset_name)
-    step2 = is_step2_ready(training_dir, dataset_name)
-    step3 = is_step3_ready(training_dir, dataset_name)
-    return {
-        "step1": step1,
-        "step2": step2,
-        "step3": step3,
-        "ready_to_train": step1 and step2 and step3,
-    }
-
-
-def prep_dataset_minimal(
-    training_dir: Path,
-    dataset_name: str,
-    default_caption_keyword: str,
-    resolution: int,
-) -> dict[str, int | bool]:
-    dataset_dir = training_dir / dataset_name
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    dataset_toml = dataset_dir / "dataset.toml"
-    image_dir_abs = (dataset_dir / "images").resolve().as_posix()
-    cache_dir_abs = (dataset_dir / "cache").resolve().as_posix()
-
-    had_dataset_toml = dataset_toml.exists()
-    if not had_dataset_toml:
-        dataset_toml.write_text(
-            "\n".join(
-                [
-                    "[general]",
-                    f"resolution = [{resolution}, {resolution}]",
-                    'caption_extension = ".txt"',
-                    "batch_size = 1",
-                    "enable_bucket = true",
-                    "bucket_no_upscale = false",
-                    "",
-                    "[[datasets]]",
-                    f'image_directory = "{image_dir_abs}"',
-                    f'cache_directory = "{cache_dir_abs}"',
-                    "num_repeats = 1",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
-        )
-
-    created = 0
-    caption_text = default_caption_keyword.strip()
-    for image_path in dataset_image_files(training_dir, dataset_name):
-        caption_path = image_path.with_suffix(".txt")
-        if caption_path.exists():
-            continue
-        caption_path.write_text(caption_text, encoding="utf-8")
-        created += 1
-
-    return {"had_dataset_toml": had_dataset_toml, "created": created}
-
-
-def count_latent_cache_ready(training_dir: Path, dataset_name: str) -> tuple[int, int]:
-    image_files = dataset_image_files(training_dir, dataset_name)
-    cache_dir = training_dir / dataset_name / "cache"
-    if not image_files or not cache_dir.exists():
-        return 0, len(image_files)
-
-    ready = 0
-    for image_path in image_files:
-        pattern = f"{image_path.stem}_*_{LATENT_SUFFIX}.safetensors"
-        if any(cache_dir.glob(pattern)):
-            ready += 1
-    return ready, len(image_files)
-
-
-def count_text_cache_ready(training_dir: Path, dataset_name: str) -> tuple[int, int]:
-    image_files = dataset_image_files(training_dir, dataset_name)
-    cache_dir = training_dir / dataset_name / "cache"
-    if not image_files or not cache_dir.exists():
-        return 0, len(image_files)
-
-    ready = 0
-    for image_path in image_files:
-        expected = cache_dir / f"{image_path.stem}_{LATENT_SUFFIX}_te.safetensors"
-        if expected.exists():
-            ready += 1
-    return ready, len(image_files)
-
-
-def remap_resume_artifacts_to_continued_steps(
-    training_dir: Path,
-    dataset_name: str,
-    resume_step_offset: int,
-    logger: Callable[[str], None],
-) -> None:
-    output_dir = training_dir / dataset_name / "output"
-    base_output_name = f"{dataset_name}_Klein"
-    remap_resume_artifacts_for_output(output_dir, base_output_name, resume_step_offset, logger)
-
-
-def remap_resume_artifacts_for_output(
-    output_dir: Path,
-    base_output_name: str,
-    resume_step_offset: int,
-    logger: Callable[[str], None],
-) -> None:
-    if resume_step_offset <= 0:
-        return
-
-    if not output_dir.exists() or not output_dir.is_dir():
-        return
-
-    resume_output_name = f"{base_output_name}-resume"
-
-    ckpt_pattern = re.compile(rf"^{re.escape(resume_output_name)}-step(\d{{8}})\.safetensors$", re.IGNORECASE)
-    state_pattern = re.compile(rf"^{re.escape(resume_output_name)}-step(\d{{8}})-state$", re.IGNORECASE)
-
-    renamed_ckpts = 0
-    renamed_states = 0
-
-    resume_ckpts: list[tuple[Path, int]] = []
-    for path in output_dir.glob("*.safetensors"):
-        match = ckpt_pattern.match(path.name)
-        if not match:
-            continue
-        resume_ckpts.append((path, int(match.group(1))))
-
-    for source, source_step in sorted(resume_ckpts, key=lambda pair: pair[1]):
-        target_step = source_step + resume_step_offset
-        target = output_dir / f"{base_output_name}-step{target_step:08d}.safetensors"
-        if target.exists():
-            logger(f"  rename warning: target exists, keeping {source.name} (target: {target.name})")
-            continue
-        try:
-            source.rename(target)
-            renamed_ckpts += 1
-        except OSError as exc:
-            logger(f"  rename warning: could not rename {source.name} -> {target.name}: {exc}")
-
-    resume_states: list[tuple[Path, int]] = []
-    for path in output_dir.iterdir():
-        if not path.is_dir():
-            continue
-        match = state_pattern.match(path.name)
-        if not match:
-            continue
-        resume_states.append((path, int(match.group(1))))
-
-    for source, source_step in sorted(resume_states, key=lambda pair: pair[1]):
-        target_step = source_step + resume_step_offset
-        target = output_dir / f"{base_output_name}-step{target_step:08d}-state"
-        if target.exists():
-            logger(f"  rename warning: target exists, keeping {source.name} (target: {target.name})")
-            continue
-        try:
-            source.rename(target)
-            renamed_states += 1
-        except OSError as exc:
-            logger(f"  rename warning: could not rename {source.name} -> {target.name}: {exc}")
-
-    resume_last_checkpoint = output_dir / f"{resume_output_name}.safetensors"
-    if resume_last_checkpoint.is_file():
-        target_last_checkpoint = output_dir / f"{base_output_name}.safetensors"
-        try:
-            if target_last_checkpoint.exists():
-                target_last_checkpoint.unlink()
-            resume_last_checkpoint.rename(target_last_checkpoint)
-            logger(f"  rename: {resume_last_checkpoint.name} -> {target_last_checkpoint.name}")
-        except OSError as exc:
-            logger(
-                f"  rename warning: could not rename {resume_last_checkpoint.name} -> "
-                f"{target_last_checkpoint.name}: {exc}"
-            )
-
-    resume_last_state = output_dir / f"{resume_output_name}-state"
-    if resume_last_state.is_dir():
-        target_last_state = output_dir / f"{base_output_name}-state"
-        try:
-            if target_last_state.exists():
-                shutil.rmtree(target_last_state)
-            resume_last_state.rename(target_last_state)
-            logger(f"  rename: {resume_last_state.name} -> {target_last_state.name}")
-        except OSError as exc:
-            logger(
-                f"  rename warning: could not rename {resume_last_state.name} -> {target_last_state.name}: {exc}"
-            )
-
-    if renamed_ckpts > 0 or renamed_states > 0:
-        logger(
-            "  rename: remapped resumed artifacts with continued step numbering "
-            f"(+{resume_step_offset}, checkpoints={renamed_ckpts}, states={renamed_states})"
-        )
-
-
-def _step_state_dirs(output_dir: Path, output_name: str) -> list[tuple[Path, int]]:
-    if not output_dir.exists() or not output_dir.is_dir():
-        return []
-
-    pattern = re.compile(rf"^{re.escape(output_name)}-step(\d{{8}})-state$", re.IGNORECASE)
-    result: list[tuple[Path, int]] = []
-    for item in output_dir.iterdir():
-        if not item.is_dir():
-            continue
-        match = pattern.match(item.name)
-        if not match:
-            continue
-        result.append((item, int(match.group(1))))
-    return sorted(result, key=lambda pair: pair[1])
-
-
-def cleanup_step_states_for_cancel(training_dir: Path, dataset_name: str, logger: Callable[[str], None]) -> None:
-    output_dir = training_dir / dataset_name / "output"
-    output_name = f"{dataset_name}_Klein"
-    cleanup_step_states_for_cancel_output(output_dir, output_name, logger)
-
-
-def cleanup_step_states_for_cancel_output(output_dir: Path, output_name: str, logger: Callable[[str], None]) -> None:
-    step_state_dirs = _step_state_dirs(output_dir, output_name)
-    if not step_state_dirs:
-        return
-
-    _latest_ckpt, latest_step = latest_checkpoint_for_output(output_dir, output_name)
-    keep_dir: Path | None = None
-
-    if latest_step > 0:
-        for state_dir, state_step in step_state_dirs:
-            if state_step == latest_step:
-                keep_dir = state_dir
-                break
-
-    if keep_dir is None:
-        # Fallback to newest step-state directory if checkpoint and state names do not line up.
-        keep_dir = step_state_dirs[-1][0]
-
-    removed = 0
-    for state_dir, _state_step in step_state_dirs:
-        if state_dir == keep_dir:
-            continue
-        try:
-            shutil.rmtree(state_dir)
-            removed += 1
-        except OSError as exc:
-            logger(f"  cleanup warning: could not remove {state_dir.name}: {exc}")
-
-    logger(f"  cleanup: kept latest resume state {keep_dir.name}, removed {removed} older step state folder(s)")
-
-
-def cleanup_step_states_for_completed_run(training_dir: Path, dataset_name: str, logger: Callable[[str], None]) -> None:
-    output_dir = training_dir / dataset_name / "output"
-    output_name = f"{dataset_name}_Klein"
-    cleanup_step_states_for_completed_output(output_dir, output_name, logger)
-
-
-def cleanup_step_states_for_completed_output(output_dir: Path, output_name: str, logger: Callable[[str], None]) -> None:
-    last_state_dir = output_dir / f"{output_name}-state"
-    if not last_state_dir.is_dir():
-        logger(f"  cleanup skipped: final state folder not found ({last_state_dir.name})")
-        return
-
-    step_state_dirs = _step_state_dirs(output_dir, output_name)
-    if not step_state_dirs:
-        return
-
-    removed = 0
-    for state_dir, _state_step in step_state_dirs:
-        try:
-            shutil.rmtree(state_dir)
-            removed += 1
-        except OSError as exc:
-            logger(f"  cleanup warning: could not remove {state_dir.name}: {exc}")
-
-    logger(f"  cleanup: kept final state {last_state_dir.name}, removed {removed} step state folder(s)")
-
-
-def run_command(
-    args: Iterable[str],
-    cwd: Path,
-    cancel_requested: Callable[[], bool] | None = None,
-    logger: Callable[[str], None] | None = None,
-    stream_to_logger: bool = False,
-    stream_mode: str = "plain",
-    inherit_io: bool = False,
-) -> None:
-    process: subprocess.Popen | None = None
-    log_path: Path | None = None
-    read_offset = 0
-    partial_line = ""
-    recent_lines: deque[str] = deque(maxlen=40)
-    cache_progress_re = re.compile(r"^\s*\d+it\s+\[")
-    train_progress_re = re.compile(r"^steps:\s+")
-
-    def flush_new_output() -> None:
-        nonlocal read_offset, partial_line
-        if log_path is None or not log_path.exists():
-            return
-        try:
-            with log_path.open("r", encoding="utf-8", errors="replace") as reader:
-                reader.seek(read_offset)
-                chunk = reader.read()
-                read_offset = reader.tell()
-        except OSError:
-            return
-
-        if not chunk:
-            return
-
-        chunk = partial_line + chunk
-        lines = chunk.splitlines()
-        if chunk and not chunk.endswith(("\n", "\r")):
-            partial_line = lines.pop() if lines else chunk
-        else:
-            partial_line = ""
-
-        for line in lines:
-            cleaned = line.rstrip("\r\n")
-            recent_lines.append(cleaned)
-            if stream_to_logger and logger is not None:
-                if stream_mode == "cache_progress":
-                    if cache_progress_re.search(cleaned):
-                        logger("\r" + cleaned)
-                elif stream_mode == "train_progress":
-                    if train_progress_re.search(cleaned):
-                        logger("\r" + cleaned)
-                else:
-                    logger(cleaned)
-
-    def flush_partial_line() -> None:
-        nonlocal partial_line
-        if not partial_line:
-            return
-        cleaned = partial_line.rstrip("\r\n")
-        recent_lines.append(cleaned)
-        if stream_to_logger and logger is not None:
-            if stream_mode == "cache_progress":
-                if cache_progress_re.search(cleaned):
-                    logger("\r" + cleaned)
-            elif stream_mode == "train_progress":
-                if train_progress_re.search(cleaned):
-                    logger("\r" + cleaned)
-            else:
-                logger(cleaned)
-        partial_line = ""
-
-    try:
-        env = os.environ.copy()
-        env.setdefault("PYTHONUTF8", "1")
-        env.setdefault("PYTHONIOENCODING", "utf-8")
-        popen_kwargs: dict[str, object] = {
-            "cwd": str(cwd),
-            "env": env,
-        }
-        if os.name == "nt" and stream_to_logger:
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = getattr(subprocess, "SW_MINIMIZE", 6)
-            popen_kwargs["startupinfo"] = startupinfo
-
-        if inherit_io:
-            # Launch training in its own console window; don't touch its output.
-            if os.name == "nt":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
-            process = subprocess.Popen(list(args), **popen_kwargs)
-            while True:
-                if cancel_requested is not None and cancel_requested():
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
-                    raise TrainingCancelledError("Cancelled by user.")
-                return_code = process.poll()
-                if return_code is not None:
-                    if return_code != 0:
-                        raise RuntimeError(
-                            f"Command failed with exit code {return_code}: {' '.join(str(a) for a in args)}"
-                        )
-                    return
-                time.sleep(0.2)
-
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", errors="replace", delete=False, suffix=".log") as log_file:
-            log_path = Path(log_file.name)
-            process = subprocess.Popen(list(args), stdout=log_file, stderr=subprocess.STDOUT, **popen_kwargs)
-            while True:
-                flush_new_output()
-                if cancel_requested is not None and cancel_requested():
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
-                    raise TrainingCancelledError("Cancelled by user.")
-
-                return_code = process.poll()
-                if return_code is not None:
-                    flush_new_output()
-                    flush_partial_line()
-                    if return_code != 0:
-                        output_tail = "\n".join(recent_lines)
-                        if not output_tail and log_path.exists():
-                            try:
-                                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-                                if lines:
-                                    output_tail = "\n".join(lines[-40:])
-                            except OSError:
-                                output_tail = ""
-                        if output_tail:
-                            raise RuntimeError(
-                                f"Command failed with exit code {return_code}: {' '.join(args)}\n"
-                                f"--- command output (tail) ---\n{output_tail}"
-                            )
-                        raise RuntimeError(f"Command failed with exit code {return_code}: {' '.join(args)}")
-                    return
-                time.sleep(0.2)
-    finally:
-        if log_path is not None and log_path.exists():
-            try:
-                log_path.unlink()
-            except OSError:
-                pass
-
-
-def format_command_for_log(args: Iterable[str]) -> str:
-    return subprocess.list2cmdline([str(arg) for arg in args])
-
-
-def toml_quote(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
-
-
-def toml_string_list(values: list[str]) -> str:
-    return "[" + ", ".join(toml_quote(value) for value in values) + "]"
-
-
-def normalize_model_checkpoint_path(path_value: Path, label: str) -> Path:
-    candidate = path_value.expanduser()
-    if not candidate.exists():
-        return candidate
-
-    if candidate.is_file() and candidate.name.lower().endswith(".safetensors.index.json"):
-        try:
-            payload = json.loads(candidate.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"{label} index file is invalid JSON: {candidate}\nDetails: {exc}") from exc
-
-        weight_map = payload.get("weight_map", {})
-        if not isinstance(weight_map, dict) or not weight_map:
-            raise RuntimeError(f"{label} index file has no weight_map entries: {candidate}")
-
-        shard_names = sorted({str(v) for v in weight_map.values() if isinstance(v, str) and v.lower().endswith(".safetensors")})
-        preferred = next((name for name in shard_names if re.search(r"-00001-of-\d+\.safetensors$", name, flags=re.IGNORECASE)), None)
-        shard_name = preferred or (shard_names[0] if shard_names else None)
-        if not shard_name:
-            raise RuntimeError(f"{label} index file did not reference any .safetensors shards: {candidate}")
-
-        shard_path = candidate.parent / shard_name
-        if not shard_path.is_file():
-            raise RuntimeError(f"{label} shard file referenced by index does not exist: {shard_path}")
-        return shard_path
-
-    return candidate
 
 
 def run_steps_for_model(
-    runtime_config: KleinRuntimeConfig,
+    runtime_config: RuntimeConfig,
     model_name: str,
     default_caption_keyword: str,
     resolution: int,
     network_dim: int,
     network_alpha: int,
     optimizer_type: str,
+    optimizer_args: str,
     learning_rate: str,
     train_steps: int,
     save_every_n_steps: int,
@@ -761,7 +107,7 @@ def run_steps_for_model(
         return normalized
 
     def resolve_text_encoder_file(path_value: Path | None) -> Path:
-        selected = require_model_file(path_value, "Klein Text Encoder")
+        selected = require_model_file(path_value, "FLUX.2 Text Encoder")
         return selected
 
     def check_cancel() -> None:
@@ -800,7 +146,7 @@ def run_steps_for_model(
     output_dir = output_dir_override if output_dir_override is not None else (runtime_config.training_dir / model_name / "output")
     dataset_config = dataset_config.resolve()
     output_dir = output_dir.resolve()
-    output_name = (output_name_override or "").strip() or f"{model_name}_Klein"
+    output_name = (output_name_override or "").strip() or f"{model_name}_Flux2"
     output_name_for_run = (
         f"{output_name}-resume" if (resume_state_dir is not None and resume_step_offset > 0) else output_name
     )
@@ -840,7 +186,7 @@ def run_steps_for_model(
         check_cancel()
         current_step += 1
         logger(f"[{current_step}/{total_steps}]   Cache Latent:")
-        vae_path = require_model_file(runtime_config.vae, "Klein VAE")
+        vae_path = require_model_file(runtime_config.vae, "FLUX.2 VAE")
         vae_path = vae_path.resolve()
         before_ready, before_total = count_latent_cache_ready(runtime_config.training_dir, model_name)
         if before_total > 0 and before_ready == before_total:
@@ -857,6 +203,7 @@ def run_steps_for_model(
                         str(vae_path),
                         "--batch_size",
                         "16",
+                        "--skip_existing",
                         "--model_version",
                         runtime_config.model_version,
                     ],
@@ -870,8 +217,8 @@ def run_steps_for_model(
                 raise
             except Exception as exc:
                 raise RuntimeError(
-                    "Klein VAE appears invalid or incompatible for Flux2 caching.\n"
-                    "Open Settings and verify Klein > VAE points to the correct VAE checkpoint file.\n"
+                    "FLUX.2 VAE appears invalid or incompatible for Flux2 caching.\n"
+                    "Open Settings and verify Settings > FLUX.2 > VAE points to the correct VAE checkpoint file.\n"
                     f"Details: {exc}"
                 ) from exc
 
@@ -902,6 +249,7 @@ def run_steps_for_model(
                         str(text_encoder_path),
                         "--batch_size",
                         "16",
+                        "--skip_existing",
                         "--model_version",
                         runtime_config.model_version,
                     ],
@@ -915,8 +263,8 @@ def run_steps_for_model(
                 raise
             except Exception as exc:
                 raise RuntimeError(
-                    "Klein Text Encoder appears invalid or incompatible for Flux2 text caching.\n"
-                    "Open Settings and verify Klein > Text Encoder points to the correct checkpoint.\n"
+                    "FLUX.2 Text Encoder appears invalid or incompatible for Flux2 text caching.\n"
+                    "Open Settings and verify Settings > FLUX.2 > Text Encoder points to the correct checkpoint.\n"
                     f"Details: {exc}"
                 ) from exc
 
@@ -929,8 +277,8 @@ def run_steps_for_model(
         check_cancel()
         current_step += 1
         logger(f"[{current_step}/{total_steps}]   Train:")
-        dit_path = require_model_file(runtime_config.dit, "Klein Model")
-        vae_path = require_model_file(runtime_config.vae, "Klein VAE")
+        dit_path = require_model_file(runtime_config.dit, "FLUX.2 Model")
+        vae_path = require_model_file(runtime_config.vae, "FLUX.2 VAE")
         text_encoder_path = resolve_text_encoder_file(runtime_config.text_encoder)
         dit_path = dit_path.resolve()
         vae_path = vae_path.resolve()
@@ -1018,7 +366,7 @@ def run_steps_for_model(
                 "Optimizer 'prodigy' requires the prodigyopt package. "
                 "Install dependencies in Musubi-Tuner venv using requirements-musubi-tuner.txt from Musubi-Trainer."
             )
-        optimizer_arg = "prodigyopt.Prodigy" if optimizer_key == "prodigy" else "adamw8bit"
+        optimizer_arg = "prodigyopt.Prodigy" if optimizer_key == "prodigy" else (optimizer_type or "adamw8bit").strip()
         learning_rate_for_run = "1" if optimizer_key == "prodigy" else learning_rate
         optimizer_args_values: list[str] = []
         if optimizer_key == "prodigy":
@@ -1028,6 +376,9 @@ def run_steps_for_model(
                 "weight_decay=0.01",
                 "betas=(0.9,0.99)",
             ]
+            optimizer_args_raw = (optimizer_args or "").strip()
+            if optimizer_args_raw:
+                optimizer_args_values = [value for value in shlex.split(optimizer_args_raw) if value.strip()]
         train_config_path = output_dir.parent / "train_config.toml"
         config_lines: list[str] = [
             f"dit = {toml_quote(str(dit_path))}",
@@ -1102,8 +453,8 @@ def run_steps_for_model(
             raise
         except Exception as exc:
             raise RuntimeError(
-                "Training launch failed due to invalid or incompatible Klein model files.\n"
-                "Open Settings and verify Klein > Model, VAE, and Text Encoder paths.\n"
+                "Training launch failed due to invalid or incompatible FLUX.2 model files.\n"
+                "Open Settings and verify Settings > FLUX.2 > Model, VAE, and Text Encoder paths.\n"
                 f"Details: {exc}"
             ) from exc
 
@@ -1111,13 +462,14 @@ def run_steps_for_model(
 
 
 def train_models(
-    runtime_config: KleinRuntimeConfig,
+    runtime_config: RuntimeConfig,
     model_names: list[str],
     default_caption_keyword: str,
     resolution: int,
     network_dim: int,
     network_alpha: int,
     optimizer_type: str,
+    optimizer_args: str,
     learning_rate: str,
     train_steps: int,
     enable_compile_optimizations: bool,
@@ -1211,6 +563,7 @@ def train_models(
                 network_dim=network_dim,
                 network_alpha=network_alpha,
                 optimizer_type=optimizer_type,
+                optimizer_args=optimizer_args,
                 learning_rate=learning_rate,
                 train_steps=train_steps,
                 save_every_n_steps=save_every_n_steps,
@@ -1275,7 +628,7 @@ def train_models(
 
 
 def run_job(
-    runtime_config: KleinRuntimeConfig,
+    runtime_config: RuntimeConfig,
     dataset_name: str,
     output_name: str,
     output_dir: Path,
@@ -1284,6 +637,7 @@ def run_job(
     network_dim: int,
     network_alpha: int,
     optimizer_type: str,
+    optimizer_args: str,
     learning_rate: str,
     train_steps: int,
     enable_compile_optimizations: bool,
@@ -1383,6 +737,7 @@ def run_job(
             network_dim=network_dim,
             network_alpha=network_alpha,
             optimizer_type=optimizer_type,
+            optimizer_args=optimizer_args,
             learning_rate=learning_rate,
             train_steps=train_steps,
             save_every_n_steps=save_every_n_steps,
