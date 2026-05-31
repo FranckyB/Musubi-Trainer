@@ -11,13 +11,14 @@ The app is now job-first:
 
 ## Current Support
 
-- Model family: Klein
+- Model families: Klein (FLUX.2), LTX, Wan, Z-Image, Qwen
+- Tested in this launcher: Klein and LTX
 - Platform focus: Windows
 
 ## Current Stage Note
 
-- This launcher is still Klein-only at this stage.
-- Model/preset expansion is planned for later.
+- Multi-family support is now available.
+- Ongoing validation and quality-of-life updates continue across families.
 - Datasets should be prepared first (images). The app can auto-create missing caption `.txt` files.
 
 ## Highlights
@@ -25,6 +26,8 @@ The app is now job-first:
 - Dataset card UI with thumbnails
 - Built-in dataset caption editor with live autosave
 - Queue-based job system with per-job settings
+- Preset system for saving and reusing job configurations
+- Per-family preferred preset support for faster Create Job setup
 - Job statuses: `queued`, `running`, `paused`, `resume`, `done`, `failed`, `broken`
 - Resume-aware step tracking using explicit `progress.json` metadata
 - Edit jobs in place and re-evaluate status from current outputs + new target steps
@@ -41,7 +44,7 @@ The app is now job-first:
    - Right-click a dataset card and choose `Edit Dataset`.
 3. Caption text is auto-saved to matching `.txt` files (created automatically when missing).
 4. Create one or more jobs from datasets.
-5. Configure job-specific training options (steps, optimizer, learning rate, dim/alpha, flags).
+5. Configure job-specific training options (steps, optimizer, learning rate, dim/alpha, flags), then save as a preset if desired.
 6. Reorder queue, pause/enable jobs, then press START QUEUE.
 7. App runs prep/cache/train per runnable job.
 8. Resume data and recorded progress determine whether a job is `resume` or `done`.
@@ -116,9 +119,10 @@ You can also set a manual Python path in Settings.
 1. Create or select a dataset card.
 2. Press Create Job.
 3. Tune job settings and save.
-4. Repeat to build queue.
-5. Press START QUEUE.
-6. The app logs each step for each runnable job:
+4. Optionally save those settings as a preset and reuse or reload them for future jobs.
+5. Repeat to build queue.
+6. Press START QUEUE.
+7. The app logs each step for each runnable job:
    - Dataset Check
    - Cache Latent
    - Cache Text Encoder
