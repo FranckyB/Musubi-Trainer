@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -461,6 +462,35 @@ def run_command(
     # Echo to the real console when one is attached (python, not pythonw)
     _console = _sys.stdout if (_sys.stdout is not None and hasattr(_sys.stdout, 'write')) else None
 
+    def _format_command_failure(return_code: int) -> str:
+        cmd_text = ' '.join(str(a) for a in args)
+        message = f"Command failed with exit code {return_code}: {cmd_text}"
+        if os.name == "nt" and return_code in (3221225477, -1073741819):
+            message += (
+                "\nWindows crash code 0xC0000005 (access violation) detected. "
+                "This is commonly caused by CUDA OOM / VRAM exhaustion or a GPU driver reset. "
+                "Try reducing batch size/resolution, closing other GPU apps, or using a lower-memory model path."
+            )
+        return message
+
+    def _cancel_subprocess(proc: subprocess.Popen) -> None:
+        if os.name == "nt":
+            ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+            if ctrl_break is not None:
+                try:
+                    # Ask the process tree to shut down cleanly first.
+                    proc.send_signal(ctrl_break)
+                    proc.wait(timeout=5)
+                    return
+                except Exception:
+                    pass
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
     def _echo_console(cleaned: str, prefix: str = "") -> None:
         if _console is None:
             return
@@ -556,6 +586,10 @@ def run_command(
             "cwd": str(cwd),
             "env": env,
         }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = int(popen_kwargs.get("creationflags", 0)) | int(
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
         if os.name == "nt" and stream_to_logger:
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -569,7 +603,9 @@ def run_command(
                     # Reuse the current console when one is already attached.
                     launch_args = list(args)
                 else:
-                    popen_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+                    popen_kwargs["creationflags"] = int(popen_kwargs.get("creationflags", 0)) | int(
+                        subprocess.CREATE_NEW_CONSOLE
+                    )
                     # Wrap with cmd so the window stays open on failure when detached.
                     cmd_str = subprocess.list2cmdline([str(a) for a in args])
                     launch_args = [
@@ -581,19 +617,12 @@ def run_command(
             process = subprocess.Popen(launch_args, **popen_kwargs)
             while True:
                 if cancel_requested is not None and cancel_requested():
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
+                    _cancel_subprocess(process)
                     raise TrainingCancelledError("Cancelled by user.")
                 return_code = process.poll()
                 if return_code is not None:
                     if return_code != 0:
-                        raise RuntimeError(
-                            f"Command failed with exit code {return_code}: {' '.join(str(a) for a in args)}"
-                        )
+                        raise RuntimeError(_format_command_failure(return_code))
                     return
                 time.sleep(0.2)
 
@@ -605,12 +634,7 @@ def run_command(
             while True:
                 flush_new_output()
                 if cancel_requested is not None and cancel_requested():
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
+                    _cancel_subprocess(process)
                     raise TrainingCancelledError("Cancelled by user.")
 
                 return_code = process.poll()
@@ -628,10 +652,10 @@ def run_command(
                                 output_tail = ""
                         if output_tail:
                             raise RuntimeError(
-                                f"Command failed with exit code {return_code}: {' '.join(str(a) for a in args)}\n"
+                                f"{_format_command_failure(return_code)}\n"
                                 f"--- command output (tail) ---\n{output_tail}"
                             )
-                        raise RuntimeError(f"Command failed with exit code {return_code}: {' '.join(str(a) for a in args)}")
+                        raise RuntimeError(_format_command_failure(return_code))
                     return
                 time.sleep(0.2)
     finally:

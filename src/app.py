@@ -1786,12 +1786,12 @@ def launch_ui() -> int:
         ).grid(row=1, column=1, sticky="w", pady=(6, 0))
         ttk.Checkbutton(
             flags_section,
-            text="Enable FP8 (Lower VRAM)",
+            text="Enable FP8 (Low VRAM)",
             variable=fp8_dit_var,
         ).grid(row=2, column=0, sticky="w", pady=(6, 0))
         ttk.Checkbutton(
             flags_section,
-            text="Enable Gradient Checkpointing (Lower VRAM)",
+            text="Enable Gradient Checkpointing (Low VRAM)",
             variable=gc_cpu_offload_var,
         ).grid(row=2, column=1, sticky="w", pady=(6, 0))
 
@@ -1919,27 +1919,29 @@ def launch_ui() -> int:
                 # ─ Model header row ─────────────────────────────────
                 hdr = ttk.Frame(model_block)
                 hdr.grid(row=0, column=0, sticky="ew")
-                hdr.columnconfigure(1, weight=1)
+                hdr.columnconfigure(0, weight=1)
 
                 detail_expanded_var = tk.BooleanVar(value=False)
                 detail_frame = ttk.Frame(model_block, padding=(20, 2, 0, 2))
                 detail_frame.columnconfigure(1, weight=1)
                 # detail_frame is NOT gridded yet (hidden by default)
 
-                expand_btn = ttk.Button(hdr, text="▶", width=2)
-                expand_btn.grid(row=0, column=0, padx=(0, 4))
-
-                ttk.Label(hdr, text=display_name, width=28, anchor="w").grid(row=0, column=1, sticky="w")
+                expand_btn = ttk.Button(
+                    hdr,
+                    text=f"▶  {display_name}",
+                    style="FamilyHeader.TButton",
+                )
+                expand_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
                 status_lbl = ttk.Label(hdr, textvariable=sv, anchor="w", width=18)
-                status_lbl.grid(row=0, column=2, padx=(8, 0), sticky="w")
+                status_lbl.grid(row=0, column=1, padx=(8, 0), sticky="w")
                 sv.trace_add("write", lambda *a, lbl=status_lbl, s=sv: _apply_status_color(lbl, s))
                 _apply_status_color(status_lbl, sv)
 
                 ttk.Button(
                     hdr, text="Auto-download",
                     command=lambda mn=mn: _auto_download_model(mn),
-                ).grid(row=0, column=3, padx=(8, 0))
+                ).grid(row=0, column=2, padx=(8, 0))
 
                 # ─ Detail rows (component paths) ─────────────────────
                 components = list(DOWNLOAD_MODELS.get(mn, {}).keys())
@@ -2002,15 +2004,16 @@ def launch_ui() -> int:
                     btn: ttk.Button = expand_btn,
                     det: ttk.Frame = detail_frame,
                     var: tk.BooleanVar = detail_expanded_var,
+                    dn: str = display_name,
                 ) -> None:
                     if var.get():
                         det.grid_remove()
                         var.set(False)
-                        btn.configure(text="▶")
+                        btn.configure(text=f"▶  {dn}")
                     else:
                         det.grid(row=1, column=0, sticky="ew")
                         var.set(True)
-                        btn.configure(text="▼")
+                        btn.configure(text=f"▼  {dn}")
 
                 expand_btn.configure(command=_toggle_detail)
                 _bind_mousewheel(hdr)
@@ -2588,9 +2591,10 @@ def launch_ui() -> int:
     if is_first_launch_unconfigured():
         messagebox.showinfo(
             "First launch setup",
-            "No model or backend settings were found yet.\n\n"
-            "Open Settings and set up at least one backend\n"
-            "for the model families you want to use.",
+            "No model or Kohya-ss tools were found yet.\n\n"
+            "Open Settings and set up tools to use:\n"
+            "Musubi Main/Musubi LTX/SD-Scripts\n"
+            "Also set or download models you want to use.",
             parent=root,
         )
         runtime_config = open_settings_dialog(required=False)
@@ -5721,6 +5725,14 @@ def launch_ui() -> int:
                 return False
             return backend_is_valid(kind, path)
 
+        def _model_has_saved_path(mn: str) -> bool:
+            return bool(str(_mpaths_cj.get(mn, {}).get("dit", "")).strip())
+
+        _backend_blocked_models = [
+            mn for mn in _all_mn
+            if _model_has_saved_path(mn) and not _backend_ready_for_model(mn)
+        ]
+
         _avail_models = [
             mn for mn in _all_mn
             if _mpaths_cj.get(mn, {}).get("dit") and _backend_ready_for_model(mn)
@@ -5733,8 +5745,13 @@ def launch_ui() -> int:
         if not _avail_models:
             messagebox.showinfo(
                 "No models available",
-                "No model backend is currently available for Jobs.\n\n"
-                "Configure Musubi Main and/or Musubi LTX in Settings.",
+                (
+                    "Models were found, but their required kohya-ss backend is not ready.\n\n"
+                    "Configure Musubi Main and/or Musubi LTX in Settings."
+                    if _backend_blocked_models
+                    else "No model backend is currently available for Jobs.\n\n"
+                    "Configure Musubi Main and/or Musubi LTX in Settings."
+                ),
                 parent=root,
             )
             dialog.destroy()
@@ -5808,15 +5825,31 @@ def launch_ui() -> int:
         _model_display_var.trace_add("write", _on_model_display_change)
         ttk.Combobox(header_frame, textvariable=_model_display_var, values=_display_values, state="readonly", width=28).grid(row=0, column=3, sticky="w")
 
-        # ── Notebook ───────────────────────────────────────────────────────
-        notebook = ttk.Notebook(outer)
-        notebook.grid(row=1, column=0, sticky="nsew")
+        if _backend_blocked_models:
+            blocked_display = sorted(
+                {DOWNLOAD_MODEL_DISPLAY_NAMES.get(mn, mn) for mn in _backend_blocked_models},
+                key=lambda name: name.casefold(),
+            )
+            blocked_names = ", ".join(blocked_display)
+            warning_icon = ttk.Label(
+                header_frame,
+                text="⚠️",
+                foreground="#d8c07a",
+            )
+            warning_icon.grid(row=0, column=4, sticky="w", padx=(8, 0))
+            attach_hover_tooltip(
+                warning_icon,
+                (
+                    "Some configured models are hidden because the matching kohya-ss backend is not set.\n\n"
+                    f"Hidden models: {blocked_names}"
+                ),
+            )
 
-        # ── Tab 1: Training ────────────────────────────────────────────────
-        training_tab = ttk.Frame(notebook, padding=10)
+        # ── Create Job content ─────────────────────────────────────────────
+        training_tab = ttk.Frame(outer, padding=10)
+        training_tab.grid(row=1, column=0, sticky="nsew")
         training_tab.columnconfigure(1, weight=1)
         training_tab.columnconfigure(3, weight=1)
-        notebook.add(training_tab, text="  Training  ")
 
         train_optimizer_var = tk.StringVar(
             value=(existing_job or {}).get("optimizer_type", "prodigy")
@@ -5893,6 +5926,11 @@ def launch_ui() -> int:
                 "ltx_mode": _normalize_ltx_mode_ui(ltx_mode_var.get()),
                 "ltx_lora_target_preset": ltx_lora_target_preset_var.get().strip(),
                 "ltx_first_frame_conditioning_p": ltx_first_frame_conditioning_p_var.get().strip(),
+                "enable_compile": bool_to_flag(compile_var.get()),
+                "enable_tf32": bool_to_flag(tf32_var.get()),
+                "enable_cudnn": bool_to_flag(cudnn_var.get()),
+                "enable_fp8": bool_to_flag(fp8_var.get()),
+                "enable_gc": bool_to_flag(gc_var.get()),
             }
 
         def _apply_preset_values(values: dict[str, str]) -> None:
@@ -5930,6 +5968,16 @@ def launch_ui() -> int:
                 ltx_lora_target_preset_var.set(values["ltx_lora_target_preset"])
             if "ltx_first_frame_conditioning_p" in values:
                 ltx_first_frame_conditioning_p_var.set(values["ltx_first_frame_conditioning_p"])
+            if "enable_compile" in values:
+                compile_var.set(flag_to_bool(values["enable_compile"]))
+            if "enable_tf32" in values:
+                tf32_var.set(flag_to_bool(values["enable_tf32"]))
+            if "enable_cudnn" in values:
+                cudnn_var.set(flag_to_bool(values["enable_cudnn"]))
+            if "enable_fp8" in values:
+                fp8_var.set(flag_to_bool(values["enable_fp8"]))
+            if "enable_gc" in values:
+                gc_var.set(flag_to_bool(values["enable_gc"]))
 
         def _preset_names_for_model(model_name: str) -> list[str]:
             selected_family = _model_to_family.get(model_name, "")
@@ -6276,7 +6324,7 @@ def launch_ui() -> int:
         ttk.Checkbutton(flags, text="Enable Allow TF32", variable=tf32_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
         ttk.Checkbutton(flags, text="Enable cuDNN Benchmark", variable=cudnn_var).grid(row=0, column=2, sticky="w", padx=(12, 0))
         ttk.Checkbutton(flags, text="Enable FP8 (Low VRAM)", variable=fp8_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(flags, text="Enable CPU Gradient Checkpointing (Low RAM)", variable=gc_var).grid(
+        ttk.Checkbutton(flags, text="Enable CPU Gradient Checkpointing (Low VRAM)", variable=gc_var).grid(
             row=1, column=1, columnspan=2, sticky="w", padx=(12, 0), pady=(6, 0)
         )
 
@@ -6310,14 +6358,14 @@ def launch_ui() -> int:
         _sync_model_specific_controls()
         _refresh_preset_combo()
 
-        # ── Tab 2: Datasets ────────────────────────────────────────────────
-        datasets_tab = ttk.Frame(notebook, padding=10)
-        datasets_tab.columnconfigure(0, weight=1)
-        datasets_tab.rowconfigure(1, weight=1)
-        notebook.add(datasets_tab, text="  Datasets  ")
+        # ── Datasets (bottom section) ─────────────────────────────────────
+        datasets_section = ttk.LabelFrame(training_tab, text="Datasets", padding=8)
+        datasets_section.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        datasets_section.columnconfigure(0, weight=1)
+        datasets_section.rowconfigure(1, weight=1)
 
         # Resolution + Batch row (both written to [general] section of dataset.toml)
-        res_row = ttk.Frame(datasets_tab)
+        res_row = ttk.Frame(datasets_section)
         res_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         _saved_res = int((existing_job or {}).get("resolution", str(DEFAULT_RESOLUTION)))
         _saved_res_str = str(_saved_res) if _saved_res in RESOLUTION_CHOICES else str(RESOLUTION_CHOICES[RESOLUTION_CHOICES.index(1024)])
@@ -6491,7 +6539,7 @@ def launch_ui() -> int:
         _sync_resolution_controls()
 
         # Dataset list
-        list_host = ttk.LabelFrame(datasets_tab, text="Datasets", padding=8)
+        list_host = ttk.Frame(datasets_section)
         list_host.grid(row=1, column=0, sticky="nsew")
         list_host.columnconfigure(0, weight=1)
         list_host.rowconfigure(0, weight=1)
@@ -6563,7 +6611,7 @@ def launch_ui() -> int:
         _rebuild_ds_rows()
 
         # Add dataset row
-        add_row = ttk.Frame(datasets_tab, padding=(0, 8, 0, 0))
+        add_row = ttk.Frame(datasets_section, padding=(0, 8, 0, 0))
         add_row.grid(row=2, column=0, sticky="ew")
         add_row.columnconfigure(1, weight=1)
         ttk.Label(add_row, text="Add dataset:").grid(row=0, column=0, sticky="w", padx=(0, 8))
@@ -6595,7 +6643,7 @@ def launch_ui() -> int:
                 )
                 return
             if not dataset_entries:
-                messagebox.showerror("No datasets", "Add at least one dataset in the Datasets tab.", parent=dialog)
+                messagebox.showerror("No datasets", "Add at least one dataset in the Datasets section.", parent=dialog)
                 return
 
             resolution_value = int(train_resolution_var.get())
@@ -7283,6 +7331,29 @@ def launch_ui() -> int:
         update_start_button_state()
         model_error_popup_shown = False
 
+        def notify_job_failure_popup(job_name: str, details: str = "") -> None:
+            summary = (details or "").strip()
+            if summary:
+                summary = summary[:1200]
+                message = (
+                    f"Job '{job_name}' failed.\n\n"
+                    f"{summary}\n\n"
+                    "See queue log for full details."
+                )
+            else:
+                message = f"Job '{job_name}' failed.\n\nSee queue log for full details."
+
+            def show_failure_popup() -> None:
+                if not root.winfo_exists():
+                    return
+                try:
+                    root.bell()
+                except Exception:
+                    pass
+                messagebox.showerror("Job Failed", message, parent=root)
+
+            root.after(0, show_failure_popup)
+
         def friendly_model_config_error(details: str) -> tuple[str, str] | None:
             text = (details or "").strip()
             lowered = text.lower()
@@ -7355,6 +7426,7 @@ def launch_ui() -> int:
                     job = job_queue[queue_index]
                     job_name = job.get("job_name", f"job_{queue_index + 1}")
                     dataset_name = job.get("dataset_name", "")
+                    job_error_details = ""
 
                     def mark_running() -> None:
                         if queue_index < len(job_queue):
@@ -7367,7 +7439,8 @@ def launch_ui() -> int:
                     model_name = job.get("model", "klein-base-9b") or "klein-base-9b"
                     job_run_fn = _run_job_for_model(model_name)
                     if job_run_fn is None:
-                        log(f"[Queue] Unsupported model '{model_name}' for job {job_name}.")
+                        job_error_details = f"Unsupported model '{model_name}' for job {job_name}."
+                        log(f"[Queue] {job_error_details}")
                         exit_code = JOB_EXIT_FAILED
                     else:
                         job_runtime_config = runtime_config_for_model(settings_state, model_name) or runtime_config
@@ -7383,8 +7456,6 @@ def launch_ui() -> int:
                                 runner_datasets = [{"name": dataset_source_name, "num_repeats": 1}]
                         else:
                             runner_datasets = [{"name": dataset_source_name, "num_repeats": 1}]
-                        job_error_details = ""
-
                         try:
                             _training_dir, output_dir, captions_added = ensure_training_job_structure(
                                 training_name=training_name,
@@ -7398,7 +7469,8 @@ def launch_ui() -> int:
                                 ds_label = ", ".join(d["name"] for d in runner_datasets)
                                 log(f"[Queue] Added {captions_added} missing caption file(s) for dataset(s): {ds_label}.")
                         except Exception as exc:
-                            log(f"[Queue] Job setup failed for {job_name}: {exc}")
+                            job_error_details = f"Job setup failed for {job_name}: {exc}"
+                            log(f"[Queue] {job_error_details}")
                             exit_code = 1
                             output_dir = Path(job.get("output_dir", str(training_job_dir_path(training_name) / "output"))).expanduser()
                         else:
@@ -7494,6 +7566,7 @@ def launch_ui() -> int:
                         exit_code not in {JOB_EXIT_SUCCESS, JOB_EXIT_CANCELLED}
                         and not (run_cancel_event is not None and run_cancel_event.is_set())
                     ):
+                        notify_job_failure_popup(job_name, job_error_details)
                         log(
                             "[Queue] Tip: If this started after changing dataset repeats/resolution/model settings, "
                             "clear this job's caches and rerun (right-click job -> Clear Job Cache)."
@@ -7512,6 +7585,21 @@ def launch_ui() -> int:
             except Exception as exc:
                 log(f"Queue failed unexpectedly: {exc}")
                 log(traceback.format_exc())
+
+                def show_unexpected_queue_failure_popup() -> None:
+                    if not root.winfo_exists():
+                        return
+                    try:
+                        root.bell()
+                    except Exception:
+                        pass
+                    messagebox.showerror(
+                        "Queue Failed",
+                        f"Queue failed unexpectedly:\n\n{exc}\n\nSee queue log for full traceback.",
+                        parent=root,
+                    )
+
+                root.after(0, show_unexpected_queue_failure_popup)
             finally:
                 def finish_ui() -> None:
                     nonlocal run_in_progress, run_cancel_event

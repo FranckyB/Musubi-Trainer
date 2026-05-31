@@ -15,6 +15,9 @@ einops==0.7.0
 ftfy==6.3.1
 easydict==1.13
 opencv-python==4.10.0.84
+pyarrow>=24.0.0
+lpips==0.1.4
+torch-optimi==0.3.3
 safetensors>=0.4.5
 sentencepiece==0.2.1
 toml==0.10.2
@@ -40,3 +43,8 @@ pytorch-optimizer>=3.10.0
 prodigy-plus-schedule-free>=1.9.2
 imagesize>=1.4.1
 rich>=15.0.0
+
+# musubi-ltx dashboard runtime deps
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+sse-starlette>=2.0.0
