@@ -544,6 +544,14 @@ def run_command(
         env = os.environ.copy()
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("PYTHONIOENCODING", "utf-8")
+        musubi_src = cwd / "src"
+        if musubi_src.exists() and musubi_src.is_dir():
+            existing_pythonpath = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = (
+                str(musubi_src)
+                if not existing_pythonpath
+                else f"{musubi_src}{os.pathsep}{existing_pythonpath}"
+            )
         popen_kwargs: dict[str, object] = {
             "cwd": str(cwd),
             "env": env,
@@ -556,13 +564,18 @@ def run_command(
 
         if inherit_io:
             if os.name == "nt":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
-                # Wrap with cmd so the window stays open on failure
-                cmd_str = subprocess.list2cmdline([str(a) for a in args])
-                launch_args: list[str] = [
-                    "cmd", "/c",
-                    f"{cmd_str} || (echo. & echo --- Process failed. Press any key to close. --- & pause > nul)",
-                ]
+                has_parent_console = bool(_console is not None and getattr(_console, "isatty", lambda: False)())
+                if has_parent_console:
+                    # Reuse the current console when one is already attached.
+                    launch_args = list(args)
+                else:
+                    popen_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+                    # Wrap with cmd so the window stays open on failure when detached.
+                    cmd_str = subprocess.list2cmdline([str(a) for a in args])
+                    launch_args = [
+                        "cmd", "/c",
+                        f"{cmd_str} || (echo. & echo --- Process failed. Press any key to close. --- & pause > nul)",
+                    ]
             else:
                 launch_args = list(args)
             process = subprocess.Popen(launch_args, **popen_kwargs)

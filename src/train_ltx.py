@@ -323,7 +323,10 @@ def run_steps_for_model(
             train_args += ["--fp8_base", "--fp8_scaled"]
         if enable_gradient_checkpointing_cpu_offload:
             train_args.append("--gradient_checkpointing_cpu_offload")
-        if enable_compile_optimizations:
+        compile_enabled = bool(enable_compile_optimizations and not enable_fp8_dit)
+        if enable_compile_optimizations and enable_fp8_dit:
+            logger("  compile note: ignoring --compile because FP8 is enabled")
+        if compile_enabled:
             train_args.append("--compile")
             if enable_cuda_allow_tf32:
                 train_args.append("--cuda_allow_tf32")

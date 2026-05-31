@@ -21,6 +21,7 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+venv_old/
 env/
 ENV/
 
@@ -44,4 +45,4 @@ Thumbs.db
 Musubi-Trainer-Workspace.code-workspace
 settings.json
 src/settings.json
-Launch_Console.bat
+.musubi-trainer.lock

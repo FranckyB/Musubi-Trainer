@@ -72,20 +72,24 @@ Expected workspace layout under this repo:
 
 ## Requirements
 
-- Python 3.10+ recommended
-- App dependencies from `requirements.txt` (`Pillow`, `tkinterdnd2`)
+- Python 3.11 required
+- Unified dependencies from `requirements.txt` (Trainer + Tuner helpers)
 - Musubi-Tuner checkout in a separate folder (for example `D:/Musubi-Tuner`)
-- Musubi-Tuner virtual environment with required dependencies installed
 
-## App Setup (venv)
+## Setup (Single venv)
 
-From repository root (first time, or after dependency changes):
+Set up the shared app/training Python environment:
 
 ```bat
 Setup.bat
 ```
 
-This creates a local `venv` and installs app dependencies from `requirements.txt`.
+`Setup.bat` attempts to auto-download a matching SageAttention wheel from:
+https://github.com/sdbds/SageAttention-for-windows/releases
+
+If auto-download fails, download a matching `.whl` manually from that releases page
+and run Setup with `--sage-wheel` pointing to the downloaded file.
+
 
 ## Launch
 
@@ -100,19 +104,12 @@ Launch.bat
 ## First-Time Setup
 
 1. Open Settings in the app.
-2. Set Musubi-Tuner directory.
+2. Set Musubi-Tuner directory (or use the startup prompt to clone/use an existing checkout).
 3. Verify model files:
 	- Klein Model
 	- Klein VAE
 	- Klein Text Encoder
 4. Save Settings.
-
-The app can auto-detect Musubi Python from:
-
-- <musubi_dir>/venv/Scripts/python.exe
-- <musubi_dir>/.venv/Scripts/python.exe
-
-You can also set a manual Python path in Settings.
 
 ## Job Workflow
 

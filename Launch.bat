@@ -1,20 +1,32 @@
 @echo off
 cd /d "%~dp0"
 
-powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command ^
+set "LOCK_FILE=%CD%\.musubi-trainer.lock"
+
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$lockFile = Join-Path $PWD.Path '.musubi-trainer.lock';" ^
-  "function Test-PidRunning($pid) { try { $p = Get-Process -Id $pid -EA Stop; return $true } catch { return $false } };" ^
+  "function Test-PidRunning($procId) { try { Get-Process -Id $procId -EA Stop | Out-Null; return $true } catch { return $false } };" ^
   "if (Test-Path $lockFile) {" ^
   "  $storedPid = [int](Get-Content $lockFile -EA SilentlyContinue);" ^
   "  if ($storedPid -and (Test-PidRunning $storedPid)) {" ^
   "    Add-Type -AssemblyName System.Windows.Forms;" ^
   "    [System.Windows.Forms.MessageBox]::Show('Musubi Trainer is already running.','Musubi Trainer',0,64) | Out-Null;" ^
-  "    exit" ^
+  "    exit 1" ^
   "  }" ^
   "}" ^
-  "$py = @('venv\Scripts\pythonw.exe','venv\Scripts\python.exe') | Where-Object { Test-Path $_ } | Select-Object -First 1;" ^
-  "if (-not $py) { $py = 'pythonw' }" ^
-  "$p = Start-Process $py '-m src.app' -PassThru -WindowStyle Hidden;" ^
-  "Set-Content $lockFile $p.Id;" ^
-  "$p.WaitForExit();" ^
-  "Remove-Item $lockFile -EA SilentlyContinue"
+  "exit 0"
+
+if errorlevel 1 exit /b 1
+
+for /f %%I in ('powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"ProcessId=$PID\").ParentProcessId"') do set "LAUNCHER_PID=%%I"
+if not defined LAUNCHER_PID set "LAUNCHER_PID=%RANDOM%"
+
+> "%LOCK_FILE%" echo %LAUNCHER_PID%
+
+call venv\Scripts\activate.bat
+python -m src.app
+set "APP_EXIT=%ERRORLEVEL%"
+
+del /f /q "%LOCK_FILE%" >nul 2>nul
+pause
+exit /b %APP_EXIT%

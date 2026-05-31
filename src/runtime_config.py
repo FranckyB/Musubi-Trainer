@@ -10,7 +10,6 @@ from .app_settings import (
     KLEIN_VAE_KEY,
     MODEL_PATHS_KEY,
     MUSUBI_DIR_KEY,
-    MUSUBI_PYTHON_KEY,
 )
 
 DEFAULT_MODEL_VERSION = "klein-base-9b"
@@ -28,15 +27,15 @@ class RuntimeConfig:
 
 
 def resolve_musubi_python(musubi_dir: Path) -> Path | None:
+    _ = musubi_dir  # kept for call-site compatibility
+    workspace_dir = Path(__file__).resolve().parent.parent
     if sys.platform == "win32":
         candidates = [
-            musubi_dir / ".venv" / "Scripts" / "python.exe",
-            musubi_dir / "venv" / "Scripts" / "python.exe",
+            workspace_dir / "venv" / "Scripts" / "python.exe",
         ]
     else:
         candidates = [
-            musubi_dir / ".venv" / "bin" / "python",
-            musubi_dir / "venv" / "bin" / "python",
+            workspace_dir / "venv" / "bin" / "python",
         ]
 
     for candidate in candidates:
@@ -51,13 +50,7 @@ def runtime_config_from_settings(settings: dict[str, str]) -> RuntimeConfig | No
         return None
 
     musubi_dir = Path(musubi_raw).expanduser()
-    musubi_python_raw = settings.get(MUSUBI_PYTHON_KEY, "").strip()
-    musubi_python_override = Path(musubi_python_raw).expanduser() if musubi_python_raw else None
-    musubi_python = (
-        musubi_python_override
-        if musubi_python_override is not None and musubi_python_override.exists() and musubi_python_override.is_file()
-        else resolve_musubi_python(musubi_dir)
-    )
+    musubi_python = resolve_musubi_python(musubi_dir)
     workspace_dir = Path(__file__).resolve().parent.parent
     # Jobs are now the canonical training root (job metadata + per-job training dirs).
     training_dir = workspace_dir / "Jobs"
@@ -89,13 +82,7 @@ def runtime_config_for_model(settings: dict[str, str], model_name: str) -> "Runt
     if not musubi_raw:
         return None
     musubi_dir = Path(musubi_raw).expanduser()
-    musubi_python_raw = settings.get(MUSUBI_PYTHON_KEY, "").strip()
-    musubi_python_override = Path(musubi_python_raw).expanduser() if musubi_python_raw else None
-    musubi_python = (
-        musubi_python_override
-        if musubi_python_override is not None and musubi_python_override.exists() and musubi_python_override.is_file()
-        else resolve_musubi_python(musubi_dir)
-    )
+    musubi_python = resolve_musubi_python(musubi_dir)
     workspace_dir = Path(__file__).resolve().parent.parent
     training_dir = workspace_dir / "Jobs"
 

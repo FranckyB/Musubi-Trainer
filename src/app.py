@@ -375,7 +375,24 @@ def launch_ui() -> int:
         window.geometry(f"+{pos_x}+{pos_y}")
 
     if tkdnd_available and TkinterDnD is not None:
-        root = TkinterDnD.Tk()
+        try:
+            root = TkinterDnD.Tk()
+        except Exception as exc:
+            # Keep launcher usable even when tkdnd native DLL fails (common 32/64-bit mismatch).
+            print(f"[UI] Drag-and-drop disabled: tkinterdnd2/tkdnd failed to load: {exc}")
+            tkdnd_available = False
+
+            # TkinterDnD may leave behind a partially-initialized default root window.
+            # Clean it up before creating our fallback root to avoid a floating ghost "tk" window.
+            try:
+                ghost_root = getattr(tk, "_default_root", None)
+                if ghost_root is not None:
+                    ghost_root.destroy()
+                tk._default_root = None  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+            root = tk.Tk()
     else:
         root = tk.Tk()
     root.withdraw()
@@ -895,7 +912,7 @@ def launch_ui() -> int:
         python_path = resolve_tensorboard_python()
         if python_path is None:
             print(
-                "[Metrics Viewer] TensorBoard is not installed in configured Musubi Python."
+                "[Metrics Viewer] TensorBoard is not installed in the app venv Python."
             )
             return False
 
@@ -977,6 +994,111 @@ def launch_ui() -> int:
         if settings_state.get(TRAIN_AUTO_START_TENSORBOARD_KEY, "0").strip().lower() not in {"1", "true", "yes", "on"}:
             return
         threading.Thread(target=launch_tensorboard_background, daemon=True).start()
+
+    def is_valid_musubi_tuner_dir(path: Path) -> bool:
+        if not path.exists() or not path.is_dir():
+            return False
+        return (
+            (path / "pyproject.toml").exists()
+            or (path / "src" / "musubi_tuner").is_dir()
+            or (path / "flux_2_train_network.py").exists()
+        )
+
+    def apply_musubi_dir_setting(musubi_dir: Path) -> bool:
+        nonlocal runtime_config, settings_state
+        if not is_valid_musubi_tuner_dir(musubi_dir):
+            return False
+        settings_state[MUSUBI_DIR_KEY] = str(musubi_dir)
+        settings_state[MUSUBI_PYTHON_KEY] = ""
+        save_settings(settings_state)
+        runtime_config = runtime_config_from_settings(settings_state)
+        return runtime_config is not None
+
+    def prompt_to_clone_or_select_musubi() -> bool:
+        choice = messagebox.askyesnocancel(
+            "Musubi-Tuner not found",
+            "Musubi-Tuner folder is not configured or is invalid.\n\n"
+            "Yes: Clone Musubi-Tuner now\n"
+            "No: Choose it manually in Settings\n"
+            "Cancel: Exit",
+            parent=root,
+        )
+        if choice is None:
+            return False
+        if choice is False:
+            return True
+
+        clone_parent = filedialog.askdirectory(
+            title="Choose parent folder for Musubi-Tuner clone",
+            initialdir=str(workspace_dir.parent),
+            parent=root,
+        )
+        if not clone_parent:
+            return True
+
+        clone_target = Path(clone_parent).expanduser() / "Musubi-Tuner"
+        if clone_target.exists():
+            if is_valid_musubi_tuner_dir(clone_target):
+                use_existing = messagebox.askyesno(
+                    "Use existing Musubi-Tuner",
+                    f"Found existing Musubi-Tuner at:\n{clone_target}\n\nUse this folder?",
+                    parent=root,
+                )
+                if use_existing:
+                    if apply_musubi_dir_setting(clone_target):
+                        return True
+                    messagebox.showerror(
+                        "Invalid Musubi-Tuner",
+                        f"Could not use folder:\n{clone_target}",
+                        parent=root,
+                    )
+                return True
+
+            if any(clone_target.iterdir()):
+                messagebox.showerror(
+                    "Clone target not empty",
+                    f"Target folder already exists and is not a Musubi-Tuner checkout:\n{clone_target}\n\n"
+                    "Choose a different parent folder.",
+                    parent=root,
+                )
+                return True
+
+        try:
+            clone_target.parent.mkdir(parents=True, exist_ok=True)
+            result = subprocess.run(
+                ["git", "clone", "https://github.com/kohya-ss/musubi-tuner.git", str(clone_target)],
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            messagebox.showerror(
+                "Clone failed",
+                f"Could not run git clone:\n{exc}\n\nInstall Git or clone manually, then select the folder in Settings.",
+                parent=root,
+            )
+            return True
+
+        if result.returncode != 0:
+            err_tail = (result.stderr or result.stdout or "").strip()
+            if len(err_tail) > 1500:
+                err_tail = err_tail[-1500:]
+            messagebox.showerror(
+                "Clone failed",
+                "git clone did not complete successfully.\n\n"
+                f"Target: {clone_target}\n\n"
+                f"Details:\n{err_tail}",
+                parent=root,
+            )
+            return True
+
+        if not apply_musubi_dir_setting(clone_target):
+            messagebox.showerror(
+                "Clone incomplete",
+                f"Clone finished but folder does not look valid:\n{clone_target}\n\n"
+                "Choose the Musubi-Tuner folder manually in Settings.",
+                parent=root,
+            )
+        return True
 
     def persist_dataset_order() -> None:
         nonlocal settings_state
@@ -1076,7 +1198,7 @@ def launch_ui() -> int:
         current_dir = ""
         if runtime_config is not None:
             current_dir = str(runtime_config.musubi_dir)
-        current_musubi_python = settings_state.get(MUSUBI_PYTHON_KEY, "").strip()
+        current_musubi_python_path = resolve_musubi_python(Path(current_dir).expanduser()) if current_dir else None
         current_default_caption_keyword = settings_state.get(DEFAULT_CAPTION_KEYWORD_KEY, "")
         current_compile_optimizations = settings_state.get(ENABLE_COMPILE_OPTIMIZATIONS_KEY, "0").strip().lower() in {
             "1",
@@ -1300,7 +1422,7 @@ def launch_ui() -> int:
                 _bind_mousewheel(child)
 
         selected_musubi_path = current_dir
-        selected_musubi_python = current_musubi_python
+        selected_musubi_python = str(current_musubi_python_path) if current_musubi_python_path is not None else ""
 
         # pending_model_paths: model_name → {component: path_str}
         import json as _json_settings
@@ -1343,7 +1465,6 @@ def launch_ui() -> int:
 
         preferred_preset_vars: dict[str, tk.StringVar] = {}
         musubi_display_var = tk.StringVar(value=current_dir if current_dir else "(none)")
-        musubi_python_display_var = tk.StringVar(value=current_musubi_python if current_musubi_python else "(auto)")
         default_caption_keyword_var = tk.StringVar(value=current_default_caption_keyword)
         compile_optimizations_var = tk.BooleanVar(value=current_compile_optimizations)
         cuda_allow_tf32_var = tk.BooleanVar(value=current_cuda_allow_tf32)
@@ -1362,15 +1483,10 @@ def launch_ui() -> int:
             musubi_section, textvariable=musubi_display_var, anchor="w", style="PathDisplay.TLabel", padding=(6, 4)
         )
         musubi_display.grid(row=0, column=1, sticky="ew")
-        ttk.Label(musubi_section, text="Python (venv):").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        musubi_python_display = ttk.Label(
+        ttk.Label(
             musubi_section,
-            textvariable=musubi_python_display_var,
-            anchor="w",
-            style="PathDisplay.TLabel",
-            padding=(6, 4),
-        )
-        musubi_python_display.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+            text="Python interpreter is managed automatically by this app.",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         ttk.Label(captions_section, text="Default caption keyword:").grid(
             row=0,
@@ -1717,7 +1833,14 @@ def launch_ui() -> int:
 
             # Resolve which Python to use — prefer the configured Musubi-Tuner venv
             # so that huggingface_hub is available and the process has a real stdout.
-            python_exe = selected_musubi_python or sys.executable
+            python_exe = selected_musubi_python
+            if not python_exe:
+                messagebox.showerror(
+                    "Python not found",
+                    "App venv Python was not found. Run Setup.bat and try again.",
+                    parent=dialog,
+                )
+                return
             cli_script = str(Path(__file__).parent / "download_cli.py")
 
             error_holder: list[str] = []
@@ -1831,33 +1954,8 @@ def launch_ui() -> int:
                 detected_python = resolve_musubi_python(Path(picked).expanduser())
                 if detected_python is not None:
                     selected_musubi_python = str(detected_python)
-                    musubi_python_display_var.set(selected_musubi_python)
                 else:
                     selected_musubi_python = ""
-                    musubi_python_display_var.set("(not found - set manually)")
-                    messagebox.showwarning(
-                        "Python venv not found",
-                        "Could not find .venv/venv Python in this Musubi-Tuner folder.\n"
-                        "Set Python (venv) manually.",
-                        parent=dialog,
-                    )
-
-        def browse_musubi_python() -> None:
-            nonlocal selected_musubi_python
-            initial_dir = selected_musubi_path or str(Path.home())
-            if selected_musubi_python:
-                initial_dir = str(Path(selected_musubi_python).expanduser().parent)
-
-            filetypes = [("Python executable", "python.exe"), ("All files", "*.*")] if sys.platform == "win32" else [("All files", "*.*")]
-            picked = filedialog.askopenfilename(
-                parent=dialog,
-                title="Select Musubi-Tuner Python executable",
-                initialdir=initial_dir,
-                filetypes=filetypes,
-            )
-            if picked:
-                selected_musubi_python = picked
-                musubi_python_display_var.set(picked)
 
         def browse_file(current_path: str, initial_dir_hint: str, title: str) -> str | None:
             initial_dir = initial_dir_hint
@@ -1896,7 +1994,7 @@ def launch_ui() -> int:
             return str(candidate)
 
         def save_and_close() -> None:
-            nonlocal result, settings_state, selected_musubi_python
+            nonlocal result, settings_state
             # Force any focused entry widget to commit (triggers FocusOut → _save_path)
             dialog.focus_set()
             if not selected_musubi_path:
@@ -1920,28 +2018,18 @@ def launch_ui() -> int:
                 messagebox.showerror("Invalid folder", "Choose a valid Musubi-Tuner folder.", parent=dialog)
                 return
 
-            musubi_python_path: Path | None = None
-            if selected_musubi_python:
-                musubi_python_path = Path(selected_musubi_python).expanduser()
-                if not musubi_python_path.exists() or not musubi_python_path.is_file():
-                    messagebox.showerror("Invalid file", "Choose a valid Python (venv) executable.", parent=dialog)
-                    return
-            else:
-                detected = resolve_musubi_python(musubi_path)
-                if detected is not None:
-                    musubi_python_path = detected
-                    selected_musubi_python = str(detected)
-                else:
-                    messagebox.showwarning(
-                        "Python venv not found",
-                        "Could not auto-detect Musubi-Tuner venv (.venv/venv).\n"
-                        "Set Python (venv) manually in Settings before running jobs.",
-                        parent=dialog,
-                    )
+            musubi_python_path = resolve_musubi_python(musubi_path)
+            if musubi_python_path is None:
+                messagebox.showerror(
+                    "Python venv not found",
+                    "App venv Python was not found. Run Setup.bat first.",
+                    parent=dialog,
+                )
+                return
 
             import json as _json_save
             settings_state[MUSUBI_DIR_KEY] = str(musubi_path)
-            settings_state[MUSUBI_PYTHON_KEY] = str(musubi_python_path) if musubi_python_path is not None else ""
+            settings_state[MUSUBI_PYTHON_KEY] = ""
             settings_state[MODEL_PATHS_KEY] = _json_save.dumps(pending_model_paths)
             # Backward compat: derive legacy keys from pending_model_paths
             _active_klein = settings_state.get(KLEIN_MODEL_VERSION_KEY, "klein-base-9b") or "klein-base-9b"
@@ -2009,9 +2097,6 @@ def launch_ui() -> int:
             root.after_idle(root.destroy)
 
         ttk.Button(musubi_section, text="Browse Folder", command=browse_musubi).grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(musubi_section, text="Browse File", command=browse_musubi_python).grid(
-            row=1, column=2, padx=(8, 0), pady=(8, 0)
-        )
         button_row = ttk.Frame(footer)
         button_row.grid(row=0, column=0, sticky="ew")
         button_row.columnconfigure(0, weight=1)
@@ -2041,16 +2126,22 @@ def launch_ui() -> int:
 
         return result
 
-    if runtime_config is None:
-        messagebox.showinfo(
-            "First launch setup",
-            "Musubi-Tuner location is required before this app can run. Set it in Settings now.",
-            parent=root,
-        )
-        runtime_config = open_settings_dialog(required=True)
-        if runtime_config is None:
+    if runtime_config is None or not is_valid_musubi_tuner_dir(runtime_config.musubi_dir):
+        proceed = prompt_to_clone_or_select_musubi()
+        if not proceed:
             root.destroy()
             return 1
+
+        if runtime_config is None or not is_valid_musubi_tuner_dir(runtime_config.musubi_dir):
+            messagebox.showinfo(
+                "First launch setup",
+                "Musubi-Tuner location is required before this app can run. Set it in Settings now.",
+                parent=root,
+            )
+            runtime_config = open_settings_dialog(required=True)
+            if runtime_config is None or not is_valid_musubi_tuner_dir(runtime_config.musubi_dir):
+                root.destroy()
+                return 1
 
     maybe_autostart_tensorboard()
 
@@ -2422,7 +2513,7 @@ def launch_ui() -> int:
             border_draw = ImageDraw.Draw(border_overlay)
             border_draw.rectangle((0, 0, thumb_size[0] - 1, thumb_size[1] - 1), outline=(255, 255, 255, 96), width=1)
             composited = Image.alpha_composite(image_rgba, border_overlay).convert("RGB")
-            return ImageTk.PhotoImage(composited)
+            return ImageTk.PhotoImage(composited, master=root)
 
         def flush_caption_save(widget: tk.Text) -> None:
             after_id = pending_save_by_widget.pop(widget, None)
@@ -3035,7 +3126,7 @@ def launch_ui() -> int:
         if musubi_python is None or not musubi_python.is_file():
             messagebox.showerror(
                 "Merge unavailable",
-                "Musubi-Tuner Python was not found. Open Settings and set Python (venv).",
+                "App venv Python was not found. Run Setup.bat first.",
                 parent=root,
             )
             return
@@ -3727,13 +3818,13 @@ def launch_ui() -> int:
                     bg_img = Image.new("RGB", (THUMB_PX, THUMB_PX), (45, 45, 45))
                     offset = ((THUMB_PX - img.width) // 2, (THUMB_PX - img.height) // 2)
                     bg_img.paste(img, offset)
-                    photo = ImageTk.PhotoImage(bg_img)
+                    photo = ImageTk.PhotoImage(bg_img, master=root)
                 else:
                     placeholder = Image.new("RGB", (THUMB_PX, THUMB_PX), (45, 45, 45))
-                    photo = ImageTk.PhotoImage(placeholder)
+                    photo = ImageTk.PhotoImage(placeholder, master=root)
             except Exception:
                 placeholder = Image.new("RGB", (THUMB_PX, THUMB_PX), (45, 45, 45))
-                photo = ImageTk.PhotoImage(placeholder)
+                photo = ImageTk.PhotoImage(placeholder, master=root)
             thumb_refs.append(photo)
 
             var = tk.BooleanVar(value=False)
@@ -4737,12 +4828,16 @@ def launch_ui() -> int:
         def fix_clicked_job_names() -> None:
             fix_job_element_names(clicked)
 
+        def clear_clicked_job_cache() -> None:
+            clear_job_cache_with_confirmation(clicked)
+
         clicked_status = detect_job_status(job_queue[clicked])
         menu = tk.Menu(root, tearoff=0)
         menu.add_command(label="Open Output Folder", command=lambda: open_job_output_folder(clicked))
         menu.add_command(label="LoRA Post-Hoc EMA Merge", command=lambda: merge_job_output_loras(clicked))
         menu.add_command(label="Duplicate Job", command=lambda: duplicate_job(clicked))
         menu.add_command(label="Edit Job", command=lambda: open_create_job_dialog(existing_job=job_queue[clicked]))
+        menu.add_command(label="Clear Job Cache", command=clear_clicked_job_cache)
         if clicked_status == "broken":
             menu.add_command(label="Fix LoRA Names", command=fix_clicked_job_names)
         menu.add_separator()
@@ -4889,6 +4984,73 @@ def launch_ui() -> int:
         update_start_button_state()
         log(
             f"[Queue] Duplicated job: {source_name} -> {new_name} (source dataset: {source_dataset}, captions added: {created_captions})"
+        )
+
+    def _job_cache_dirs(job: dict) -> list[Path]:
+        training_name = job.get("training_name", "").strip() or job.get("job_name", "").strip()
+        if not training_name:
+            return []
+        training_dir = Path(job.get("training_dir", "")).expanduser()
+        if not training_dir.exists() or not training_dir.is_dir():
+            training_dir = training_job_dir_path(training_name).expanduser()
+        if not training_dir.exists() or not training_dir.is_dir():
+            return []
+        cache_dirs: list[Path] = []
+        for child in training_dir.iterdir():
+            if not child.is_dir():
+                continue
+            child_name = child.name.lower()
+            if child_name == "cache" or child_name.startswith("cache_"):
+                cache_dirs.append(child)
+        return sorted(cache_dirs)
+
+    def clear_job_cache_with_confirmation(index: int | None = None) -> None:
+        idx = selected_queue_index() if index is None else index
+        if idx is None or idx < 0 or idx >= len(job_queue):
+            return
+        job = job_queue[idx]
+        job_name = job.get("job_name", "unnamed")
+        cache_dirs = _job_cache_dirs(job)
+        if not cache_dirs:
+            messagebox.showinfo("Clear job cache", f"No cache folders found for '{job_name}'.", parent=root)
+            return
+
+        if not messagebox.askyesno(
+            "Clear job cache",
+            (
+                f"Delete cached latents/text encodes for '{job_name}'?\n\n"
+                "This removes files inside cache folders so they can be regenerated on next run."
+            ),
+            parent=root,
+        ):
+            return
+
+        deleted_files = 0
+        deleted_dirs = 0
+        for cache_dir in cache_dirs:
+            for child in list(cache_dir.iterdir()):
+                try:
+                    if child.is_dir():
+                        shutil.rmtree(child)
+                        deleted_dirs += 1
+                    else:
+                        child.unlink(missing_ok=True)
+                        deleted_files += 1
+                except OSError as exc:
+                    messagebox.showerror(
+                        "Clear job cache failed",
+                        f"Could not remove:\n{child}\n\n{exc}",
+                        parent=root,
+                    )
+                    return
+
+        log(
+            f"[Queue] Cleared cache for {job_name}: {deleted_files} file(s), {deleted_dirs} folder(s) removed."
+        )
+        messagebox.showinfo(
+            "Clear job cache",
+            f"Cleared cache for '{job_name}'.\nRemoved {deleted_files} file(s) and {deleted_dirs} folder(s).",
+            parent=root,
         )
 
     def delete_job_with_confirmation(index: int | None = None) -> None:
@@ -6302,7 +6464,7 @@ def launch_ui() -> int:
             if badge is not None:
                 image.paste(badge, (thumb_px - badge_margin - badge_size, badge_margin), badge)
 
-        photo = ImageTk.PhotoImage(image)
+        photo = ImageTk.PhotoImage(image, master=root)
         thumbnail_cache[cache_key] = photo
         return photo
 
@@ -6851,6 +7013,10 @@ def launch_ui() -> int:
                         exit_code not in {JOB_EXIT_SUCCESS, JOB_EXIT_CANCELLED}
                         and not (run_cancel_event is not None and run_cancel_event.is_set())
                     ):
+                        log(
+                            "[Queue] Tip: If this started after changing dataset repeats/resolution/model settings, "
+                            "clear this job's caches and rerun (right-click job -> Clear Job Cache)."
+                        )
                         failed_jobs.append(job_name)
 
                     if not (run_cancel_event is not None and run_cancel_event.is_set()):
@@ -6889,14 +7055,18 @@ def launch_ui() -> int:
     _settings_icon_path = Path(__file__).resolve().parent / "icons" / "settings.png"
     _settings_icon_img: ImageTk.PhotoImage | None = None
     try:
-        _raw = Image.open(_settings_icon_path).convert("RGBA").resize((18, 18), Image.LANCZOS)
-        _settings_icon_img = ImageTk.PhotoImage(_raw)
+        with Image.open(_settings_icon_path) as _img:
+            _raw = _img.convert("RGBA").resize((18, 18), Image.LANCZOS)
+        _settings_icon_img = ImageTk.PhotoImage(_raw, master=root)
     except Exception:
         pass
     settings_button = ttk.Button(controls, command=apply_settings_from_dialog)
     if _settings_icon_img is not None:
-        settings_button.configure(image=_settings_icon_img, padding=(4, 2))
-        settings_button._icon_ref = _settings_icon_img  # type: ignore[attr-defined]
+        try:
+            settings_button.configure(image=_settings_icon_img, padding=(4, 2))
+            settings_button._icon_ref = _settings_icon_img  # type: ignore[attr-defined]
+        except Exception:
+            settings_button.configure(text="Settings")
     else:
         settings_button.configure(text="Settings")
     create_job_large_button = ttk.Button(dataset_actions_bar, text="Create Job", command=open_create_job_dialog)

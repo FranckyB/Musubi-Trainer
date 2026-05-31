@@ -1,8 +1,42 @@
-# Musubi-Trainer desktop app runtime dependencies (local venv)
-# Install with:
-#   venv\Scripts\python.exe -m pip install -r requirements.txt
+# Unified venv dependencies for Musubi-Trainer + Musubi-Tuner workflows.
 
-Pillow
-tkinterdnd2
-huggingface_hub
-hf_xet
+# Musubi-Trainer UI/runtime
+Pillow>=11.3.0
+tkinterdnd2==0.4.3
+huggingface-hub==0.34.3
+hf_xet>=1.5.0
+
+# Musubi-Tuner core (keep in sync with Musubi-Tuner pyproject where versions are pinned)
+accelerate==1.6.0
+av==14.0.1
+bitsandbytes
+diffusers==0.32.1
+einops==0.7.0
+ftfy==6.3.1
+easydict==1.13
+opencv-python==4.10.0.84
+safetensors>=0.4.5
+sentencepiece==0.2.1
+toml==0.10.2
+tqdm==4.67.1
+transformers==4.56.1
+voluptuous==0.15.2
+
+# Common training/logging extras already used in this workspace
+prodigyopt>=1.1.2
+wandb>=0.27.0
+tensorboard>=2.20.0
+tensorflow>=2.21.0
+triton-windows==3.6.0.post25
+
+# Common optional runtime deps found in the current Musubi venv
+onnxruntime>=1.24.1
+onnxruntime-gpu>=1.24.3
+
+# sd-scripts ecosystem helpers (safe to have in shared venv)
+lion-pytorch>=0.2.3
+schedulefree>=1.4
+pytorch-optimizer>=3.10.0
+prodigy-plus-schedule-free>=1.9.2
+imagesize>=1.4.1
+rich>=15.0.0

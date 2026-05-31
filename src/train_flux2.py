@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 import shlex
 import shutil
+import os
+import subprocess
 from pathlib import Path
 from typing import Callable
 
@@ -50,6 +52,111 @@ from .train_utils import (  # noqa: F401  (re-exported for backward compat)
 # FLUX.2-specific constants
 # ---------------------------------------------------------------------------
 LATENT_SUFFIX = "f2k9b"
+
+
+def _dataset_output_dir(training_dir: Path, dataset_name: str) -> Path:
+    return training_dir / dataset_name / "output"
+
+
+def _dataset_output_name(dataset_name: str) -> str:
+    return f"{dataset_name}_Flux2"
+
+
+def is_step1_ready(training_dir: Path, dataset_name: str) -> bool:
+    dataset_dir = training_dir / dataset_name
+    dataset_toml_exists = (dataset_dir / "dataset.toml").exists()
+    images = dataset_image_files(training_dir, dataset_name)
+    if not dataset_toml_exists or not images:
+        return False
+    return all(image_path.with_suffix(".txt").exists() for image_path in images)
+
+
+def count_latent_cache_ready(training_dir: Path, dataset_name: str) -> tuple[int, int]:
+    images = dataset_image_files(training_dir, dataset_name)
+    total = len(images)
+    if total == 0:
+        return 0, 0
+
+    cache_dir = training_dir / dataset_name / "cache"
+    if not cache_dir.exists() or not cache_dir.is_dir():
+        return 0, total
+
+    ready = 0
+    for image_path in images:
+        pattern = f"{image_path.stem}_*_{LATENT_SUFFIX}.safetensors"
+        if any(cache_dir.glob(pattern)):
+            ready += 1
+    return ready, total
+
+
+def count_text_cache_ready(training_dir: Path, dataset_name: str) -> tuple[int, int]:
+    images = dataset_image_files(training_dir, dataset_name)
+    total = len(images)
+    if total == 0:
+        return 0, 0
+
+    cache_dir = training_dir / dataset_name / "cache"
+    if not cache_dir.exists() or not cache_dir.is_dir():
+        return 0, total
+
+    ready = 0
+    for image_path in images:
+        expected = cache_dir / f"{image_path.stem}_{LATENT_SUFFIX}_te.safetensors"
+        if expected.exists():
+            ready += 1
+    return ready, total
+
+
+def latest_checkpoint_for_dataset(training_dir: Path, dataset_name: str) -> tuple[Path | None, int]:
+    return latest_checkpoint_for_output(
+        _dataset_output_dir(training_dir, dataset_name),
+        _dataset_output_name(dataset_name),
+    )
+
+
+def finished_checkpoint_for_dataset(training_dir: Path, dataset_name: str) -> Path | None:
+    return finished_checkpoint_for_output(
+        _dataset_output_dir(training_dir, dataset_name),
+        _dataset_output_name(dataset_name),
+    )
+
+
+def latest_resume_state_for_dataset(training_dir: Path, dataset_name: str, checkpoint_step: int) -> tuple[Path | None, int]:
+    return latest_resume_state_for_output(
+        _dataset_output_dir(training_dir, dataset_name),
+        _dataset_output_name(dataset_name),
+        checkpoint_step,
+    )
+
+
+def remap_resume_artifacts_to_continued_steps(
+    training_dir: Path,
+    dataset_name: str,
+    resume_step_offset: int,
+    logger: Callable[[str], None],
+) -> None:
+    remap_resume_artifacts_for_output(
+        _dataset_output_dir(training_dir, dataset_name),
+        _dataset_output_name(dataset_name),
+        resume_step_offset,
+        logger,
+    )
+
+
+def cleanup_step_states_for_completed_run(training_dir: Path, dataset_name: str, logger: Callable[[str], None]) -> None:
+    cleanup_step_states_for_completed_output(
+        _dataset_output_dir(training_dir, dataset_name),
+        _dataset_output_name(dataset_name),
+        logger,
+    )
+
+
+def cleanup_step_states_for_cancel(training_dir: Path, dataset_name: str, logger: Callable[[str], None]) -> None:
+    cleanup_step_states_for_cancel_output(
+        _dataset_output_dir(training_dir, dataset_name),
+        _dataset_output_name(dataset_name),
+        logger,
+    )
 
 
 
@@ -287,14 +394,20 @@ def run_steps_for_model(
         output_dir.mkdir(parents=True, exist_ok=True)
 
         train_steps_for_run = train_steps_override if train_steps_override is not None else train_steps
+        compile_enabled = bool(enable_compile_optimizations and not enable_fp8_dit)
+        if enable_compile_optimizations and enable_fp8_dit:
+            logger("  compile note: ignoring --compile because FP8 is enabled")
+        if compile_enabled and not module_available("triton"):
+            logger("  compile note: ignoring --compile because triton is not installed/available")
+            compile_enabled = False
         compile_flags: list[str] = []
-        if enable_compile_optimizations:
+        if compile_enabled:
             compile_flags.extend(["--compile"])
-        if enable_compile_optimizations and enable_cuda_allow_tf32:
+        if compile_enabled and enable_cuda_allow_tf32:
             compile_flags.extend(["--cuda_allow_tf32"])
-        if enable_compile_optimizations and enable_cuda_cudnn_benchmark:
+        if compile_enabled and enable_cuda_cudnn_benchmark:
             compile_flags.extend(["--cuda_cudnn_benchmark"])
-        if enable_compile_optimizations:
+        if compile_enabled:
             compile_flags.extend(["--compile_cache_size_limit", "32"])
         fp8_flags = ["--fp8_base", "--fp8_scaled"] if enable_fp8_dit else []
         gc_offload_flags = ["--gradient_checkpointing_cpu_offload"] if enable_gradient_checkpointing_cpu_offload else []
@@ -307,8 +420,8 @@ def run_steps_for_model(
             has_wandb = module_available("wandb")
             has_wandb_key = wandb_key_available()
             requirements_hint = (
-                "Install dependencies in Musubi-Tuner venv using "
-                "requirements-musubi-tuner.txt from Musubi-Trainer."
+                "Run Setup.bat (or install from Musubi-Trainer requirements.txt) "
+                "to ensure logging dependencies are available in the shared app venv."
             )
             if log_backend == "tensorboard":
                 if not has_tensorboard:
@@ -349,26 +462,21 @@ def run_steps_for_model(
                         f"{requirements_hint}"
                     )
             logging_dir, auto_tracker_name = next_dataset_log_run_dir(runtime_config.training_dir, model_name)
-            logging_flags.extend([
-                "--log_with",
-                log_backend,
-                "--logging_dir",
-                str(logging_dir),
-            ])
             tracker_name = training_log_tracker_name.strip() or auto_tracker_name
-            if tracker_name:
-                logging_flags.extend(["--log_tracker_name", tracker_name])
             logger(f"  logging_dir: {logging_dir}")
             logger(f"  log_tracker_name: {tracker_name}")
         optimizer_key = (optimizer_type or "adamw8bit").strip().lower()
         if optimizer_key == "prodigy" and not module_available("prodigyopt"):
             raise RuntimeError(
                 "Optimizer 'prodigy' requires the prodigyopt package. "
-                "Install dependencies in Musubi-Tuner venv using requirements-musubi-tuner.txt from Musubi-Trainer."
+                "Run Setup.bat (or install from Musubi-Trainer requirements.txt) "
+                "to ensure prodigyopt is available in the shared app venv."
             )
         optimizer_arg = "prodigyopt.Prodigy" if optimizer_key == "prodigy" else (optimizer_type or "adamw8bit").strip()
         learning_rate_for_run = "1" if optimizer_key == "prodigy" else learning_rate
         optimizer_args_values: list[str] = []
+        gradient_checkpointing_enabled = True
+        gradient_checkpointing_cpu_offload_enabled = bool(enable_gradient_checkpointing_cpu_offload)
         if optimizer_key == "prodigy":
             optimizer_args_values = [
                 "safeguard_warmup=True",
@@ -398,8 +506,8 @@ def run_steps_for_model(
             f"max_train_steps = {train_steps_for_run}",
             'mixed_precision = "bf16"',
             "sdpa = true",
-            "gradient_checkpointing = true",
-            f"gradient_checkpointing_cpu_offload = {'true' if enable_gradient_checkpointing_cpu_offload else 'false'}",
+            f"gradient_checkpointing = {'true' if gradient_checkpointing_enabled else 'false'}",
+            f"gradient_checkpointing_cpu_offload = {'true' if gradient_checkpointing_cpu_offload_enabled else 'false'}",
             "persistent_data_loader_workers = true",
             "max_data_loader_n_workers = 2",
             f"save_every_n_steps = {save_every_n_steps}",
@@ -408,10 +516,10 @@ def run_steps_for_model(
             "seed = 42",
             f"fp8_base = {'true' if enable_fp8_dit else 'false'}",
             f"fp8_scaled = {'true' if enable_fp8_dit else 'false'}",
-            f"compile = {'true' if enable_compile_optimizations else 'false'}",
-            f"cuda_allow_tf32 = {'true' if (enable_compile_optimizations and enable_cuda_allow_tf32) else 'false'}",
-            f"cuda_cudnn_benchmark = {'true' if (enable_compile_optimizations and enable_cuda_cudnn_benchmark) else 'false'}",
-            f"compile_cache_size_limit = {32 if enable_compile_optimizations else 0}",
+            f"compile = {'true' if compile_enabled else 'false'}",
+            f"cuda_allow_tf32 = {'true' if (compile_enabled and enable_cuda_allow_tf32) else 'false'}",
+            f"cuda_cudnn_benchmark = {'true' if (compile_enabled and enable_cuda_cudnn_benchmark) else 'false'}",
+            f"compile_cache_size_limit = {32 if compile_enabled else 0}",
         ]
         if optimizer_args_values:
             config_lines.append(f"optimizer_args = {toml_string_list(optimizer_args_values)}")
