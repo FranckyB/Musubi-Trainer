@@ -20,6 +20,33 @@ from typing import Callable
 #   shard_count   – total number of shards (only used when shards=True)
 
 MODELS: dict[str, dict[str, dict]] = {
+    # ── SDXL ──────────────────────────────────────────────────────────
+    # SDXL LoRA uses a base checkpoint. VAE is optional and can be overridden.
+    "sdxl": {
+        "dit": {
+            "repo_id": "stabilityai/stable-diffusion-xl-base-1.0",
+            "filename": "sd_xl_base_1.0.safetensors",
+            "shards": False,
+            "folder_name": "sdxl-base-1.0",
+        },
+    },
+    "pony": {
+        "dit": {
+            "repo_id": "LyliaEngine/Pony_Diffusion_V6_XL",
+            "filename": "ponyDiffusionV6XL_v6StartWithThisOne.safetensors",
+            "shards": False,
+            "folder_name": "pony-v6-xl",
+        },
+    },
+    "illustrious": {
+        "dit": {
+            "repo_id": "OnomaAIResearch/Illustrious-XL-v1.0",
+            "filename": "Illustrious-XL-v1.0.safetensors",
+            "shards": False,
+            "folder_name": "illustrious-xl",
+        },
+    },
+
     # ── FLUX.2 ─────────────────────────────────────────────────────────
     # VAE is shared across all FLUX.2 variants → folder "flux2-vae"
     # Qwen3-8B TE is shared by all klein 9B variants → folder "qwen3-8b"
@@ -399,6 +426,7 @@ DOWNLOAD_LOCATIONS: tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 
 MODEL_FAMILIES: dict[str, list[str]] = {
+    "SDXL": ["sdxl", "pony", "illustrious"],
     "FLUX.2": ["flux2-dev", "klein-base-9b", "klein-9b", "klein-base-4b", "klein-4b"],
     "LTX": ["ltx-2.3"],
     "Wan": ["wan2.1-t2v-14b", "wan2.1-i2v-720p-14b", "wan2.1-i2v-480p-14b", "wan2.2-t2v-14b"],
@@ -410,6 +438,10 @@ MODEL_FAMILIES: dict[str, list[str]] = {
 # Shared components (VAE, TE) appear under multiple models, so this tells the user
 # exactly what file they are expected to provide.
 COMPONENT_FRIENDLY_NAMES: dict[str, str] = {
+    # SDXL
+    "sdxl-base-1.0": "SDXL Base 1.0 Checkpoint",
+    "pony-v6-xl": "Pony Diffusion V6 XL Checkpoint",
+    "illustrious-xl": "Illustrious XL Checkpoint",
     # FLUX.2
     "flux2-dev":    "FLUX.2-dev DiT",
     "flux2-vae":    "FLUX.2 AE (ae.safetensors)",
@@ -446,6 +478,9 @@ COMPONENT_FRIENDLY_NAMES: dict[str, str] = {
 }
 
 MODEL_DISPLAY_NAMES: dict[str, str] = {
+    "sdxl": "SDXL",
+    "pony": "Pony (SDXL)",
+    "illustrious": "Illustrious (SDXL)",
     "flux2-dev": "FLUX.2-dev",
     "klein-base-9b": "Klein base 9B",
     "klein-9b": "Klein 9B",

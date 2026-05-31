@@ -574,13 +574,27 @@ def run_command(
         env = os.environ.copy()
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("PYTHONIOENCODING", "utf-8")
+        # Suppress TensorFlow/absl startup noise from optional logging backends.
+        env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+        env.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+
+        pythonpath_entries: list[str] = []
+        if cwd.exists() and cwd.is_dir():
+            pythonpath_entries.append(str(cwd))
+            cwd_tools = cwd / "tools"
+            if cwd_tools.exists() and cwd_tools.is_dir():
+                pythonpath_entries.append(str(cwd_tools))
+
         musubi_src = cwd / "src"
         if musubi_src.exists() and musubi_src.is_dir():
-            existing_pythonpath = env.get("PYTHONPATH", "")
+            pythonpath_entries.append(str(musubi_src))
+
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        if pythonpath_entries:
             env["PYTHONPATH"] = (
-                str(musubi_src)
+                os.pathsep.join(pythonpath_entries)
                 if not existing_pythonpath
-                else f"{musubi_src}{os.pathsep}{existing_pythonpath}"
+                else f"{os.pathsep.join(pythonpath_entries)}{os.pathsep}{existing_pythonpath}"
             )
         popen_kwargs: dict[str, object] = {
             "cwd": str(cwd),

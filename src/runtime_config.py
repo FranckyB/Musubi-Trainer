@@ -13,10 +13,12 @@ from .app_settings import (
     MUSUBI_DIR_KEY,
     MUSUBI_LTX_DIR_KEY,
     MUSUBI_MAIN_DIR_KEY,
+    SD_SCRIPTS_DIR_KEY,
 )
 
 DEFAULT_MODEL_VERSION = "klein-base-9b"
 _LTX_MODELS = {"ltx-2.3"}
+_SD_SCRIPTS_MODELS = {"sdxl", "pony", "illustrious"}
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,7 @@ def _default_backend_path(workspace_dir: Path, folder_name: str) -> Path:
 def _resolve_musubi_backend_path(settings: dict[str, str], model_name: str) -> Path | None:
     workspace_dir = Path(__file__).resolve().parent.parent
     is_ltx_model = (model_name or "").strip().lower() in _LTX_MODELS
+    is_sd_scripts_model = (model_name or "").strip().lower() in _SD_SCRIPTS_MODELS
 
     backends_root_raw = settings.get(BACKENDS_ROOT_KEY, "").strip()
     backends_root = Path(backends_root_raw).expanduser() if backends_root_raw else _default_backends_root(workspace_dir)
@@ -50,12 +53,16 @@ def _resolve_musubi_backend_path(settings: dict[str, str], model_name: str) -> P
 
     main_raw = settings.get(MUSUBI_MAIN_DIR_KEY, "").strip()
     ltx_raw = settings.get(MUSUBI_LTX_DIR_KEY, "").strip()
+    sd_raw = settings.get(SD_SCRIPTS_DIR_KEY, "").strip()
 
     main_path = Path(main_raw).expanduser() if main_raw else (backends_root / "musubi-main")
     ltx_path = Path(ltx_raw).expanduser() if ltx_raw else (backends_root / "musubi-ltx")
+    sd_path = Path(sd_raw).expanduser() if sd_raw else (backends_root / "sd-scripts")
 
     if is_ltx_model:
         return ltx_path
+    if is_sd_scripts_model:
+        return sd_path
     if main_raw:
         return main_path
     if legacy_musubi_path is not None:

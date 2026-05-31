@@ -85,6 +85,7 @@ from .train_utils import (
     JOB_EXIT_SUCCESS,
 )
 from .train_flux2 import run_job as _run_job_flux2, train_models
+from .train_sdxl import run_job as _run_job_sdxl
 from .train_ltx import run_job as _run_job_ltx
 from .train_wan import run_job as _run_job_wan
 from .train_zimage import run_job as _run_job_zimage
@@ -92,6 +93,7 @@ from .train_qwen import run_job as _run_job_qwen
 
 # Model name → run_job function
 _KLEIN_MODELS = {"flux2-dev", "klein-base-9b", "klein-9b", "klein-base-4b", "klein-4b"}
+_SDXL_MODELS = {"sdxl", "pony", "illustrious"}
 _LTX_MODELS = {"ltx-2.3"}
 _WAN_MODELS = {"wan2.1-t2v-14b", "wan2.1-i2v-720p-14b", "wan2.1-i2v-480p-14b", "wan2.2-t2v-14b", "wan2.2-i2v-720p-14b", "wan2.2-i2v-480p-14b"}
 _ZIMAGE_MODELS = {"zimage-de-turbo"}
@@ -107,6 +109,8 @@ def _run_job_for_model(model_name: str):
     """Return the appropriate run_job function for a given model name."""
     if model_name in _KLEIN_MODELS:
         return _run_job_flux2
+    if model_name in _SDXL_MODELS:
+        return _run_job_sdxl
     if model_name in _LTX_MODELS:
         return _run_job_ltx
     if model_name in _WAN_MODELS:
@@ -1078,6 +1082,8 @@ def launch_ui() -> int:
         return has_project_marker and has_train_entry
 
     def backend_kind_for_model(model_name: str) -> str:
+        if model_name in _SDXL_MODELS:
+            return "sd-scripts"
         if model_name in _LTX_MODELS:
             return "musubi-ltx"
         return "musubi-main"
@@ -5675,7 +5681,7 @@ def launch_ui() -> int:
             if not dialog.winfo_exists():
                 return
             dialog.update_idletasks()
-            target_width = max(820, dialog.winfo_reqwidth())
+            target_width = max(740, dialog.winfo_reqwidth())
             target_height = dialog.winfo_reqheight()
             if dialog.state() == "withdrawn":
                 dialog.geometry(f"{target_width}x{target_height}")
@@ -5887,6 +5893,8 @@ def launch_ui() -> int:
         timestep_sampling_var = tk.StringVar(value=(existing_job or {}).get("timestep_sampling", "sigma"))
         ltx_lora_target_preset_var = tk.StringVar(value=(existing_job or {}).get("ltx_lora_target_preset", "full"))
         ltx_first_frame_conditioning_p_var = tk.StringVar(value=(existing_job or {}).get("ltx_first_frame_conditioning_p", "0.5"))
+        sd_unet_lr_var = tk.StringVar(value=(existing_job or {}).get("sd_unet_lr", ""))
+        sd_text_encoder_lr_var = tk.StringVar(value=(existing_job or {}).get("sd_text_encoder_lr", ""))
 
         job_presets = load_job_presets_from_disk()
         preset_none_label = "---------"
@@ -5905,6 +5913,9 @@ def launch_ui() -> int:
         )
         gc_var = tk.BooleanVar(
             value=flag_to_bool((existing_job or {}).get("enable_gc", bool_to_flag(is_truthy(settings_state.get(ENABLE_GRADIENT_CHECKPOINTING_CPU_OFFLOAD_KEY), default=False))))
+        )
+        sdxl_grad_ckpt_var = tk.BooleanVar(
+            value=flag_to_bool((existing_job or {}).get("enable_grad_ckpt", "1"))
         )
 
         def _collect_preset_values() -> dict[str, str]:
@@ -5926,11 +5937,14 @@ def launch_ui() -> int:
                 "ltx_mode": _normalize_ltx_mode_ui(ltx_mode_var.get()),
                 "ltx_lora_target_preset": ltx_lora_target_preset_var.get().strip(),
                 "ltx_first_frame_conditioning_p": ltx_first_frame_conditioning_p_var.get().strip(),
+                "sd_unet_lr": sd_unet_lr_var.get().strip(),
+                "sd_text_encoder_lr": sd_text_encoder_lr_var.get().strip(),
                 "enable_compile": bool_to_flag(compile_var.get()),
                 "enable_tf32": bool_to_flag(tf32_var.get()),
                 "enable_cudnn": bool_to_flag(cudnn_var.get()),
                 "enable_fp8": bool_to_flag(fp8_var.get()),
                 "enable_gc": bool_to_flag(gc_var.get()),
+                "enable_grad_ckpt": bool_to_flag(sdxl_grad_ckpt_var.get()),
             }
 
         def _apply_preset_values(values: dict[str, str]) -> None:
@@ -5968,6 +5982,10 @@ def launch_ui() -> int:
                 ltx_lora_target_preset_var.set(values["ltx_lora_target_preset"])
             if "ltx_first_frame_conditioning_p" in values:
                 ltx_first_frame_conditioning_p_var.set(values["ltx_first_frame_conditioning_p"])
+            if "sd_unet_lr" in values:
+                sd_unet_lr_var.set(values["sd_unet_lr"])
+            if "sd_text_encoder_lr" in values:
+                sd_text_encoder_lr_var.set(values["sd_text_encoder_lr"])
             if "enable_compile" in values:
                 compile_var.set(flag_to_bool(values["enable_compile"]))
             if "enable_tf32" in values:
@@ -5978,6 +5996,8 @@ def launch_ui() -> int:
                 fp8_var.set(flag_to_bool(values["enable_fp8"]))
             if "enable_gc" in values:
                 gc_var.set(flag_to_bool(values["enable_gc"]))
+            if "enable_grad_ckpt" in values:
+                sdxl_grad_ckpt_var.set(flag_to_bool(values["enable_grad_ckpt"]))
 
         def _preset_names_for_model(model_name: str) -> list[str]:
             selected_family = _model_to_family.get(model_name, "")
@@ -6176,7 +6196,7 @@ def launch_ui() -> int:
         _attach_field_tooltip(
             _learning_rate_label,
             train_learning_rate_entry,
-            "Main step size for updates. For Prodigy, this value is ignored and Musubi uses 1 automatically.",
+            "Main step size for updates. For Prodigy, this value is ignored and the launcher uses 1 automatically.",
         )
         _attach_field_tooltip(
             _optimizer_args_label,
@@ -6318,15 +6338,101 @@ def launch_ui() -> int:
             ),
         )
 
+        sd_scripts_specific_frame = ttk.Frame(model_specific)
+        sd_scripts_specific_frame.grid(row=1, column=0, columnspan=4, sticky="ew")
+        sd_scripts_specific_frame.columnconfigure(1, weight=1)
+        sd_scripts_specific_frame.columnconfigure(3, weight=1)
+
+        _sd_unet_lr_label = ttk.Label(sd_scripts_specific_frame, text="U-Net LR override:")
+        _sd_unet_lr_label.grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        _sd_unet_lr_entry = ttk.Entry(sd_scripts_specific_frame, textvariable=sd_unet_lr_var, style="Flat.TEntry")
+        _sd_unet_lr_entry.grid(row=0, column=1, sticky="ew", pady=(6, 0))
+
+        _sd_text_encoder_lr_label = ttk.Label(sd_scripts_specific_frame, text="Text Encoder LR override:")
+        _sd_text_encoder_lr_label.grid(row=0, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        _sd_text_encoder_lr_entry = ttk.Entry(sd_scripts_specific_frame, textvariable=sd_text_encoder_lr_var, style="Flat.TEntry")
+        _sd_text_encoder_lr_entry.grid(row=0, column=3, sticky="ew", pady=(6, 0))
+
+        _attach_field_tooltip(
+            _sd_unet_lr_label,
+            _sd_unet_lr_entry,
+            "SD-Scripts only. Optional U-Net learning-rate override. Leave blank to use the global learning rate.",
+        )
+        _attach_field_tooltip(
+            _sd_text_encoder_lr_label,
+            _sd_text_encoder_lr_entry,
+            "SD-Scripts only. Optional Text Encoder learning-rate override. Leave blank to use defaults.",
+        )
+
         flags = ttk.LabelFrame(training_tab, text="Advanced flags", padding=8)
         flags.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-        ttk.Checkbutton(flags, text="Enable Torch Compile", variable=compile_var).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(flags, text="Enable Allow TF32", variable=tf32_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
-        ttk.Checkbutton(flags, text="Enable cuDNN Benchmark", variable=cudnn_var).grid(row=0, column=2, sticky="w", padx=(12, 0))
-        ttk.Checkbutton(flags, text="Enable FP8 (Low VRAM)", variable=fp8_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(flags, text="Enable CPU Gradient Checkpointing (Low VRAM)", variable=gc_var).grid(
-            row=1, column=1, columnspan=2, sticky="w", padx=(12, 0), pady=(6, 0)
+        flags.columnconfigure(0, weight=1)
+        flags.columnconfigure(1, weight=1)
+        _compile_check = ttk.Checkbutton(flags, text="Enable Torch Compile", variable=compile_var)
+        _compile_check.grid(row=0, column=0, sticky="w")
+        _tf32_check = ttk.Checkbutton(flags, text="Enable Allow TF32", variable=tf32_var)
+        _tf32_check.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        _cudnn_check = ttk.Checkbutton(flags, text="Enable cuDNN Benchmark", variable=cudnn_var)
+        _cudnn_check.grid(row=2, column=1, sticky="w", pady=(6, 0), padx=(12, 0))
+        _fp8_check = ttk.Checkbutton(flags, text="Enable FP8 (Low VRAM)", variable=fp8_var)
+        _fp8_check.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        _sdxl_grad_ckpt_check = ttk.Checkbutton(
+            flags,
+            text="Enable SDXL Gradient Checkpointing (Lower VRAM, slower)",
+            variable=sdxl_grad_ckpt_var,
         )
+        _sdxl_grad_ckpt_check.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        _gc_check = ttk.Checkbutton(flags, text="Enable CPU Offload for Checkpointing (Very low VRAM)", variable=gc_var)
+        _gc_check.grid(row=1, column=1, sticky="w", pady=(6, 0), padx=(12, 0))
+
+        attach_hover_tooltip(
+            _sdxl_grad_ckpt_check,
+            (
+                "SD-Scripts SDXL only. Reduces VRAM use by recomputing activations during backward pass.\n"
+                "Usually slower per step; disable on high-VRAM GPUs for higher throughput."
+            ),
+        )
+        attach_hover_tooltip(
+            _gc_check,
+            (
+                "Offloads gradient-checkpointing state to CPU for extra memory savings.\n"
+                "Can be significantly slower and may increase host RAM / PCIe traffic."
+            ),
+        )
+        _sd_scripts_hidden_widgets: list[tk.Widget] = [
+            _blocks_to_swap_label,
+            _blocks_to_swap_entry,
+            _timestep_sampling_label,
+            _timestep_sampling_combo,
+            _tf32_check,
+            _cudnn_check,
+        ]
+        _sd_scripts_only_widgets: list[tk.Widget] = [
+            _sdxl_grad_ckpt_check,
+        ]
+        _advanced_state_specs: list[tuple[tk.Widget, str]] = [(_lr_scheduler_combo, "readonly"), (_lr_warmup_entry, "normal"), (_grad_accum_entry, "normal")]
+        _flags_state_specs: list[tuple[tk.Widget, str]] = [(_compile_check, "normal"), (_fp8_check, "normal"), (_sdxl_grad_ckpt_check, "normal"), (_gc_check, "normal"), (_tf32_check, "normal"), (_cudnn_check, "normal")]
+
+        def _sync_backend_specific_controls() -> None:
+            model_name = model_var.get().strip()
+            is_sd_scripts = backend_kind_for_model(model_name) == "sd-scripts"
+
+            for widget, enabled_state in _advanced_state_specs:
+                widget.configure(state=enabled_state)
+            for widget, enabled_state in _flags_state_specs:
+                widget.configure(state=enabled_state)
+
+            for widget in _sd_scripts_hidden_widgets:
+                if is_sd_scripts:
+                    widget.grid_remove()
+                else:
+                    widget.grid()
+
+            for widget in _sd_scripts_only_widgets:
+                if is_sd_scripts:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
 
         def sync_optimizer_controls() -> None:
             optimizer_value = train_optimizer_var.get().strip().lower()
@@ -6340,6 +6446,7 @@ def launch_ui() -> int:
         def _sync_model_specific_controls() -> None:
             model_name = model_var.get().strip()
             is_ltx = _model_to_family.get(model_name, "") == "LTX"
+            is_sd_scripts = backend_kind_for_model(model_name) == "sd-scripts"
             if is_ltx:
                 model_specific.grid()
                 ltx_specific_frame.grid()
@@ -6349,8 +6456,17 @@ def launch_ui() -> int:
                 if ltx_lora_target_preset_var.get().strip() not in _ltx_image_lora_target_choices:
                     ltx_lora_target_preset_var.set("full")
             else:
-                model_specific.grid_remove()
                 ltx_specific_frame.grid_remove()
+
+            if is_sd_scripts:
+                model_specific.grid()
+                sd_scripts_specific_frame.grid()
+            else:
+                sd_scripts_specific_frame.grid_remove()
+
+            if not is_ltx and not is_sd_scripts:
+                model_specific.grid_remove()
+            _sync_backend_specific_controls()
             _fit_create_job_dialog_to_content()
 
         train_optimizer_var.trace_add("write", lambda *_args: sync_optimizer_controls())
@@ -6396,6 +6512,22 @@ def launch_ui() -> int:
                 train_resolution_var.set("1920" if is_ltx else _saved_res_str)
 
         _family_default_profiles: dict[str, dict[str, str]] = {
+            "SDXL": {
+                "optimizer_type": "prodigy",
+                "optimizer_args": DEFAULT_PRODIGY_OPTIMIZER_ARGS,
+                "learning_rate": DEFAULT_LEARNING_RATE,
+                "train_steps": str(DEFAULT_TRAIN_STEPS),
+                "save_every_n_steps": _default_save_every_from_settings,
+                "network_dim": str(DEFAULT_NETWORK_DIM),
+                "network_alpha": str(DEFAULT_NETWORK_ALPHA),
+                "lr_scheduler": "constant_with_warmup",
+                "lr_warmup_steps": "100",
+                "gradient_accumulation_steps": "1",
+                "blocks_to_swap": "0",
+                "timestep_sampling": "sigma",
+                "resolution": "1024",
+                "batch_size": "1",
+            },
             "FLUX.2": {
                 "optimizer_type": "prodigy",
                 "optimizer_args": DEFAULT_PRODIGY_OPTIMIZER_ARGS,
@@ -6565,6 +6697,55 @@ def launch_ui() -> int:
 
         # dataset_entries: list of {"name", "num_repeats_var", "frame"}
         dataset_entries: list[dict] = []
+        dataset_image_count_cache: dict[str, int] = {}
+        estimated_epochs_var = tk.StringVar(value="Est. epochs: n/a")
+
+        def _dataset_image_count(name: str) -> int:
+            cached = dataset_image_count_cache.get(name)
+            if cached is not None:
+                return cached
+            count = len(dataset_image_files(datasets_root_dir(), name))
+            dataset_image_count_cache[name] = count
+            return count
+
+        def _refresh_estimated_epochs() -> None:
+            try:
+                steps_value = int(train_steps_var.get().strip())
+                batch_value = int(train_batch_var.get().strip())
+                grad_accum_value = int(gradient_accumulation_steps_var.get().strip())
+            except ValueError:
+                estimated_epochs_var.set("Est. epochs: n/a")
+                return
+
+            if steps_value <= 0 or batch_value <= 0 or grad_accum_value <= 0:
+                estimated_epochs_var.set("Est. epochs: n/a")
+                return
+
+            total_images = 0
+            effective_samples = 0
+            for entry in dataset_entries:
+                try:
+                    repeats = int(entry["num_repeats_var"].get().strip())
+                except ValueError:
+                    estimated_epochs_var.set("Est. epochs: n/a")
+                    return
+                if repeats <= 0:
+                    estimated_epochs_var.set("Est. epochs: n/a")
+                    return
+                image_count = _dataset_image_count(entry["name"])
+                total_images += image_count
+                effective_samples += image_count * repeats
+
+            if effective_samples <= 0:
+                estimated_epochs_var.set("Est. epochs: n/a (no images)")
+                return
+
+            denom = batch_value * grad_accum_value
+            steps_per_epoch = max(1, (effective_samples + denom - 1) // denom)
+            epochs_value = steps_value / steps_per_epoch
+            estimated_epochs_var.set(
+                f"Est. epochs: {epochs_value:.2f} (img: {total_images}, repeated: {effective_samples}, eff batch: {denom}, steps/epoch: {steps_per_epoch})"
+            )
 
         def _rebuild_ds_rows() -> None:
             for child in ds_inner.winfo_children():
@@ -6588,10 +6769,13 @@ def launch_ui() -> int:
                     dataset_entries.remove(e)
                     _rebuild_ds_rows()
                     _refresh_add_combo()
+                    _refresh_estimated_epochs()
 
                 ttk.Button(row_frame, text="✕", style="QueueAction.TButton", command=_make_remove, width=2).grid(
                     row=0, column=3, sticky="e"
                 )
+
+            _refresh_estimated_epochs()
 
         def _available_datasets() -> list[str]:
             return sorted(scan_training_folders(datasets_root_dir()), key=str.casefold)
@@ -6607,7 +6791,9 @@ def launch_ui() -> int:
 
         # Populate from initial_datasets
         for _ds in initial_datasets:
-            dataset_entries.append({"name": _ds["name"], "num_repeats_var": tk.StringVar(value=str(_ds.get("num_repeats", 1))), "frame": None})
+            _repeats_var = tk.StringVar(value=str(_ds.get("num_repeats", 1)))
+            _repeats_var.trace_add("write", lambda *_args: _refresh_estimated_epochs())
+            dataset_entries.append({"name": _ds["name"], "num_repeats_var": _repeats_var, "frame": None})
         _rebuild_ds_rows()
 
         # Add dataset row
@@ -6623,11 +6809,18 @@ def launch_ui() -> int:
             name = add_combo.get().strip()
             if not name or any(e["name"] == name for e in dataset_entries):
                 return
-            dataset_entries.append({"name": name, "num_repeats_var": tk.StringVar(value="1"), "frame": None})
+            _repeats_var = tk.StringVar(value="1")
+            _repeats_var.trace_add("write", lambda *_args: _refresh_estimated_epochs())
+            dataset_entries.append({"name": name, "num_repeats_var": _repeats_var, "frame": None})
             _rebuild_ds_rows()
             _refresh_add_combo()
+            _refresh_estimated_epochs()
 
         ttk.Button(add_row, text="Add", command=_add_dataset).grid(row=0, column=2, sticky="w")
+        train_steps_var.trace_add("write", lambda *_args: _refresh_estimated_epochs())
+        train_batch_var.trace_add("write", lambda *_args: _refresh_estimated_epochs())
+        gradient_accumulation_steps_var.trace_add("write", lambda *_args: _refresh_estimated_epochs())
+        _refresh_estimated_epochs()
 
         # ── create_job / save ──────────────────────────────────────────────
         def create_job() -> None:
@@ -6732,6 +6925,24 @@ def launch_ui() -> int:
             except ValueError:
                 messagebox.showerror("Invalid value", "First-frame conditioning p must be a number between 0 and 1.", parent=dialog)
                 return
+
+            sd_unet_lr_value = sd_unet_lr_var.get().strip()
+            if sd_unet_lr_value:
+                try:
+                    if float(sd_unet_lr_value) <= 0:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showerror("Invalid value", "SD-Scripts U-Net LR must be a number greater than 0.", parent=dialog)
+                    return
+
+            sd_text_encoder_lr_value = sd_text_encoder_lr_var.get().strip()
+            if sd_text_encoder_lr_value:
+                try:
+                    if float(sd_text_encoder_lr_value) <= 0:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showerror("Invalid value", "SD-Scripts Text Encoder LR must be a number greater than 0.", parent=dialog)
+                    return
 
             # Validate and collect per-dataset config
             datasets_config: list[dict] = []
@@ -6843,11 +7054,14 @@ def launch_ui() -> int:
                 "timestep_sampling": timestep_sampling_value,
                 "ltx_lora_target_preset": ltx_lora_target_preset_value,
                 "ltx_first_frame_conditioning_p": str(ltx_first_frame_conditioning_p_value),
+                "sd_unet_lr": sd_unet_lr_value,
+                "sd_text_encoder_lr": sd_text_encoder_lr_value,
                 "enable_compile": bool_to_flag(compile_var.get()),
                 "enable_tf32": bool_to_flag(tf32_var.get()),
                 "enable_cudnn": bool_to_flag(cudnn_var.get()),
                 "enable_fp8": bool_to_flag(fp8_var.get()),
                 "enable_gc": bool_to_flag(gc_var.get()),
+                "enable_grad_ckpt": bool_to_flag(sdxl_grad_ckpt_var.get()),
                 "enable_logging": bool_to_flag(is_truthy(settings_state.get(TRAIN_ENABLE_LOGGING_KEY), default=True)),
                 "tracker_name": tracker_name,
                 "stream_output": bool_to_flag(is_truthy(settings_state.get(TRAIN_STREAM_TO_LOGGER_KEY), default=False)),
@@ -6900,9 +7114,11 @@ def launch_ui() -> int:
 
         # ── Footer buttons ─────────────────────────────────────────────────
         buttons = ttk.Frame(outer, padding=(0, 10, 0, 0))
-        buttons.grid(row=2, column=0, sticky="e")
-        ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(buttons, text="Save" if existing_job is not None else "Create Job", command=create_job).grid(row=0, column=1)
+        buttons.grid(row=2, column=0, sticky="ew")
+        buttons.columnconfigure(0, weight=1)
+        ttk.Label(buttons, textvariable=estimated_epochs_var, style="Dim.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(buttons, text="Save" if existing_job is not None else "Create Job", command=create_job).grid(row=0, column=2)
 
         _fit_create_job_dialog_to_content()
         center_window(dialog)
@@ -7331,17 +7547,41 @@ def launch_ui() -> int:
         update_start_button_state()
         model_error_popup_shown = False
 
+        def _compact_failure_summary(details: str) -> str:
+            text = (details or "").replace("\r\n", "\n").strip()
+            if not text:
+                return ""
+
+            # Keep only high-signal lines and never include raw command/path dumps.
+            compact_lines: list[str] = []
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+
+                lowered = line.lower()
+
+                # If this line reports a failed command, keep that one line and stop.
+                if lowered.startswith("details: command failed with exit code") or lowered.startswith("command failed with exit code"):
+                    compact_lines.append(line)
+                    break
+
+                # Skip explicit command/path lines from subprocess output.
+                if line.lower().startswith("command:"):
+                    continue
+                if ":\\" in line and (".py" in lowered or "python.exe" in lowered):
+                    continue
+                if line.startswith("--"):
+                    continue
+
+                compact_lines.append(line)
+                if len(compact_lines) >= 6:
+                    break
+
+            return "\n".join(compact_lines) if compact_lines else text.splitlines()[0].strip()
+
         def notify_job_failure_popup(job_name: str, details: str = "") -> None:
-            summary = (details or "").strip()
-            if summary:
-                summary = summary[:1200]
-                message = (
-                    f"Job '{job_name}' failed.\n\n"
-                    f"{summary}\n\n"
-                    "See queue log for full details."
-                )
-            else:
-                message = f"Job '{job_name}' failed.\n\nSee queue log for full details."
+            message = f"Job '{job_name}' failed.\n\nSee queue log for full details."
 
             def show_failure_popup() -> None:
                 if not root.winfo_exists():
@@ -7528,6 +7768,13 @@ def launch_ui() -> int:
                                     )
                                 except ValueError:
                                     run_job_kwargs["ltx_first_frame_conditioning_p"] = 0.1
+                            elif job_run_fn is _run_job_sdxl:
+                                run_job_kwargs["lr_scheduler"] = str(job.get("lr_scheduler", "constant") or "constant")
+                                run_job_kwargs["lr_warmup_steps"] = get_non_negative_int_setting(job, "lr_warmup_steps", 0)
+                                run_job_kwargs["gradient_accumulation_steps"] = get_positive_int_setting(job, "gradient_accumulation_steps", 1, minimum=1)
+                                run_job_kwargs["unet_lr"] = str(job.get("sd_unet_lr", "") or "")
+                                run_job_kwargs["text_encoder_lr"] = str(job.get("sd_text_encoder_lr", "") or "")
+                                run_job_kwargs["enable_gradient_checkpointing"] = flag_to_bool(job.get("enable_grad_ckpt", "1"))
 
                             exit_code = job_run_fn(job_runtime_config, **run_job_kwargs)
 
