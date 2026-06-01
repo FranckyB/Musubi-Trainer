@@ -300,7 +300,7 @@ class LoraMergeWindow:
             created_paths.append(output_path)
 
         if created_paths:
-            created_text = "\n".join(str(path) for path in created_paths)
+            created_text = "\n".join(path.stem if path.suffix.lower() == ".safetensors" else path.name for path in created_paths)
             self.messagebox.showinfo("Post-Hoc EMA merge complete", f"Created:\n{created_text}", parent=self.root)
 
         self.checkpoint_cache.pop(target_name, None)
@@ -726,7 +726,7 @@ class LoraMergeWindow:
                 if candidate.exists():
                     existing_outputs.append(candidate)
             if existing_outputs:
-                existing_text = "\n".join(str(path) for path in existing_outputs)
+                existing_text = "\n".join(path.stem if path.suffix.lower() == ".safetensors" else path.name for path in existing_outputs)
                 self.messagebox.showerror(
                     "Name already exists",
                     f"One or more output files already exist:\n{existing_text}\n\nChoose a different output name.",
@@ -804,7 +804,7 @@ class LoraMergeWindow:
                 self.log(f"[LoRA Post-Hoc EMA Merge] Created ({merge_mode_suffix} / {preset_name}): {output_path}")
                 created_paths.append(output_path)
 
-            created_text = "\n".join(str(path) for path in created_paths)
+            created_text = "\n".join(path.stem if path.suffix.lower() == ".safetensors" else path.name for path in created_paths)
             self.messagebox.showinfo("Merge complete", f"Created:\n{created_text}", parent=dialog)
 
         candidate_list.bind("<Double-Button-1>", on_candidate_double_click)

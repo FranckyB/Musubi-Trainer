@@ -3911,6 +3911,14 @@ def _launch_ui_impl() -> int:
 
             root.after(0, show_failure_popup)
 
+        def log_status(message: str) -> None:
+            # Mirror key lifecycle status lines to both the UI log and parent console.
+            log(message)
+            try:
+                print(message, flush=True)
+            except Exception:
+                pass
+
         def friendly_model_config_error(details: str) -> tuple[str, str] | None:
             text = (details or "").strip()
             lowered = text.lower()
@@ -4126,6 +4134,15 @@ def _launch_ui_impl() -> int:
 
                     root.after(0, mark_done)
 
+                    if exit_code == JOB_EXIT_SUCCESS:
+                        log_status(f"[Train] Completed: {job_name}")
+                    elif exit_code == JOB_EXIT_CANCELLED or (
+                        run_cancel_event is not None and run_cancel_event.is_set()
+                    ):
+                        log_status(f"[Train] Stopped: {job_name}")
+                    else:
+                        log_status(f"[Train] Failed: {job_name}")
+
                     if (
                         exit_code not in {JOB_EXIT_SUCCESS, JOB_EXIT_CANCELLED}
                         and not (run_cancel_event is not None and run_cancel_event.is_set())
@@ -4141,13 +4158,13 @@ def _launch_ui_impl() -> int:
                         refresh_ui_now_from_worker()
 
                 if run_cancel_event is not None and run_cancel_event.is_set():
-                    log("Queue cancelled by user.")
+                    log_status("Queue cancelled by user.")
                 elif failed_jobs:
-                    log(f"Queue completed with failures: {', '.join(failed_jobs)}")
+                    log_status(f"Queue completed with failures: {', '.join(failed_jobs)}")
                 else:
-                    log("Queue completed.")
+                    log_status("Queue completed.")
             except Exception as exc:
-                log(f"Queue failed unexpectedly: {exc}")
+                log_status(f"Queue failed unexpectedly: {exc}")
                 log(traceback.format_exc())
 
                 def show_unexpected_queue_failure_popup() -> None:
