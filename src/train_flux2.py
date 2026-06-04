@@ -11,6 +11,7 @@ from typing import Callable
 
 from .runtime_config import RuntimeConfig
 from .train_utils import (  # noqa: F401  (re-exported for backward compat)
+    clear_dataset_cache_directories,
     DEFAULT_LEARNING_RATE,
     DEFAULT_NETWORK_ALPHA,
     DEFAULT_NETWORK_DIM,
@@ -193,7 +194,8 @@ def run_steps_for_model(
     train_steps_override: int | None,
     output_name_override: str | None,
     output_dir_override: Path | None,
-    logger: Callable[[str], None],
+    generate_training_args_only: bool = False,
+    logger: Callable[[str], None] = print,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> None:
     def require_musubi_python() -> Path:
@@ -289,49 +291,48 @@ def run_steps_for_model(
             logger(f"  prep: dataset.toml {toml_status}, captions created {prep_result['created']}")
         logger("")
 
+    if do_cache_latents or do_cache_text:
+        cleared_cache_dirs = clear_dataset_cache_directories(dataset_config, logger)
+        if cleared_cache_dirs > 0:
+            plural = "y" if cleared_cache_dirs == 1 else "ies"
+            logger(f"  cache reset: cleared {cleared_cache_dirs} cache director{plural}")
+
     if do_cache_latents:
         check_cancel()
         current_step += 1
         logger(f"[{current_step}/{total_steps}]   Cache Latent:")
         vae_path = require_model_file(runtime_config.vae, "FLUX.2 VAE")
         vae_path = vae_path.resolve()
-        before_ready, before_total = count_latent_cache_ready(runtime_config.training_dir, model_name)
-        if before_total > 0 and before_ready == before_total:
-            logger(f"  cache_latents: already ready ({before_ready}/{before_total}), skipped")
-        else:
-            try:
-                run_command(
-                    [
-                        str(musubi_python),
-                        "flux_2_cache_latents.py",
-                        "--dataset_config",
-                        str(dataset_config),
-                        "--vae",
-                        str(vae_path),
-                        "--batch_size",
-                        "16",
-                        "--skip_existing",
-                        "--model_version",
-                        runtime_config.model_version,
-                    ],
-                    cwd=runtime_config.musubi_dir,
-                    cancel_requested=cancel_requested,
-                    logger=logger,
-                    stream_to_logger=stream_training_output,
-                    stream_mode="cache_progress",
-                )
-            except TrainingCancelledError:
-                raise
-            except Exception as exc:
-                raise RuntimeError(
-                    "FLUX.2 VAE appears invalid or incompatible for Flux2 caching.\n"
-                    "Open Settings and verify Settings > FLUX.2 > VAE points to the correct VAE checkpoint file.\n"
-                    f"Details: {exc}"
-                ) from exc
+        try:
+            run_command(
+                [
+                    str(musubi_python),
+                    "flux_2_cache_latents.py",
+                    "--dataset_config",
+                    str(dataset_config),
+                    "--vae",
+                    str(vae_path),
+                    "--batch_size",
+                    "16",
+                    "--model_version",
+                    runtime_config.model_version,
+                ],
+                cwd=runtime_config.musubi_dir,
+                cancel_requested=cancel_requested,
+                logger=logger,
+                stream_to_logger=stream_training_output,
+                stream_mode="cache_progress",
+            )
+        except TrainingCancelledError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                "FLUX.2 VAE appears invalid or incompatible for Flux2 caching.\n"
+                "Open Settings and verify Settings > FLUX.2 > VAE points to the correct VAE checkpoint file.\n"
+                f"Details: {exc}"
+            ) from exc
 
-            after_ready, after_total = count_latent_cache_ready(runtime_config.training_dir, model_name)
-            generated = max(0, after_ready - before_ready)
-            logger(f"  cache_latents: done ({after_ready}/{after_total} ready, +{generated} generated)")
+        logger("  cache_latents: done (full rebuild)")
         logger("")
 
     if do_cache_text:
@@ -341,43 +342,36 @@ def run_steps_for_model(
         text_encoder_path = resolve_text_encoder_file(runtime_config.text_encoder)
         text_encoder_path = text_encoder_path.resolve()
         logger(f"  text_encoder: {text_encoder_path}")
-        before_ready, before_total = count_text_cache_ready(runtime_config.training_dir, model_name)
-        if before_total > 0 and before_ready == before_total:
-            logger(f"  cache_text: already ready ({before_ready}/{before_total}), skipped")
-        else:
-            try:
-                run_command(
-                    [
-                        str(musubi_python),
-                        "flux_2_cache_text_encoder_outputs.py",
-                        "--dataset_config",
-                        str(dataset_config),
-                        "--text_encoder",
-                        str(text_encoder_path),
-                        "--batch_size",
-                        "16",
-                        "--skip_existing",
-                        "--model_version",
-                        runtime_config.model_version,
-                    ],
-                    cwd=runtime_config.musubi_dir,
-                    cancel_requested=cancel_requested,
-                    logger=logger,
-                    stream_to_logger=stream_training_output,
-                    stream_mode="cache_progress",
-                )
-            except TrainingCancelledError:
-                raise
-            except Exception as exc:
-                raise RuntimeError(
-                    "FLUX.2 Text Encoder appears invalid or incompatible for Flux2 text caching.\n"
-                    "Open Settings and verify Settings > FLUX.2 > Text Encoder points to the correct checkpoint.\n"
-                    f"Details: {exc}"
-                ) from exc
+        try:
+            run_command(
+                [
+                    str(musubi_python),
+                    "flux_2_cache_text_encoder_outputs.py",
+                    "--dataset_config",
+                    str(dataset_config),
+                    "--text_encoder",
+                    str(text_encoder_path),
+                    "--batch_size",
+                    "16",
+                    "--model_version",
+                    runtime_config.model_version,
+                ],
+                cwd=runtime_config.musubi_dir,
+                cancel_requested=cancel_requested,
+                logger=logger,
+                stream_to_logger=stream_training_output,
+                stream_mode="cache_progress",
+            )
+        except TrainingCancelledError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                "FLUX.2 Text Encoder appears invalid or incompatible for Flux2 text caching.\n"
+                "Open Settings and verify Settings > FLUX.2 > Text Encoder points to the correct checkpoint.\n"
+                f"Details: {exc}"
+            ) from exc
 
-            after_ready, after_total = count_text_cache_ready(runtime_config.training_dir, model_name)
-            generated = max(0, after_ready - before_ready)
-            logger(f"  cache_text: done ({after_ready}/{after_total} ready, +{generated} generated)")
+        logger("  cache_text: done (full rebuild)")
         logger("")
 
     if do_train:
@@ -487,33 +481,40 @@ def run_steps_for_model(
             optimizer_args_raw = (optimizer_args or "").strip()
             if optimizer_args_raw:
                 optimizer_args_values = [value for value in shlex.split(optimizer_args_raw) if value.strip()]
-        train_config_path = output_dir.parent / "train_config.toml"
-        config_lines: list[str] = [
+        train_config_path = output_dir.parent / "training_args.toml"
+        model_lines = [
             f"dit = {toml_quote(str(dit_path))}",
             f"vae = {toml_quote(str(vae_path))}",
             'vae_dtype = "bf16"',
             f"text_encoder = {toml_quote(str(text_encoder_path))}",
             f"model_version = {toml_quote(runtime_config.model_version)}",
-            f"optimizer_type = {toml_quote(optimizer_arg)}",
-            'timestep_sampling = "flux2_shift"',
+        ]
+        data_output_lines = [
             f"dataset_config = {toml_quote(str(dataset_config))}",
             f"output_dir = {toml_quote(str(output_dir))}",
             f"output_name = {toml_quote(output_name_for_run)}",
+        ]
+        network_lines = [
             'network_module = "networks.lora_flux_2"',
             f"network_dim = {network_dim}",
             f"network_alpha = {network_alpha}",
+        ]
+        optimization_lines = [
+            f"optimizer_type = {toml_quote(optimizer_arg)}",
             f"learning_rate = {learning_rate_for_run}",
+            'timestep_sampling = "flux2_shift"',
             f"max_train_steps = {train_steps_for_run}",
+        ]
+        if optimizer_args_values:
+            optimization_lines.append(f"optimizer_args = {toml_string_list(optimizer_args_values)}")
+
+        runtime_lines = [
             'mixed_precision = "bf16"',
             "sdpa = true",
             f"gradient_checkpointing = {'true' if gradient_checkpointing_enabled else 'false'}",
             f"gradient_checkpointing_cpu_offload = {'true' if gradient_checkpointing_cpu_offload_enabled else 'false'}",
             "persistent_data_loader_workers = true",
             "max_data_loader_n_workers = 2",
-            f"save_every_n_steps = {save_every_n_steps}",
-            "save_state = true",
-            "save_state_on_train_end = true",
-            "seed = 42",
             f"fp8_base = {'true' if enable_fp8_dit else 'false'}",
             f"fp8_scaled = {'true' if enable_fp8_dit else 'false'}",
             f"compile = {'true' if compile_enabled else 'false'}",
@@ -521,23 +522,60 @@ def run_steps_for_model(
             f"cuda_cudnn_benchmark = {'true' if (compile_enabled and enable_cuda_cudnn_benchmark) else 'false'}",
             f"compile_cache_size_limit = {32 if compile_enabled else 0}",
         ]
-        if optimizer_args_values:
-            config_lines.append(f"optimizer_args = {toml_string_list(optimizer_args_values)}")
+        checkpoint_lines = [
+            f"save_every_n_steps = {save_every_n_steps}",
+            "save_state = true",
+            "save_state_on_train_end = true",
+            "seed = 42",
+        ]
+
+        restore_lines: list[str] = []
+        if warmstart_checkpoint is not None:
+            restore_lines.append(f"network_weights = {toml_quote(str(warmstart_checkpoint))}")
+        if resume_state_dir is not None:
+            restore_lines.append(f"resume = {toml_quote(str(resume_state_dir))}")
+
+        logging_lines: list[str] = []
         if enable_training_logging:
-            config_lines.extend(
+            logging_lines.extend(
                 [
                     f"log_with = {toml_quote(log_backend)}",
                     f"logging_dir = {toml_quote(str(logging_dir))}",
                 ]
             )
             if tracker_name:
-                config_lines.append(f"log_tracker_name = {toml_quote(tracker_name)}")
-        if warmstart_checkpoint is not None:
-            config_lines.append(f"network_weights = {toml_quote(str(warmstart_checkpoint))}")
-        if resume_state_dir is not None:
-            config_lines.append(f"resume = {toml_quote(str(resume_state_dir))}")
+                logging_lines.append(f"log_tracker_name = {toml_quote(tracker_name)}")
 
-        train_config_path.write_text("\n".join(config_lines) + "\n", encoding="utf-8")
+        config_lines: list[str] = []
+        config_sections: list[tuple[str, list[str]]] = [
+            ("Model", model_lines),
+            ("Data and Output", data_output_lines),
+            ("Network", network_lines),
+            ("Optimization", optimization_lines),
+            ("Runtime", runtime_lines),
+            ("Checkpointing", checkpoint_lines),
+        ]
+        if restore_lines:
+            config_sections.append(("Resume and Warmstart", restore_lines))
+        if logging_lines:
+            config_sections.append(("Logging", logging_lines))
+
+        for section_name, section_lines in config_sections:
+            if config_lines:
+                config_lines.append("")
+            config_lines.append(f"# {section_name}")
+            config_lines.extend(section_lines)
+
+        if generate_training_args_only or not train_config_path.exists():
+            train_config_path.write_text("\n".join(config_lines) + "\n", encoding="utf-8")
+            logger(f"  training_args: {train_config_path}")
+        else:
+            logger(f"  training_args: {train_config_path} (using existing)")
+
+        if generate_training_args_only:
+            logger("  training args generated (no training launched)")
+            logger("")
+            return
 
         train_args = [
             str(musubi_python),
@@ -545,7 +583,6 @@ def run_steps_for_model(
             "--config_file",
             str(train_config_path),
         ]
-        logger(f"  train_config: {train_config_path}")
         logger(f"  train_command: {format_command_for_log(train_args)}")
         try:
             run_command(
@@ -763,6 +800,7 @@ def run_job(
     do_cache_latents: bool,
     do_cache_text: bool,
     do_train: bool,
+    generate_training_args_only: bool = False,
     save_every_n_steps: int = DEFAULT_SAVE_EVERY_N_STEPS,
     cancel_requested: Callable[[], bool] | None = None,
     on_error: Callable[[str], None] | None = None,
@@ -781,7 +819,7 @@ def run_job(
             on_error(message)
         return 1
 
-    if not (do_prep_dataset or do_cache_latents or do_cache_text or do_train):
+    if not (do_prep_dataset or do_cache_latents or do_cache_text or do_train or generate_training_args_only):
         message = "No steps selected. Select at least one step."
         logger(message)
         if on_error is not None:
@@ -804,7 +842,7 @@ def run_job(
     effective_warmstart_checkpoint: Path | None = None
     train_steps_override: int | None = None
 
-    if progress_step >= train_steps:
+    if progress_step >= train_steps and not generate_training_args_only:
         logger(f"Job already complete at step {progress_step}; nothing to run.")
         if auto_cleanup_states:
             cleanup_step_states_for_completed_output(output_dir_resolved, output_name_resolved, logger)
@@ -861,16 +899,19 @@ def run_job(
             do_prep_dataset=do_prep_dataset,
             do_cache_latents=do_cache_latents,
             do_cache_text=do_cache_text,
-            do_train=do_train,
+            do_train=(do_train or generate_training_args_only),
             resume_state_dir=effective_resume_state,
             resume_step_offset=resume_step_offset,
             warmstart_checkpoint=effective_warmstart_checkpoint,
             train_steps_override=train_steps_override,
             output_name_override=output_name,
             output_dir_override=output_dir,
+            generate_training_args_only=generate_training_args_only,
             logger=logger,
             cancel_requested=cancel_requested,
         )
+        if generate_training_args_only:
+            return JOB_EXIT_SUCCESS
         if effective_resume_state is not None and resume_step_offset > 0:
             remap_resume_artifacts_for_output(output_dir_resolved, output_name_resolved, resume_step_offset, logger)
         if auto_cleanup_states:

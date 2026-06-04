@@ -21,6 +21,8 @@ from typing import Callable
 
 from .runtime_config import RuntimeConfig
 from .train_utils import (
+    build_config_file_command,
+    clear_dataset_cache_directories,
     run_command,
     TrainingCancelledError,
     JOB_EXIT_SUCCESS,
@@ -44,6 +46,8 @@ from .train_utils import (
     write_recorded_completed_steps,
     next_dataset_log_run_dir,
     require_model_file,
+    toml_quote,
+    toml_string_list,
 )
 
 # model_name → --model_version value  (None = omit the flag entirely)
@@ -99,6 +103,7 @@ def run_steps_for_model(
     train_steps_override: int | None = None,
     output_name_override: str | None = None,
     output_dir_override: Path | None = None,
+    generate_training_args_only: bool = False,
     logger: Callable[[str], None] = print,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> None:
@@ -131,6 +136,12 @@ def run_steps_for_model(
             "Run Step 1 (Prepare Dataset) first."
         )
 
+    if do_cache_latents or do_cache_text:
+        cleared_cache_dirs = clear_dataset_cache_directories(dataset_config, logger)
+        if cleared_cache_dirs > 0:
+            plural = "y" if cleared_cache_dirs == 1 else "ies"
+            logger(f"  cache reset: cleared {cleared_cache_dirs} cache director{plural}")
+
     # ── Resolve model paths ─────────────────────────────────────────────────
     dit_path = require_model_file(runtime_config.dit, "Qwen-Image DiT")
     vae_path = require_model_file(runtime_config.vae, "Qwen-Image VAE")
@@ -146,7 +157,6 @@ def run_steps_for_model(
             "qwen_image_cache_latents.py",
             "--dataset_config", str(dataset_config),
             "--vae", str(vae_path),
-            "--skip_existing",
         ] + version_flags
         logger(f"  command: {format_command_for_log(cache_latents_args)}")
         try:
@@ -178,7 +188,6 @@ def run_steps_for_model(
             "qwen_image_cache_text_encoder_outputs.py",
             "--dataset_config", str(dataset_config),
             "--text_encoder", str(text_encoder_path),
-            "--skip_existing",
         ] + version_flags
         logger(f"  command: {format_command_for_log(cache_text_args)}")
         try:
@@ -206,54 +215,40 @@ def run_steps_for_model(
         if cancel_requested and cancel_requested():
             raise TrainingCancelledError
 
-        logging_flags: list[str] = []
+        log_backend = "tensorboard"
+        logging_dir: Path | None = None
+        tracker_name = ""
         if enable_training_logging:
             log_backend = training_log_backend.strip().lower() or "tensorboard"
             logging_dir, auto_tracker_name = next_dataset_log_run_dir(training_dir, model_name)
-            logging_flags.extend(["--log_with", log_backend, "--logging_dir", str(logging_dir)])
             tracker_name = training_log_tracker_name.strip() or auto_tracker_name
-            if tracker_name:
-                logging_flags.extend(["--log_tracker_name", tracker_name])
 
         optimizer_key = (optimizer_type or "adamw8bit").strip().lower()
         optimizer_arg = "prodigyopt.Prodigy" if optimizer_key == "prodigy" else (optimizer_type or "adamw8bit").strip()
         learning_rate_for_run = "1" if optimizer_key == "prodigy" else learning_rate
 
-        train_args = [
-            str(musubi_python),
-            "qwen_image_train_network.py",
-            "--dit", str(dit_path),
-            "--vae", str(vae_path),
-            "--text_encoder", str(text_encoder_path),
-            "--network_dim", str(network_dim),
-            "--network_alpha", str(network_alpha),
-            "--dataset_config", str(dataset_config),
-            "--output_dir", str(output_dir),
-            "--output_name", output_name,
-            "--optimizer_type", optimizer_arg,
-            "--learning_rate", learning_rate_for_run,
-            "--max_train_steps", str(train_steps_for_run),
-            "--mixed_precision", "bf16",
-            "--sdpa",
-            "--gradient_checkpointing",
-            "--save_every_n_steps", str(save_every_n_steps),
-            "--save_state",
-            "--save_state_on_train_end",
-            "--seed", "42",
-        ] + version_flags
-        if enable_fp8_dit:
-            train_args += ["--fp8_base", "--fp8_scaled"]
-        if enable_gradient_checkpointing_cpu_offload:
-            train_args.append("--gradient_checkpointing_cpu_offload")
         compile_enabled = bool(enable_compile_optimizations and not enable_fp8_dit)
         if enable_compile_optimizations and enable_fp8_dit:
             logger("  compile note: ignoring --compile because FP8 is enabled")
-        if compile_enabled:
-            train_args.append("--compile")
-            if enable_cuda_allow_tf32:
-                train_args.append("--cuda_allow_tf32")
-            if enable_cuda_cudnn_benchmark:
-                train_args.append("--cuda_cudnn_benchmark")
+
+        model_lines = [
+            f"dit = {toml_quote(str(dit_path))}",
+            f"vae = {toml_quote(str(vae_path))}",
+            f"text_encoder = {toml_quote(str(text_encoder_path))}",
+        ]
+        if qwen_version:
+            model_lines.append(f"model_version = {toml_quote(qwen_version)}")
+
+        data_output_lines = [
+            f"dataset_config = {toml_quote(str(dataset_config))}",
+            f"output_dir = {toml_quote(str(output_dir))}",
+            f"output_name = {toml_quote(output_name)}",
+        ]
+        network_lines = [
+            f"network_dim = {network_dim}",
+            f"network_alpha = {network_alpha}",
+        ]
+
         optimizer_args_values: list[str] = []
         if optimizer_key == "prodigy":
             optimizer_args_values = [
@@ -265,33 +260,100 @@ def run_steps_for_model(
             optimizer_args_raw = (optimizer_args or "").strip()
             if optimizer_args_raw:
                 optimizer_args_values = [value for value in shlex.split(optimizer_args_raw) if value.strip()]
-        if optimizer_args_values:
-            train_args += ["--optimizer_args", *optimizer_args_values]
-        if warmstart_checkpoint is not None:
-            train_args += ["--network_weights", str(warmstart_checkpoint)]
-        if resume_state_dir is not None:
-            train_args += ["--resume", str(resume_state_dir)]
-        train_args.extend(logging_flags)
 
-        logger(f"  command: {format_command_for_log(train_args)}")
-        try:
-            run_command(
-                train_args,
-                cwd=musubi_dir,
-                cancel_requested=cancel_requested,
-                logger=logger,
-                stream_to_logger=stream_training_output,
-                stream_mode="plain",
-                inherit_io=not stream_training_output,
+        optimization_lines = [
+            f"optimizer_type = {toml_quote(optimizer_arg)}",
+            f"learning_rate = {learning_rate_for_run}",
+            f"max_train_steps = {train_steps_for_run}",
+        ]
+        if optimizer_args_values:
+            optimization_lines.append(f"optimizer_args = {toml_string_list(optimizer_args_values)}")
+
+        runtime_lines = [
+            'mixed_precision = "bf16"',
+            "sdpa = true",
+            "gradient_checkpointing = true",
+            f"gradient_checkpointing_cpu_offload = {'true' if enable_gradient_checkpointing_cpu_offload else 'false'}",
+            f"fp8_base = {'true' if enable_fp8_dit else 'false'}",
+            f"fp8_scaled = {'true' if enable_fp8_dit else 'false'}",
+            f"compile = {'true' if compile_enabled else 'false'}",
+            f"cuda_allow_tf32 = {'true' if (compile_enabled and enable_cuda_allow_tf32) else 'false'}",
+            f"cuda_cudnn_benchmark = {'true' if (compile_enabled and enable_cuda_cudnn_benchmark) else 'false'}",
+        ]
+        checkpoint_lines = [
+            f"save_every_n_steps = {save_every_n_steps}",
+            "save_state = true",
+            "save_state_on_train_end = true",
+            "seed = 42",
+        ]
+
+        restore_lines: list[str] = []
+        if warmstart_checkpoint is not None:
+            restore_lines.append(f"network_weights = {toml_quote(str(warmstart_checkpoint))}")
+        if resume_state_dir is not None:
+            restore_lines.append(f"resume = {toml_quote(str(resume_state_dir))}")
+
+        logging_lines: list[str] = []
+        if enable_training_logging and logging_dir is not None:
+            logging_lines.extend(
+                [
+                    f"log_with = {toml_quote(log_backend)}",
+                    f"logging_dir = {toml_quote(str(logging_dir))}",
+                ]
             )
-        except TrainingCancelledError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(
-                f"Training launch failed for Qwen-Image ({model_name}).\n"
-                "Verify Settings > Qwen-Image > DiT, VAE, and Text Encoder paths.\n"
-                f"Details: {exc}"
-            ) from exc
+            if tracker_name:
+                logging_lines.append(f"log_tracker_name = {toml_quote(tracker_name)}")
+
+        config_lines: list[str] = []
+        config_sections: list[tuple[str, list[str]]] = [
+            ("Model", model_lines),
+            ("Data and Output", data_output_lines),
+            ("Network", network_lines),
+            ("Optimization", optimization_lines),
+            ("Runtime", runtime_lines),
+            ("Checkpointing", checkpoint_lines),
+        ]
+        if restore_lines:
+            config_sections.append(("Resume and Warmstart", restore_lines))
+        if logging_lines:
+            config_sections.append(("Logging", logging_lines))
+
+        for section_name, section_lines in config_sections:
+            if config_lines:
+                config_lines.append("")
+            config_lines.append(f"# {section_name}")
+            config_lines.extend(section_lines)
+
+        train_config_path = output_dir.parent / "training_args.toml"
+        if generate_training_args_only or not train_config_path.exists():
+            train_config_path.write_text("\n".join(config_lines) + "\n", encoding="utf-8")
+            logger(f"  training_args: {train_config_path}")
+        else:
+            logger(f"  training_args: {train_config_path} (using existing)")
+
+        if generate_training_args_only:
+            logger("  training args generated (no training launched)")
+        else:
+            launch_args = build_config_file_command(musubi_python, "qwen_image_train_network.py", train_config_path)
+            logger(f"  command: {format_command_for_log(launch_args)}")
+            try:
+                run_command(
+                launch_args,
+                    cwd=musubi_dir,
+                    cancel_requested=cancel_requested,
+                    logger=logger,
+                    stream_to_logger=stream_training_output,
+                    stream_mode="plain",
+                    inherit_io=not stream_training_output,
+                )
+            except TrainingCancelledError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Training launch failed for Qwen-Image ({model_name}).\n"
+                    "Verify Settings > Qwen-Image > DiT, VAE, and Text Encoder paths.\n"
+                    f"Details: {exc}"
+                ) from exc
 
     logger("")
 
@@ -329,6 +391,7 @@ def run_job(
     do_cache_latents: bool,
     do_cache_text: bool,
     do_train: bool,
+    generate_training_args_only: bool = False,
     save_every_n_steps: int = DEFAULT_SAVE_EVERY_N_STEPS,
     cancel_requested: Callable[[], bool] | None = None,
     on_error: Callable[[str], None] | None = None,
@@ -347,7 +410,7 @@ def run_job(
             on_error(message)
         return JOB_EXIT_FAILED
 
-    if not (do_prep_dataset or do_cache_latents or do_cache_text or do_train):
+    if not (do_prep_dataset or do_cache_latents or do_cache_text or do_train or generate_training_args_only):
         message = "No steps selected."
         logger(message)
         if on_error:
@@ -368,7 +431,7 @@ def run_job(
     effective_warmstart_checkpoint: Path | None = None
     train_steps_override: int | None = None
 
-    if progress_step >= train_steps:
+    if progress_step >= train_steps and not generate_training_args_only:
         logger(f"Job already complete at step {progress_step}; nothing to run.")
         if auto_cleanup_states:
             cleanup_step_states_for_completed_output(output_dir_resolved, output_name_resolved, logger)
@@ -414,7 +477,8 @@ def run_job(
             do_prep_dataset=do_prep_dataset,
             do_cache_latents=do_cache_latents,
             do_cache_text=do_cache_text,
-            do_train=do_train,
+            do_train=(do_train or generate_training_args_only),
+            generate_training_args_only=generate_training_args_only,
             resume_state_dir=effective_resume_state,
             resume_step_offset=resume_step_offset,
             warmstart_checkpoint=effective_warmstart_checkpoint,
@@ -424,6 +488,8 @@ def run_job(
             logger=logger,
             cancel_requested=cancel_requested,
         )
+        if generate_training_args_only:
+            return JOB_EXIT_SUCCESS
         if effective_resume_state is not None and resume_step_offset > 0:
             remap_resume_artifacts_for_output(output_dir_resolved, output_name_resolved, resume_step_offset, logger)
         if auto_cleanup_states:

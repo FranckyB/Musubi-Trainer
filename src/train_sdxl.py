@@ -15,6 +15,8 @@ from typing import Callable
 
 from .runtime_config import RuntimeConfig
 from .train_utils import (
+    build_config_file_command,
+    clear_dataset_cache_directories,
     run_command,
     TrainingCancelledError,
     JOB_EXIT_SUCCESS,
@@ -169,6 +171,7 @@ def run_steps_for_model(
     train_steps_override: int | None = None,
     output_name_override: str | None = None,
     output_dir_override: Path | None = None,
+    generate_training_args_only: bool = False,
     logger: Callable[[str], None] = print,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> None:
@@ -202,6 +205,12 @@ def run_steps_for_model(
             "Run Step 1 (Prepare Dataset) first."
         )
 
+    if do_cache_latents or do_cache_text:
+        cleared_cache_dirs = clear_dataset_cache_directories(dataset_config, logger)
+        if cleared_cache_dirs > 0:
+            plural = "y" if cleared_cache_dirs == 1 else "ies"
+            logger(f"  cache reset: cleared {cleared_cache_dirs} cache director{plural}")
+
     dataset_config_for_sd = _sd_scripts_dataset_config(dataset_config, logger)
 
     # Resolve model paths
@@ -223,7 +232,6 @@ def run_steps_for_model(
             "--dataset_config", str(dataset_config_for_sd),
             "--pretrained_model_name_or_path", str(sdxl_base),
             "--sdxl",
-            "--skip_cache_check",
             "--no_half_vae",
         ]
         if vae_override is not None:
@@ -262,7 +270,6 @@ def run_steps_for_model(
             "--dataset_config", str(dataset_config_for_sd),
             "--pretrained_model_name_or_path", str(sdxl_base),
             "--sdxl",
-            "--skip_cache_check",
         ]
 
         logger(f"  command: {format_command_for_log(cache_text_args)}")
@@ -291,14 +298,13 @@ def run_steps_for_model(
         if cancel_requested and cancel_requested():
             raise TrainingCancelledError
 
-        logging_flags: list[str] = []
+        log_backend = "tensorboard"
+        logging_dir: Path | None = None
+        tracker_name = ""
         if enable_training_logging:
             log_backend = training_log_backend.strip().lower() or "tensorboard"
             logging_dir, auto_tracker_name = next_dataset_log_run_dir(training_dir, model_name)
-            logging_flags.extend(["--log_with", log_backend, "--logging_dir", str(logging_dir)])
             tracker_name = training_log_tracker_name.strip() or auto_tracker_name
-            if tracker_name:
-                logging_flags.extend(["--log_tracker_name", tracker_name])
 
         optimizer_key = (optimizer_type or "adamw8bit").strip().lower()
         optimizer_arg = "Prodigy" if optimizer_key == "prodigy" else (optimizer_type or "adamw8bit").strip()
@@ -309,84 +315,131 @@ def run_steps_for_model(
             logger("  lr_warmup_steps is ignored for constant scheduler; forcing to 0")
             warmup_steps = 0
 
-        train_args = [
-            str(musubi_python),
-            "sdxl_train_network.py",
-            "--pretrained_model_name_or_path", str(sdxl_base),
-            "--dataset_config", str(dataset_config_for_sd),
-            "--output_dir", str(output_dir),
-            "--output_name", output_name,
-            "--network_module", "networks.lora",
-            "--network_dim", str(network_dim),
-            "--network_alpha", str(network_alpha),
-            "--optimizer_type", optimizer_arg,
-            "--learning_rate", learning_rate_for_run,
-            "--lr_scheduler", scheduler_key,
-            "--lr_warmup_steps", str(warmup_steps),
-            "--gradient_accumulation_steps", str(max(1, int(gradient_accumulation_steps))),
-            "--max_train_steps", str(train_steps_for_run),
-            "--persistent_data_loader_workers",
-            "--save_every_n_steps", str(save_every_n_steps),
-            "--mixed_precision", "bf16",
-            "--sdpa",
-            "--cache_latents",
-            "--cache_text_encoder_outputs",
-            "--cache_text_encoder_outputs_to_disk",
-            "--network_train_unet_only",
-            "--save_state",
-            "--save_state_on_train_end",
-            "--seed", "42",
+        model_lines = [
+            f"pretrained_model_name_or_path = {_toml_scalar(str(sdxl_base))}",
         ]
-        if enable_gradient_checkpointing:
-            train_args.append("--gradient_checkpointing")
         if vae_override is not None:
-            train_args += ["--vae", str(vae_override)]
+            model_lines.append(f"vae = {_toml_scalar(str(vae_override))}")
 
-        if enable_compile_optimizations:
-            train_args.append("--torch_compile")
-        if enable_fp8_dit:
-            train_args.append("--fp8_base_unet")
-        if enable_gradient_checkpointing_cpu_offload:
-            train_args.append("--cpu_offload_checkpointing")
+        data_output_lines = [
+            f"dataset_config = {_toml_scalar(str(dataset_config_for_sd))}",
+            f"output_dir = {_toml_scalar(str(output_dir))}",
+            f"output_name = {_toml_scalar(output_name)}",
+        ]
+        network_lines = [
+            'network_module = "networks.lora"',
+            f"network_dim = {network_dim}",
+            f"network_alpha = {network_alpha}",
+            "network_train_unet_only = true",
+        ]
+        optimization_lines = [
+            f"optimizer_type = {_toml_scalar(optimizer_arg)}",
+            f"learning_rate = {learning_rate_for_run}",
+            f"lr_scheduler = {_toml_scalar(scheduler_key)}",
+            f"lr_warmup_steps = {warmup_steps}",
+            f"gradient_accumulation_steps = {max(1, int(gradient_accumulation_steps))}",
+            f"max_train_steps = {train_steps_for_run}",
+        ]
+
         if enable_cuda_allow_tf32 or enable_cuda_cudnn_benchmark:
             logger("  cuda tuning note: sd-scripts SDXL path does not expose tf32/cudnn flags here; using script defaults")
 
         if optimizer_args.strip():
             parsed = shlex.split(optimizer_args)
             if parsed:
-                train_args += ["--optimizer_args", *parsed]
+                optimization_lines.append(f"optimizer_args = {_toml_list(parsed)}")
 
         if unet_lr.strip():
-            train_args += ["--unet_lr", unet_lr.strip()]
+            optimization_lines.append(f"unet_lr = {_toml_scalar(unet_lr.strip())}")
         if text_encoder_lr.strip():
-            train_args += ["--text_encoder_lr", text_encoder_lr.strip()]
+            optimization_lines.append(f"text_encoder_lr = {_toml_scalar(text_encoder_lr.strip())}")
 
+        runtime_lines = [
+            'mixed_precision = "bf16"',
+            "sdpa = true",
+            "cache_latents = true",
+            "cache_text_encoder_outputs = true",
+            "cache_text_encoder_outputs_to_disk = true",
+            f"gradient_checkpointing = {'true' if enable_gradient_checkpointing else 'false'}",
+            f"cpu_offload_checkpointing = {'true' if enable_gradient_checkpointing_cpu_offload else 'false'}",
+            f"torch_compile = {'true' if enable_compile_optimizations else 'false'}",
+            f"fp8_base_unet = {'true' if enable_fp8_dit else 'false'}",
+            "persistent_data_loader_workers = true",
+        ]
+        checkpoint_lines = [
+            f"save_every_n_steps = {save_every_n_steps}",
+            "save_state = true",
+            "save_state_on_train_end = true",
+            "seed = 42",
+        ]
+
+        restore_lines: list[str] = []
         if resume_state_dir is not None:
-            train_args += ["--resume", str(resume_state_dir)]
+            restore_lines.append(f"resume = {_toml_scalar(str(resume_state_dir))}")
         if warmstart_checkpoint is not None:
-            train_args += ["--network_weights", str(warmstart_checkpoint)]
+            restore_lines.append(f"network_weights = {_toml_scalar(str(warmstart_checkpoint))}")
 
-        train_args += logging_flags
-
-        logger(f"  command: {format_command_for_log(train_args)}")
-        try:
-            run_command(
-                train_args,
-                cwd=backend_dir,
-                cancel_requested=cancel_requested,
-                logger=logger,
-                stream_to_logger=stream_training_output,
-                stream_mode="train_progress",
-                inherit_io=not stream_training_output,
+        logging_lines: list[str] = []
+        if enable_training_logging and logging_dir is not None:
+            logging_lines.extend(
+                [
+                    f"log_with = {_toml_scalar(log_backend)}",
+                    f"logging_dir = {_toml_scalar(str(logging_dir))}",
+                ]
             )
-        except TrainingCancelledError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(
-                f"Training launch failed for {model_label}.\n"
-                "Verify SDXL-family model paths in Settings.\n"
-                f"Details: {exc}"
-            ) from exc
+            if tracker_name:
+                logging_lines.append(f"log_tracker_name = {_toml_scalar(tracker_name)}")
+
+        config_lines: list[str] = []
+        config_sections: list[tuple[str, list[str]]] = [
+            ("Model", model_lines),
+            ("Data and Output", data_output_lines),
+            ("Network", network_lines),
+            ("Optimization", optimization_lines),
+            ("Runtime", runtime_lines),
+            ("Checkpointing", checkpoint_lines),
+        ]
+        if restore_lines:
+            config_sections.append(("Resume and Warmstart", restore_lines))
+        if logging_lines:
+            config_sections.append(("Logging", logging_lines))
+
+        for section_name, section_lines in config_sections:
+            if config_lines:
+                config_lines.append("")
+            config_lines.append(f"# {section_name}")
+            config_lines.extend(section_lines)
+
+        train_config_path = output_dir.parent / "training_args.toml"
+        if generate_training_args_only or not train_config_path.exists():
+            train_config_path.write_text("\n".join(config_lines) + "\n", encoding="utf-8")
+            logger(f"  training_args: {train_config_path}")
+        else:
+            logger(f"  training_args: {train_config_path} (using existing)")
+
+        if generate_training_args_only:
+            logger("  training args generated (no training launched)")
+        else:
+            launch_args = build_config_file_command(musubi_python, "sdxl_train_network.py", train_config_path)
+            logger(f"  command: {format_command_for_log(launch_args)}")
+            try:
+                run_command(
+                launch_args,
+                    cwd=backend_dir,
+                    cancel_requested=cancel_requested,
+                    logger=logger,
+                    stream_to_logger=stream_training_output,
+                    stream_mode="train_progress",
+                    inherit_io=not stream_training_output,
+                )
+            except TrainingCancelledError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Training launch failed for {model_label}.\n"
+                    "Verify SDXL-family model paths in Settings.\n"
+                    f"Details: {exc}"
+                ) from exc
 
     logger("")
 
@@ -425,6 +478,7 @@ def run_job(
     do_cache_latents: bool,
     do_cache_text: bool,
     do_train: bool,
+    generate_training_args_only: bool = False,
     save_every_n_steps: int = DEFAULT_SAVE_EVERY_N_STEPS,
     cancel_requested: Callable[[], bool] | None = None,
     on_error: Callable[[str], None] | None = None,
@@ -443,7 +497,7 @@ def run_job(
             on_error(message)
         return JOB_EXIT_FAILED
 
-    if not (do_prep_dataset or do_cache_latents or do_cache_text or do_train):
+    if not (do_prep_dataset or do_cache_latents or do_cache_text or do_train or generate_training_args_only):
         message = "No steps selected."
         logger(message)
         if on_error:
@@ -464,7 +518,7 @@ def run_job(
     effective_warmstart_checkpoint: Path | None = None
     train_steps_override: int | None = None
 
-    if progress_step >= train_steps:
+    if progress_step >= train_steps and not generate_training_args_only:
         logger(f"Job already complete at step {progress_step}; nothing to run.")
         if auto_cleanup_states:
             cleanup_step_states_for_completed_output(output_dir_resolved, output_name_resolved, logger)
@@ -516,7 +570,8 @@ def run_job(
             do_prep_dataset=do_prep_dataset,
             do_cache_latents=do_cache_latents,
             do_cache_text=do_cache_text,
-            do_train=do_train,
+            do_train=(do_train or generate_training_args_only),
+            generate_training_args_only=generate_training_args_only,
             resume_state_dir=effective_resume_state,
             resume_step_offset=resume_step_offset,
             warmstart_checkpoint=effective_warmstart_checkpoint,
@@ -526,6 +581,8 @@ def run_job(
             logger=logger,
             cancel_requested=cancel_requested,
         )
+        if generate_training_args_only:
+            return JOB_EXIT_SUCCESS
         if effective_resume_state is not None and resume_step_offset > 0:
             remap_resume_artifacts_for_output(output_dir_resolved, output_name_resolved, resume_step_offset, logger)
         if auto_cleanup_states:

@@ -454,7 +454,7 @@ COMPONENT_FRIENDLY_NAMES: dict[str, str] = {
     "klein-4b":     "Klein 4B DiT",
     # LTX
     "ltx-2.3":      "LTX-2.3 Checkpoint",
-    "gemma3-12b":   "Gemma 3 12B Text Encoder (FP8)",
+    "gemma3-12b":   "Gemma 3 12B Text Encoder",
     # Wan
     "wan2.1-t2v-14b":      "Wan 2.1 T2V DiT",
     "wan2.1-i2v-720p-14b": "Wan 2.1 I2V 720p DiT",

@@ -12,15 +12,15 @@ or ``--gemma_safetensors`` (single file).
 
 from __future__ import annotations
 
+import os
 import shlex
 import re
-import json
-from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 from .runtime_config import RuntimeConfig
 from .train_utils import (
+    clear_dataset_cache_directories,
     run_command,
     TrainingCancelledError,
     JOB_EXIT_SUCCESS,
@@ -45,11 +45,14 @@ from .train_utils import (
     next_dataset_log_run_dir,
     module_available,
     require_model_file,
+    toml_quote,
+    toml_string_list,
 )
 
 # LTX-2.3 latent cache suffix
 LATENT_SUFFIX = "ltx23"
 LTX_VERSION = "2.3"
+PREFERRED_GEMMA_ROOT = Path("D:/Musubi-Trainer/Models/gemma-3-12b")
 
 # ────────────────────────────────────────────────────────────────────────────
 # Internal helpers
@@ -82,6 +85,10 @@ def _looks_like_sharded_safetensor(path_value: Path) -> bool:
 
 
 def _resolve_ltx_text_encoder(path_value: Path | None) -> tuple[str, Path]:
+    # Prefer the local Gemma root when available so cache/text behavior matches the 8-bit workflow.
+    if PREFERRED_GEMMA_ROOT.exists() and PREFERRED_GEMMA_ROOT.is_dir():
+        return "--gemma_root", PREFERRED_GEMMA_ROOT
+
     if path_value is None:
         raise RuntimeError(
             "LTX-2.3 Text Encoder is not configured. Open Settings and set Gemma root folder or Gemma safetensors."
@@ -110,6 +117,34 @@ def _latest_resume_state(training_dir: Path, dataset_name: str, checkpoint_step:
 def _finished_checkpoint(training_dir: Path, dataset_name: str) -> Path | None:
     output_dir = training_dir / dataset_name / "output"
     return finished_checkpoint_for_output(output_dir, _output_name_default(dataset_name))
+
+
+def _recommended_accelerate_cpu_threads_per_process() -> int:
+    # Keep launch parity with known-good LTX workflows that pin this to 1.
+    return 1
+
+
+def _recommended_ltx_dataloader_workers() -> int:
+    cpu_count = os.cpu_count() or 8
+    return max(2, min(8, cpu_count // 2))
+
+
+def _build_ltx_train_launch_command(python_exe: Path | str, config_path: Path, ltx2_checkpoint: Path) -> list[str]:
+    cpu_threads = _recommended_accelerate_cpu_threads_per_process()
+    return [
+        str(python_exe),
+        "-m",
+        "accelerate.commands.launch",
+        "--num_cpu_threads_per_process",
+        str(cpu_threads),
+        "--mixed_precision",
+        "bf16",
+        "ltx2_train_network.py",
+        "--config_file",
+        str(config_path),
+        "--ltx2_checkpoint",
+        str(ltx2_checkpoint),
+    ]
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -147,6 +182,7 @@ def run_steps_for_model(
     training_log_tracker_name: str = "",
     stream_training_output: bool = True,
     ltx_mode: str = "video",
+    ltx_gemma_load_in_4bit: bool = True,
     do_prep_dataset: bool = True,
     do_cache_latents: bool = True,
     do_cache_text: bool = True,
@@ -157,6 +193,7 @@ def run_steps_for_model(
     train_steps_override: int | None = None,
     output_name_override: str | None = None,
     output_dir_override: Path | None = None,
+    generate_training_args_only: bool = False,
     logger: Callable[[str], None] = print,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> None:
@@ -187,6 +224,12 @@ def run_steps_for_model(
             "Run Step 1 (Prepare Dataset) first."
         )
 
+    if do_cache_latents or do_cache_text:
+        cleared_cache_dirs = clear_dataset_cache_directories(dataset_config, logger)
+        if cleared_cache_dirs > 0:
+            plural = "y" if cleared_cache_dirs == 1 else "ies"
+            logger(f"  cache reset: cleared {cleared_cache_dirs} cache director{plural}")
+
     # ── Resolve model paths ─────────────────────────────────────────────────
     dit_path = require_model_file(runtime_config.dit, "LTX-2.3 Model")
     gemma_flag, gemma_path = _resolve_ltx_text_encoder(runtime_config.text_encoder)
@@ -201,7 +244,8 @@ def run_steps_for_model(
             "ltx2_cache_latents.py",
             "--dataset_config", str(dataset_config),
             "--ltx2_checkpoint", str(dit_path),
-            "--skip_existing",
+            "--device", "cuda",
+            "--vae_dtype", "bf16",
             "--ltx2_mode", ltx_mode_value,
         ]
         logger(f"  command: {format_command_for_log(cache_latents_args)}")
@@ -238,10 +282,9 @@ def run_steps_for_model(
             "--device", "cuda",
             "--mixed_precision", "bf16",
             "--batch_size", "1",
-            "--skip_existing",
             "--ltx2_mode", ltx_mode_value,
         ]
-        if gemma_flag == "--gemma_root":
+        if gemma_flag == "--gemma_root" and ltx_gemma_load_in_4bit:
             cache_text_args.append("--gemma_load_in_4bit")
         logger(f"  command: {format_command_for_log(cache_text_args)}")
         try:
@@ -270,7 +313,8 @@ def run_steps_for_model(
         if cancel_requested and cancel_requested():
             raise TrainingCancelledError
 
-        logging_flags: list[str] = []
+        logging_dir: Path | None = None
+        tracker_name = ""
         if enable_training_logging:
             log_backend = training_log_backend.strip().lower() or "tensorboard"
             if log_backend == "all":
@@ -279,59 +323,18 @@ def run_steps_for_model(
                         "Logging backend 'all' requires tensorboard and/or wandb, but neither is installed."
                     )
             logging_dir, auto_tracker_name = next_dataset_log_run_dir(training_dir, model_name)
-            logging_flags.extend(["--log_with", log_backend, "--logging_dir", str(logging_dir)])
             tracker_name = training_log_tracker_name.strip() or auto_tracker_name
-            if tracker_name:
-                logging_flags.extend(["--log_tracker_name", tracker_name])
 
         optimizer_key = (optimizer_type or "adamw8bit").strip().lower()
         optimizer_arg = "prodigyopt.Prodigy" if optimizer_key == "prodigy" else (optimizer_type or "adamw8bit").strip()
         learning_rate_for_run = "1" if optimizer_key == "prodigy" else learning_rate
 
-        train_args = [
-            str(musubi_python),
-            "ltx2_train_network.py",
-            "--ltx_version", LTX_VERSION,
-            "--ltx2_checkpoint", str(dit_path),
-            gemma_flag, str(gemma_path),
-            "--ltx2_mode", ltx_mode_value,
-            "--dataset_config", str(dataset_config),
-            "--output_dir", str(output_dir),
-            "--output_name", output_name,
-            "--network_dim", str(network_dim),
-            "--network_alpha", str(network_alpha),
-            "--optimizer_type", optimizer_arg,
-            "--learning_rate", learning_rate_for_run,
-            "--lr_scheduler", str(lr_scheduler or "constant"),
-            "--lr_warmup_steps", str(max(0, int(lr_warmup_steps))),
-            "--gradient_accumulation_steps", str(max(1, int(gradient_accumulation_steps))),
-            "--timestep_sampling", str(timestep_sampling or "sigma"),
-            "--lora_target_preset", str(ltx_lora_target_preset or "t2v"),
-            "--ltx2_first_frame_conditioning_p", str(float(ltx_first_frame_conditioning_p)),
-            "--max_train_steps", str(train_steps_for_run),
-            "--mixed_precision", "bf16",
-            "--sdpa",
-            "--gradient_checkpointing",
-            "--save_every_n_steps", str(save_every_n_steps),
-            "--save_state",
-            "--save_state_on_train_end",
-            "--seed", "42",
-        ]
-        if int(blocks_to_swap) > 0:
-            train_args += ["--blocks_to_swap", str(int(blocks_to_swap))]
-        if enable_fp8_dit:
-            train_args += ["--fp8_base", "--fp8_scaled"]
-        if enable_gradient_checkpointing_cpu_offload:
-            train_args.append("--gradient_checkpointing_cpu_offload")
+        max_data_loader_n_workers = _recommended_ltx_dataloader_workers()
+
         compile_enabled = bool(enable_compile_optimizations and not enable_fp8_dit)
         if enable_compile_optimizations and enable_fp8_dit:
             logger("  compile note: ignoring --compile because FP8 is enabled")
-        if compile_enabled:
-            train_args.append("--compile")
-            if enable_cuda_allow_tf32:
-                train_args.append("--cuda_allow_tf32")
-            if enable_cuda_cudnn_benchmark:
-                train_args.append("--cuda_cudnn_benchmark")
+
         optimizer_args_values: list[str] = []
         if optimizer_key == "prodigy":
             optimizer_args_values = [
@@ -343,33 +346,137 @@ def run_steps_for_model(
             optimizer_args_raw = (optimizer_args or "").strip()
             if optimizer_args_raw:
                 optimizer_args_values = [value for value in shlex.split(optimizer_args_raw) if value.strip()]
-        if optimizer_args_values:
-            train_args += ["--optimizer_args", *optimizer_args_values]
-        if warmstart_checkpoint is not None:
-            train_args += ["--network_weights", str(warmstart_checkpoint)]
-        if resume_state_dir is not None:
-            train_args += ["--resume", str(resume_state_dir)]
-        train_args.extend(logging_flags)
 
-        logger(f"  command: {format_command_for_log(train_args)}")
-        try:
-            run_command(
-                train_args,
-                cwd=musubi_dir,
-                cancel_requested=cancel_requested,
-                logger=logger,
-                stream_to_logger=stream_training_output,
-                stream_mode="plain",
-                inherit_io=not stream_training_output,
+        model_lines = [
+            f"ltx_version = {toml_quote(LTX_VERSION)}",
+            f"ltx2_checkpoint = {toml_quote(str(dit_path))}",
+            f"ltx_mode = {toml_quote(ltx_mode_value)}",
+            'ltx_version_check_mode = "error"',
+        ]
+        if gemma_flag == "--gemma_root":
+            model_lines.append(f"gemma_root = {toml_quote(str(gemma_path))}")
+            if ltx_gemma_load_in_4bit:
+                model_lines.append("gemma_load_in_4bit = true")
+        else:
+            model_lines.append(f"gemma_safetensors = {toml_quote(str(gemma_path))}")
+
+        data_output_lines = [
+            f"dataset_config = {toml_quote(str(dataset_config))}",
+            f"output_dir = {toml_quote(str(output_dir))}",
+            f"output_name = {toml_quote(output_name)}",
+        ]
+        network_lines = [
+            'network_module = "networks.lora_ltx2"',
+            f"network_dim = {network_dim}",
+            f"network_alpha = {network_alpha}",
+            f"lora_target_preset = {toml_quote(str(ltx_lora_target_preset or 't2v'))}",
+            f"ltx2_first_frame_conditioning_p = {float(ltx_first_frame_conditioning_p)}",
+        ]
+        optimization_lines = [
+            f"optimizer_type = {toml_quote(optimizer_arg)}",
+            f"learning_rate = {learning_rate_for_run}",
+            f"lr_scheduler = {toml_quote(str(lr_scheduler or 'constant'))}",
+            f"lr_warmup_steps = {max(0, int(lr_warmup_steps))}",
+            f"gradient_accumulation_steps = {max(1, int(gradient_accumulation_steps))}",
+            f"timestep_sampling = {toml_quote(str(timestep_sampling or 'sigma'))}",
+            f"max_train_steps = {train_steps_for_run}",
+        ]
+        if optimizer_args_values:
+            optimization_lines.append(f"optimizer_args = {toml_string_list(optimizer_args_values)}")
+
+        runtime_lines = [
+            "cache_text_encoder_outputs = true",
+            "cache_text_encoder_outputs_to_disk = false",
+            'mixed_precision = "bf16"',
+            "sdpa = true",
+            "gradient_checkpointing = true",
+            f"gradient_checkpointing_cpu_offload = {'true' if enable_gradient_checkpointing_cpu_offload else 'false'}",
+            "persistent_data_loader_workers = true",
+            f"max_data_loader_n_workers = {max_data_loader_n_workers}",
+            f"fp8_base = {'true' if enable_fp8_dit else 'false'}",
+            f"fp8_scaled = {'true' if enable_fp8_dit else 'false'}",
+            f"compile = {'true' if compile_enabled else 'false'}",
+            f"cuda_allow_tf32 = {'true' if (compile_enabled and enable_cuda_allow_tf32) else 'false'}",
+            f"cuda_cudnn_benchmark = {'true' if (compile_enabled and enable_cuda_cudnn_benchmark) else 'false'}",
+            f"blocks_to_swap = {max(0, int(blocks_to_swap))}",
+        ]
+
+        checkpoint_lines = [
+            f"save_every_n_steps = {save_every_n_steps}",
+            'save_model_as = "safetensors"',
+            "save_state = true",
+            "save_state_on_train_end = true",
+            "seed = 42",
+        ]
+
+        restore_lines: list[str] = []
+        if warmstart_checkpoint is not None:
+            restore_lines.append(f"network_weights = {toml_quote(str(warmstart_checkpoint))}")
+        if resume_state_dir is not None:
+            restore_lines.append(f"resume = {toml_quote(str(resume_state_dir))}")
+
+        logging_lines: list[str] = []
+        if enable_training_logging and logging_dir is not None:
+            logging_lines.extend(
+                [
+                    f"log_with = {toml_quote(log_backend)}",
+                    f"logging_dir = {toml_quote(str(logging_dir))}",
+                    "log_config = true",
+                ]
             )
-        except TrainingCancelledError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(
-                "Training launch failed for LTX-2.3.\n"
-                "Verify Settings > LTX > Model and Text Encoder paths.\n"
-                f"Details: {exc}"
-            ) from exc
+            if tracker_name:
+                logging_lines.append(f"log_tracker_name = {toml_quote(tracker_name)}")
+
+        config_lines: list[str] = []
+        config_sections: list[tuple[str, list[str]]] = [
+            ("Model", model_lines),
+            ("Data and Output", data_output_lines),
+            ("Network", network_lines),
+            ("Optimization", optimization_lines),
+            ("Runtime", runtime_lines),
+            ("Checkpointing", checkpoint_lines),
+        ]
+        if restore_lines:
+            config_sections.append(("Resume and Warmstart", restore_lines))
+        if logging_lines:
+            config_sections.append(("Logging", logging_lines))
+
+        for section_name, section_lines in config_sections:
+            if config_lines:
+                config_lines.append("")
+            config_lines.append(f"# {section_name}")
+            config_lines.extend(section_lines)
+
+        train_config_path = output_dir.parent / "training_args.toml"
+        if generate_training_args_only or not train_config_path.exists():
+            train_config_path.write_text("\n".join(config_lines) + "\n", encoding="utf-8")
+            logger(f"  training_args: {train_config_path}")
+        else:
+            logger(f"  training_args: {train_config_path} (using existing)")
+
+        if generate_training_args_only:
+            logger("  training args generated (no training launched)")
+        else:
+            launch_args = _build_ltx_train_launch_command(musubi_python, train_config_path, dit_path)
+            logger(f"  command: {format_command_for_log(launch_args)}")
+            try:
+                run_command(
+                    launch_args,
+                    cwd=musubi_dir,
+                    cancel_requested=cancel_requested,
+                    logger=logger,
+                    stream_to_logger=stream_training_output,
+                    stream_mode="plain",
+                    inherit_io=not stream_training_output,
+                )
+            except TrainingCancelledError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    "Training launch failed for LTX-2.3.\n"
+                    "Verify Settings > LTX > Model and Text Encoder paths.\n"
+                    f"Details: {exc}"
+                ) from exc
 
     logger("")
 
@@ -414,7 +521,9 @@ def run_job(
     do_cache_latents: bool,
     do_cache_text: bool,
     do_train: bool,
+    generate_training_args_only: bool = False,
     ltx_mode: str = "video",
+    ltx_gemma_load_in_4bit: bool = True,
     save_every_n_steps: int = DEFAULT_SAVE_EVERY_N_STEPS,
     cancel_requested: Callable[[], bool] | None = None,
     on_error: Callable[[str], None] | None = None,
@@ -433,7 +542,7 @@ def run_job(
             on_error(message)
         return JOB_EXIT_FAILED
 
-    if not (do_prep_dataset or do_cache_latents or do_cache_text or do_train):
+    if not (do_prep_dataset or do_cache_latents or do_cache_text or do_train or generate_training_args_only):
         message = "No steps selected."
         logger(message)
         if on_error:
@@ -454,7 +563,7 @@ def run_job(
     effective_warmstart_checkpoint: Path | None = None
     train_steps_override: int | None = None
 
-    if progress_step >= train_steps:
+    if progress_step >= train_steps and not generate_training_args_only:
         logger(f"Job already complete at step {progress_step}; nothing to run.")
         if auto_cleanup_states:
             cleanup_step_states_for_completed_output(output_dir_resolved, output_name_resolved, logger)
@@ -505,10 +614,12 @@ def run_job(
             training_log_tracker_name=training_log_tracker_name,
             stream_training_output=stream_training_output,
             ltx_mode=ltx_mode,
+            ltx_gemma_load_in_4bit=ltx_gemma_load_in_4bit,
             do_prep_dataset=do_prep_dataset,
             do_cache_latents=do_cache_latents,
             do_cache_text=do_cache_text,
-            do_train=do_train,
+            do_train=(do_train or generate_training_args_only),
+            generate_training_args_only=generate_training_args_only,
             resume_state_dir=effective_resume_state,
             resume_step_offset=resume_step_offset,
             warmstart_checkpoint=effective_warmstart_checkpoint,
@@ -518,6 +629,8 @@ def run_job(
             logger=logger,
             cancel_requested=cancel_requested,
         )
+        if generate_training_args_only:
+            return JOB_EXIT_SUCCESS
         if effective_resume_state is not None and resume_step_offset > 0:
             remap_resume_artifacts_for_output(output_dir_resolved, output_name_resolved, resume_step_offset, logger)
         if auto_cleanup_states:

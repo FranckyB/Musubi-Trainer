@@ -305,6 +305,9 @@ class CreateJobWindow:
         timestep_sampling_var = self.tk.StringVar(value=(existing_job or {}).get("timestep_sampling", "sigma"))
         ltx_lora_target_preset_var = self.tk.StringVar(value=(existing_job or {}).get("ltx_lora_target_preset", "full"))
         ltx_first_frame_conditioning_p_var = self.tk.StringVar(value=(existing_job or {}).get("ltx_first_frame_conditioning_p", "0.5"))
+        ltx_gemma_load_in_4bit_var = self.tk.BooleanVar(
+            value=self.flag_to_bool((existing_job or {}).get("ltx_gemma_load_in_4bit", self.bool_to_flag(True)))
+        )
         sd_unet_lr_var = self.tk.StringVar(value=(existing_job or {}).get("sd_unet_lr", ""))
         sd_text_encoder_lr_var = self.tk.StringVar(value=(existing_job or {}).get("sd_text_encoder_lr", ""))
 
@@ -355,6 +358,7 @@ class CreateJobWindow:
                 "ltx_mode": _normalize_ltx_mode_ui(ltx_mode_var.get()),
                 "ltx_lora_target_preset": ltx_lora_target_preset_var.get().strip(),
                 "ltx_first_frame_conditioning_p": ltx_first_frame_conditioning_p_var.get().strip(),
+                "ltx_gemma_load_in_4bit": self.bool_to_flag(ltx_gemma_load_in_4bit_var.get()),
                 "sd_unet_lr": sd_unet_lr_var.get().strip(),
                 "sd_text_encoder_lr": sd_text_encoder_lr_var.get().strip(),
                 "enable_compile": self.bool_to_flag(compile_var.get()),
@@ -400,6 +404,8 @@ class CreateJobWindow:
                 ltx_lora_target_preset_var.set(values["ltx_lora_target_preset"])
             if "ltx_first_frame_conditioning_p" in values:
                 ltx_first_frame_conditioning_p_var.set(values["ltx_first_frame_conditioning_p"])
+            if "ltx_gemma_load_in_4bit" in values:
+                ltx_gemma_load_in_4bit_var.set(self.flag_to_bool(values["ltx_gemma_load_in_4bit"]))
             if "sd_unet_lr" in values:
                 sd_unet_lr_var.set(values["sd_unet_lr"])
             if "sd_text_encoder_lr" in values:
@@ -872,6 +878,13 @@ class CreateJobWindow:
         _ltx_first_frame_entry = self.ttk.Entry(ltx_specific_frame, textvariable=ltx_first_frame_conditioning_p_var, style="Flat.TEntry")
         _ltx_first_frame_entry.grid(row=1, column=3, sticky="ew", pady=(6, 0))
 
+        _ltx_gemma_4bit_check = self.ttk.Checkbutton(
+            ltx_specific_frame,
+            text="Gemma load in 4-bit",
+            variable=ltx_gemma_load_in_4bit_var,
+        )
+        _ltx_gemma_4bit_check.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
         self.attach_hover_tooltip(
             _ltx_lora_target_combo,
             (
@@ -884,6 +897,13 @@ class CreateJobWindow:
             (
                 "First-frame conditioning probability.\n"
                 "Higher values bias training to preserve frame-0 identity/composition guidance."
+            ),
+        )
+        self.attach_hover_tooltip(
+            _ltx_gemma_4bit_check,
+            (
+                "Use bitsandbytes 4-bit quantization for Gemma when a Gemma root folder is used.\n"
+                "Reduces VRAM for text caching/training text path; disable if troubleshooting quantization behavior."
             ),
         )
 
@@ -1160,12 +1180,13 @@ class CreateJobWindow:
                 "lr_scheduler": "constant_with_warmup",
                 "lr_warmup_steps": "100",
                 "gradient_accumulation_steps": "1",
-                "blocks_to_swap": "1",
+                "blocks_to_swap": "0",
                 "timestep_sampling": "shifted_logit_normal",
                 "resolution": "1920",
                 "batch_size": "1",
                 "ltx_lora_target_preset": "full",
                 "ltx_first_frame_conditioning_p": "0.5",
+                "ltx_gemma_load_in_4bit": "1",
             },
             "Wan": {
                 "optimizer_type": "prodigy",
@@ -1260,6 +1281,8 @@ class CreateJobWindow:
                 ltx_lora_target_preset_var.set(profile["ltx_lora_target_preset"])
             if "ltx_first_frame_conditioning_p" in profile:
                 ltx_first_frame_conditioning_p_var.set(profile["ltx_first_frame_conditioning_p"])
+            if "ltx_gemma_load_in_4bit" in profile:
+                ltx_gemma_load_in_4bit_var.set(self.flag_to_bool(profile["ltx_gemma_load_in_4bit"]))
 
         def _on_model_change_for_defaults(*_args: object) -> None:
             _sync_resolution_controls()
@@ -1741,6 +1764,7 @@ class CreateJobWindow:
                 "timestep_sampling": timestep_sampling_value,
                 "ltx_lora_target_preset": ltx_lora_target_preset_value,
                 "ltx_first_frame_conditioning_p": str(ltx_first_frame_conditioning_p_value),
+                "ltx_gemma_load_in_4bit": self.bool_to_flag(ltx_gemma_load_in_4bit_var.get()),
                 "sd_unet_lr": sd_unet_lr_value,
                 "sd_text_encoder_lr": sd_text_encoder_lr_value,
                 "enable_compile": self.bool_to_flag(compile_var.get()),
@@ -1779,11 +1803,24 @@ class CreateJobWindow:
                     self.job_queue[existing_index] = new_job
 
             self.save_job_to_disk(new_job)
+            generated_training_args = True
+            generator = getattr(self, "ensure_job_training_args_toml", None)
+            if callable(generator):
+                try:
+                    generated_training_args = bool(generator(new_job))
+                except Exception:
+                    generated_training_args = False
             self.save_job_order()
             if renamed_training_folder:
                 self.load_job_queue_from_disk()
             self.refresh_job_queue_list()
             self.update_start_button_state()
+
+            if not generated_training_args:
+                self.log(
+                    f"[Queue] Note: Could not pre-generate training_args.toml for {job_name}; "
+                    "it will be generated at launch if missing."
+                )
 
             ds_names = ", ".join(d["name"] for d in datasets_config)
             if existing_job is None:

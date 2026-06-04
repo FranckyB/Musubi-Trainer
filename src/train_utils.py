@@ -223,6 +223,79 @@ def dataset_image_files(training_dir: Path, dataset_name: str) -> list[Path]:
     )
 
 
+def dataset_cache_directories_from_config(dataset_config: Path) -> list[Path]:
+    if not dataset_config.exists() or not dataset_config.is_file():
+        return []
+
+    try:
+        import tomllib  # Python 3.11+
+    except Exception:
+        tomllib = None  # type: ignore[assignment]
+
+    candidates: list[Path] = []
+
+    if tomllib is not None:
+        try:
+            parsed = tomllib.loads(dataset_config.read_text(encoding="utf-8"))
+        except Exception:
+            parsed = None
+
+        if isinstance(parsed, dict):
+            datasets = parsed.get("datasets", [])
+            if isinstance(datasets, list):
+                for entry in datasets:
+                    if not isinstance(entry, dict):
+                        continue
+                    raw_cache = str(entry.get("cache_directory", "")).strip()
+                    if not raw_cache:
+                        continue
+                    cache_dir = Path(raw_cache).expanduser()
+                    if not cache_dir.is_absolute():
+                        cache_dir = (dataset_config.parent / cache_dir).resolve()
+                    candidates.append(cache_dir)
+
+    if not candidates:
+        try:
+            content = dataset_config.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            content = ""
+        for match in re.finditer(r'^\s*cache_directory\s*=\s*"([^"]+)"', content, flags=re.MULTILINE):
+            raw_cache = match.group(1).strip()
+            if not raw_cache:
+                continue
+            cache_dir = Path(raw_cache).expanduser()
+            if not cache_dir.is_absolute():
+                cache_dir = (dataset_config.parent / cache_dir).resolve()
+            candidates.append(cache_dir)
+
+    # Preserve order while de-duplicating.
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for cache_dir in candidates:
+        key = str(cache_dir).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(cache_dir)
+    return unique
+
+
+def clear_dataset_cache_directories(dataset_config: Path, logger: Callable[[str], None] | None = None) -> int:
+    cache_dirs = dataset_cache_directories_from_config(dataset_config)
+    cleared = 0
+    for cache_dir in cache_dirs:
+        resolved = cache_dir.resolve()
+        if resolved == Path(resolved.anchor):
+            if logger is not None:
+                logger(f"  cache reset warning: refusing to clear root path {resolved}")
+            continue
+        if resolved.exists() and resolved.is_dir():
+            shutil.rmtree(resolved)
+            cleared += 1
+        resolved.mkdir(parents=True, exist_ok=True)
+    return cleared
+
+
 def prep_dataset_minimal(
     training_dir: Path,
     dataset_name: str,
@@ -717,6 +790,111 @@ def toml_quote(value: str) -> str:
 
 def toml_string_list(values: list[str]) -> str:
     return "[" + ", ".join(toml_quote(value) for value in values) + "]"
+
+
+_TOML_INT_RE = re.compile(r"^[+-]?\d+$")
+_TOML_FLOAT_RE = re.compile(
+    r"^[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?$|^[+-]?\d+[eE][+-]?\d+$"
+)
+
+
+def _toml_auto_scalar(value: str) -> str:
+    text = str(value).strip()
+    lowered = text.lower()
+    if lowered in {"true", "false"}:
+        return lowered
+    if _TOML_INT_RE.fullmatch(text):
+        return text
+    if _TOML_FLOAT_RE.fullmatch(text):
+        return text
+    return toml_quote(text)
+
+
+def _toml_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        # Keep list elements as strings so argparse nargs-style options deserialize predictably.
+        return "[" + ", ".join(toml_quote(str(item)) for item in value) + "]"
+    return _toml_auto_scalar(str(value))
+
+
+def cli_args_to_toml_entries(script_args: Iterable[str]) -> list[tuple[str, object]]:
+    """Convert CLI-style args (without executable/script) into TOML key/value entries."""
+    args = [str(arg) for arg in script_args]
+    parsed: dict[str, object] = {}
+
+    idx = 0
+    while idx < len(args):
+        token = args[idx]
+        if not token.startswith("--"):
+            idx += 1
+            continue
+
+        key = token[2:].strip().replace("-", "_")
+        if not key:
+            idx += 1
+            continue
+
+        idx += 1
+        values: list[str] = []
+        while idx < len(args) and not args[idx].startswith("--"):
+            values.append(args[idx])
+            idx += 1
+
+        if not values:
+            value: object = True
+        elif len(values) == 1 and not key.endswith("_args"):
+            value = values[0]
+        else:
+            value = values
+
+        if key not in parsed:
+            parsed[key] = value
+            continue
+
+        existing = parsed[key]
+        if isinstance(existing, list):
+            if isinstance(value, list):
+                existing.extend(value)
+            else:
+                existing.append(str(value))
+            parsed[key] = existing
+            continue
+
+        merged: list[str] = [str(existing)]
+        if isinstance(value, list):
+            merged.extend(value)
+        else:
+            merged.append(str(value))
+        parsed[key] = merged
+
+    return list(parsed.items())
+
+
+def write_training_args_toml(training_dir: Path, model_name: str, script_args: Iterable[str]) -> Path:
+    """Write effective training args for a job to Jobs/<model_name>/training_args.toml."""
+    job_dir = training_dir / model_name
+    job_dir.mkdir(parents=True, exist_ok=True)
+    config_path = job_dir / "training_args.toml"
+
+    entries = cli_args_to_toml_entries(script_args)
+    lines = [
+        "# Auto-generated by Musubi-Trainer (effective training args)",
+        f"# updated_at = {datetime.now().isoformat(timespec='seconds')}",
+        "",
+    ]
+    for key, value in entries:
+        lines.append(f"{key} = {_toml_value(value)}")
+
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return config_path
+
+
+def build_config_file_command(python_exe: Path | str, script_name: str, config_path: Path) -> list[str]:
+    return [str(python_exe), script_name, "--config_file", str(config_path)]
 
 
 def normalize_model_checkpoint_path(path_value: Path, label: str) -> Path:

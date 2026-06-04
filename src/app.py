@@ -2464,6 +2464,95 @@ def _launch_ui_impl() -> int:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         settings_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
 
+    def ensure_job_training_args_toml(job: dict[str, str], *, silent: bool = True) -> bool:
+        model_name = (job.get("model", "klein-base-9b") or "klein-base-9b").strip()
+        job_run_fn = _run_job_for_model(model_name)
+        if job_run_fn is None:
+            return False
+
+        job_runtime_config = runtime_config_for_model(settings_state, model_name) or runtime_config
+        if job_runtime_config is None:
+            return False
+
+        training_name = job.get("training_name", "").strip() or job.get("job_name", "").strip()
+        if not training_name:
+            return False
+
+        output_dir = Path(job.get("output_dir", str(training_job_dir_path(training_name) / "output"))).expanduser()
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        logger_fn: Callable[[str], None] = (lambda _message: None) if silent else log
+        error_message = ""
+
+        def capture_job_error(message: str) -> None:
+            nonlocal error_message
+            error_message = message
+
+        run_job_kwargs = {
+            "dataset_name": training_name,
+            "output_name": job.get("job_name", training_name),
+            "output_dir": output_dir,
+            "default_caption_keyword": settings_state.get(app_settings.DEFAULT_CAPTION_KEYWORD_KEY, ""),
+            "resolution": get_positive_int_setting(job, "resolution", DEFAULT_RESOLUTION, minimum=64),
+            "network_dim": get_positive_int_setting(job, "network_dim", DEFAULT_NETWORK_DIM),
+            "network_alpha": get_positive_int_setting(job, "network_alpha", DEFAULT_NETWORK_ALPHA),
+            "optimizer_type": job.get("optimizer_type", "prodigy"),
+            "optimizer_args": str(job.get("optimizer_args", "") or ""),
+            "learning_rate": job.get("learning_rate", DEFAULT_LEARNING_RATE),
+            "train_steps": get_positive_int_setting(job, "train_steps", DEFAULT_TRAIN_STEPS),
+            "save_every_n_steps": get_positive_int_setting(job, "save_every_n_steps", DEFAULT_SAVE_EVERY_N_STEPS, minimum=1),
+            "enable_compile_optimizations": flag_to_bool(job.get("enable_compile", "0")),
+            "enable_cuda_allow_tf32": flag_to_bool(job.get("enable_tf32", "1")),
+            "enable_cuda_cudnn_benchmark": flag_to_bool(job.get("enable_cudnn", "1")),
+            "enable_fp8_dit": flag_to_bool(job.get("enable_fp8", "0")),
+            "enable_gradient_checkpointing_cpu_offload": flag_to_bool(job.get("enable_gc", "0")),
+            "enable_training_logging": is_truthy(settings_state.get(app_settings.TRAIN_ENABLE_LOGGING_KEY), default=True),
+            "training_log_backend": get_train_log_backend_setting(settings_state),
+            "training_log_tracker_name": settings_state.get(app_settings.TRAIN_LOG_TRACKER_NAME_KEY, "").strip(),
+            "stream_training_output": is_truthy(settings_state.get(app_settings.TRAIN_STREAM_TO_LOGGER_KEY), default=False),
+            "auto_cleanup_states": is_truthy(settings_state.get(app_settings.TRAIN_AUTO_CLEANUP_STATES_KEY), default=True),
+            "logger": logger_fn,
+            "do_prep_dataset": False,
+            "do_cache_latents": False,
+            "do_cache_text": False,
+            "do_train": False,
+            "generate_training_args_only": True,
+            "cancel_requested": None,
+            "on_error": capture_job_error,
+        }
+
+        if job_run_fn is _run_job_ltx:
+            run_job_kwargs["ltx_mode"] = str(job.get("ltx_mode", "video"))
+            run_job_kwargs["ltx_gemma_load_in_4bit"] = flag_to_bool(job.get("ltx_gemma_load_in_4bit", "1"))
+            run_job_kwargs["lr_scheduler"] = str(job.get("lr_scheduler", "constant"))
+            run_job_kwargs["lr_warmup_steps"] = get_non_negative_int_setting(job, "lr_warmup_steps", 0)
+            run_job_kwargs["gradient_accumulation_steps"] = get_positive_int_setting(job, "gradient_accumulation_steps", 1, minimum=1)
+            run_job_kwargs["blocks_to_swap"] = get_non_negative_int_setting(job, "blocks_to_swap", 0)
+            run_job_kwargs["timestep_sampling"] = str(job.get("timestep_sampling", "sigma") or "sigma")
+            run_job_kwargs["ltx_lora_target_preset"] = str(job.get("ltx_lora_target_preset", "t2v") or "t2v")
+            try:
+                run_job_kwargs["ltx_first_frame_conditioning_p"] = float(
+                    str(job.get("ltx_first_frame_conditioning_p", "0.1") or "0.1")
+                )
+            except ValueError:
+                run_job_kwargs["ltx_first_frame_conditioning_p"] = 0.1
+        elif job_run_fn is _run_job_sdxl:
+            run_job_kwargs["lr_scheduler"] = str(job.get("lr_scheduler", "constant") or "constant")
+            run_job_kwargs["lr_warmup_steps"] = get_non_negative_int_setting(job, "lr_warmup_steps", 0)
+            run_job_kwargs["gradient_accumulation_steps"] = get_positive_int_setting(job, "gradient_accumulation_steps", 1, minimum=1)
+            run_job_kwargs["unet_lr"] = str(job.get("sd_unet_lr", "") or "")
+            run_job_kwargs["text_encoder_lr"] = str(job.get("sd_text_encoder_lr", "") or "")
+            run_job_kwargs["enable_gradient_checkpointing"] = flag_to_bool(job.get("enable_grad_ckpt", "1"))
+
+        exit_code = job_run_fn(job_runtime_config, **run_job_kwargs)
+        config_path = output_dir.parent / "training_args.toml"
+        if exit_code == JOB_EXIT_SUCCESS and config_path.exists() and config_path.is_file():
+            return True
+
+        if (not silent) and error_message:
+            log(f"[Queue] training_args generation note for {training_name}: {error_message}")
+        return False
+
     def remove_job_from_disk(job: dict[str, str]) -> None:
         try:
             training_name = job.get("training_name", "").strip() or job.get("job_name", "").strip()
@@ -3025,6 +3114,9 @@ def _launch_ui_impl() -> int:
         def clear_clicked_job_cache() -> None:
             clear_job_cache_with_confirmation(clicked)
 
+        def reset_clicked_job() -> None:
+            reset_job_with_confirmation(clicked)
+
         clicked_status = detect_job_status(job_queue[clicked])
         menu = tk.Menu(root, tearoff=0)
         menu.add_command(label="Open Output Folder", command=lambda: open_job_output_folder(clicked))
@@ -3032,6 +3124,7 @@ def _launch_ui_impl() -> int:
         menu.add_command(label="Duplicate Job", command=lambda: duplicate_job(clicked))
         menu.add_command(label="Edit Job", command=lambda: open_create_job_dialog(existing_job=job_queue[clicked]))
         menu.add_command(label="Clear Job Cache", command=clear_clicked_job_cache)
+        menu.add_command(label="Reset Job (Fresh Start)", command=reset_clicked_job)
         if clicked_status == "broken":
             menu.add_command(label="Fix LoRA Names", command=fix_clicked_job_names)
         menu.add_separator()
@@ -3247,6 +3340,93 @@ def _launch_ui_impl() -> int:
             parent=root,
         )
 
+    def reset_job_with_confirmation(index: int | None = None) -> None:
+        idx = selected_queue_index() if index is None else index
+        if idx is None or idx < 0 or idx >= len(job_queue):
+            return
+
+        job = job_queue[idx]
+        job_name = job.get("job_name", "unnamed")
+        training_name = job.get("training_name", "").strip() or job_name
+        training_dir = Path(job.get("training_dir", "")).expanduser()
+        if not training_dir.exists() and training_name:
+            training_dir = training_job_dir_path(training_name).expanduser()
+
+        output_dir = Path(job.get("output_dir", "")).expanduser()
+        cache_dirs = _job_cache_dirs(job)
+        logs_dir = training_dir / "logs"
+        progress_path = training_dir / JOB_PROGRESS_FILE_NAME
+        training_args_path = training_dir / "training_args.toml"
+
+        if not messagebox.askyesno(
+            "Reset job",
+            (
+                f"Reset job '{job_name}' for a fresh run?\n\n"
+                "This keeps the job entry/settings, but clears:\n"
+                "- output checkpoints and states\n"
+                "- cache latents/text outputs\n"
+                "- logs and progress markers\n"
+                "- generated training_args.toml"
+            ),
+            parent=root,
+        ):
+            return
+
+        removed_files = 0
+        removed_dirs = 0
+
+        def clear_directory_contents(target_dir: Path) -> None:
+            nonlocal removed_files, removed_dirs
+            if not target_dir.exists() or not target_dir.is_dir():
+                return
+            resolved = target_dir.resolve()
+            if resolved == Path(resolved.anchor):
+                raise OSError(f"Refusing to clear root directory: {resolved}")
+            for child in list(target_dir.iterdir()):
+                if child.is_dir():
+                    shutil.rmtree(child)
+                    removed_dirs += 1
+                else:
+                    child.unlink(missing_ok=True)
+                    removed_files += 1
+
+        try:
+            clear_directory_contents(output_dir)
+            for cache_dir in cache_dirs:
+                clear_directory_contents(cache_dir)
+            if logs_dir.exists() and logs_dir.is_dir():
+                shutil.rmtree(logs_dir)
+                removed_dirs += 1
+            if progress_path.exists() and progress_path.is_file():
+                progress_path.unlink(missing_ok=True)
+                removed_files += 1
+            if training_args_path.exists() and training_args_path.is_file():
+                training_args_path.unlink(missing_ok=True)
+                removed_files += 1
+        except OSError as exc:
+            messagebox.showerror("Reset job failed", f"Could not reset '{job_name}':\n{exc}", parent=root)
+            return
+
+        # Keep hold as-is; detect_job_status will map held jobs to paused.
+        job_queue[idx]["status"] = "queued"
+        save_job_to_disk(job_queue[idx])
+        refresh_job_queue_list()
+        set_queue_selection(idx)
+        update_start_button_state()
+
+        log(
+            f"[Queue] Reset job for fresh run: {job_name} "
+            f"({removed_files} file(s), {removed_dirs} folder(s) removed)."
+        )
+        messagebox.showinfo(
+            "Reset job",
+            (
+                f"Job '{job_name}' has been reset for a fresh run.\n"
+                f"Removed {removed_files} file(s) and {removed_dirs} folder(s)."
+            ),
+            parent=root,
+        )
+
     def delete_job_with_confirmation(index: int | None = None) -> None:
         idx = selected_queue_index() if index is None else index
         if idx is None or idx < 0 or idx >= len(job_queue):
@@ -3415,6 +3595,7 @@ def _launch_ui_impl() -> int:
             "save_job_order": save_job_order,
             "save_job_preset_to_disk": save_job_preset_to_disk,
             "save_job_to_disk": save_job_to_disk,
+            "ensure_job_training_args_toml": ensure_job_training_args_toml,
             "scan_training_folders": scan_training_folders,
             "selected_dataset_names": selected_dataset_names,
             "set_dark_title_bar": set_dark_title_bar,
@@ -4081,6 +4262,7 @@ def _launch_ui_impl() -> int:
                             }
                             if job_run_fn is _run_job_ltx:
                                 run_job_kwargs["ltx_mode"] = str(job.get("ltx_mode", "video"))
+                                run_job_kwargs["ltx_gemma_load_in_4bit"] = flag_to_bool(job.get("ltx_gemma_load_in_4bit", "1"))
                                 run_job_kwargs["lr_scheduler"] = str(job.get("lr_scheduler", "constant"))
                                 run_job_kwargs["lr_warmup_steps"] = get_non_negative_int_setting(job, "lr_warmup_steps", 0)
                                 run_job_kwargs["gradient_accumulation_steps"] = get_positive_int_setting(job, "gradient_accumulation_steps", 1, minimum=1)
@@ -4150,7 +4332,7 @@ def _launch_ui_impl() -> int:
                         notify_job_failure_popup(job_name, job_error_details)
                         log(
                             "[Queue] Tip: If this started after changing dataset repeats/resolution/model settings, "
-                            "clear this job's caches and rerun (right-click job -> Clear Job Cache)."
+                            "reset this job for a fresh run (right-click job -> Reset Job (Fresh Start))."
                         )
                         failed_jobs.append(job_name)
 
