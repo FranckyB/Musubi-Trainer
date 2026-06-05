@@ -95,14 +95,20 @@ class CreateJobWindow:
             for mn in models
         }
 
-        _KLEIN_MODELS = {"klein-base-9b", "klein-9b", "klein-base-4b", "klein-4b"}
+        _job_name_equivalence_source = getattr(self, "JOB_NAME_EQUIVALENCE_BY_MODEL", {})
+        _job_name_equivalence_by_model: dict[str, str] = {}
+        if isinstance(_job_name_equivalence_source, dict):
+            _job_name_equivalence_by_model = {
+                str(k).strip(): str(v).strip()
+                for k, v in _job_name_equivalence_source.items()
+                if str(k).strip() and str(v).strip()
+            }
 
         def _family_label(mn: str) -> str:
-            if mn in _KLEIN_MODELS:
-                return "Klein"
+            mapped_label = _job_name_equivalence_by_model.get((mn or "").strip(), "").strip()
+            if mapped_label:
+                return mapped_label
             fam = _model_to_family.get(mn, "")
-            if fam == "FLUX.2":
-                return "Flux2"
             return fam or mn
 
         _MODEL_UNSELECTED_LABEL = "-------------"

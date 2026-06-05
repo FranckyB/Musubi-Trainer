@@ -479,8 +479,8 @@ COMPONENT_FRIENDLY_NAMES: dict[str, str] = {
 
 MODEL_DISPLAY_NAMES: dict[str, str] = {
     "sdxl": "SDXL",
-    "pony": "Pony (SDXL)",
-    "illustrious": "Illustrious (SDXL)",
+    "pony": "Pony",
+    "illustrious": "Illustrious",
     "flux2-dev": "FLUX.2-dev",
     "klein-base-9b": "Klein base 9B",
     "klein-9b": "Klein 9B",
@@ -497,6 +497,31 @@ MODEL_DISPLAY_NAMES: dict[str, str] = {
     "qwen-image-edit-2509": "Qwen-Image Edit 25.09",
     "qwen-image-edit-2511": "Qwen-Image Edit 25.11",
     "qwen-image-layered": "Qwen-Image Layered",
+}
+
+# Optional per-model suffix used when Create Job auto-builds names like
+# "<dataset>_<suffix>". If a model is missing here, Create Job falls back
+# to the model family label.
+JOB_NAME_EQUIVALENCE_BY_MODEL: dict[str, str] = {
+    "sdxl": "SDXL",
+    "illustrious": "ILXL",
+    "pony": "PONY",
+    "flux2-dev": "FLUX2",
+    "klein-base-9b": "KLEIN",
+    "klein-9b": "KLEIN",
+    "klein-base-4b": "KLEIN4B",
+    "klein-4b": "KLEIN4B",
+    "ltx-2.3": "LTX",
+    "wan2.1-t2v-14b": "WAN21",
+    "wan2.1-i2v-720p-14b": "WAN21",
+    "wan2.1-i2v-480p-14b": "WAN21",
+    "wan2.2-t2v-14b": "WAN22",
+    "zimage-de-turbo": "ZIT",
+    "qwen-image": "QWEN",
+    "qwen-image-edit": "QWEN-EDIT",
+    "qwen-image-edit-2509": "QWENe",
+    "qwen-image-edit-2511": "QWENe",
+    "qwen-image-layered": "QWEN",
 }
 
 # Canonical model version strings used as --model_version CLI argument
