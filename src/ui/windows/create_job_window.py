@@ -455,6 +455,9 @@ class CreateJobWindow:
         sdxl_grad_ckpt_var = self.tk.BooleanVar(
             value=self.flag_to_bool((existing_job or {}).get("enable_grad_ckpt", self.bool_to_flag(default_enable_grad_ckpt)))
         )
+        global_repeats_var: Any | None = None
+        _suppress_global_repeats_apply: dict[str, bool] = {"enabled": False}
+        _pending_global_repeats_from_preset: dict[str, object] = {"value": None, "apply": False}
 
         def _collect_preset_values() -> dict[str, str]:
             return {
@@ -484,6 +487,11 @@ class CreateJobWindow:
                 "enable_fp8": self.bool_to_flag(fp8_var.get()),
                 "enable_gc": self.bool_to_flag(gc_var.get()),
                 "enable_grad_ckpt": self.bool_to_flag(sdxl_grad_ckpt_var.get()),
+                "global_repeats": (
+                    str(global_repeats_var.get()).strip()
+                    if global_repeats_var is not None
+                    else "1"
+                ),
             }
 
         def _apply_preset_values(values: dict[str, str]) -> None:
@@ -539,6 +547,28 @@ class CreateJobWindow:
                 gc_var.set(self.flag_to_bool(values["enable_gc"]))
             if "enable_grad_ckpt" in values:
                 sdxl_grad_ckpt_var.set(self.flag_to_bool(values["enable_grad_ckpt"]))
+            if "global_repeats" in values:
+                try:
+                    preset_global_repeats = int(str(values["global_repeats"]).strip())
+                except Exception:
+                    preset_global_repeats = 1
+                if preset_global_repeats > 1:
+                    if global_repeats_var is not None:
+                        global_repeats_var.set(str(preset_global_repeats))
+                    else:
+                        _pending_global_repeats_from_preset["value"] = str(preset_global_repeats)
+                        _pending_global_repeats_from_preset["apply"] = True
+                else:
+                    # Reset the global control to 1, but do not overwrite per-dataset repeats.
+                    if global_repeats_var is not None:
+                        _suppress_global_repeats_apply["enabled"] = True
+                        try:
+                            global_repeats_var.set("1")
+                        finally:
+                            _suppress_global_repeats_apply["enabled"] = False
+                    else:
+                        _pending_global_repeats_from_preset["value"] = "1"
+                        _pending_global_repeats_from_preset["apply"] = False
 
         def _preset_names_for_model(model_name: str) -> list[str]:
             selected_family = _model_to_family.get(model_name, "")
@@ -1264,6 +1294,8 @@ class CreateJobWindow:
         global_repeats_frame.columnconfigure(4, minsize=26)
         
         def _apply_global_repeats(*_args: object) -> None:
+            if _suppress_global_repeats_apply["enabled"]:
+                return
             val = global_repeats_var.get().strip()
             if not val or not val.isdigit():
                 return
@@ -1683,6 +1715,19 @@ class CreateJobWindow:
             _repeats_var.trace_add("write", lambda *_args: _refresh_estimated_epochs())
             dataset_entries.append({"name": _ds["name"], "num_repeats_var": _repeats_var, "frame": None})
         _rebuild_ds_rows()
+        if _pending_global_repeats_from_preset["value"] is not None:
+            pending_value = str(_pending_global_repeats_from_preset["value"])
+            pending_apply = bool(_pending_global_repeats_from_preset.get("apply", False))
+            if pending_apply:
+                global_repeats_var.set(pending_value)
+            else:
+                _suppress_global_repeats_apply["enabled"] = True
+                try:
+                    global_repeats_var.set(pending_value)
+                finally:
+                    _suppress_global_repeats_apply["enabled"] = False
+            _pending_global_repeats_from_preset["value"] = None
+            _pending_global_repeats_from_preset["apply"] = False
 
         # Add dataset row
         add_row = self.ttk.Frame(datasets_section, padding=(0, 8, 0, 0))
