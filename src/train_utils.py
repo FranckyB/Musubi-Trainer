@@ -541,9 +541,17 @@ def run_command(
         if os.name == "nt" and return_code in (3221225477, -1073741819):
             message += (
                 "\nWindows crash code 0xC0000005 (access violation) detected. "
-                "This is commonly caused by CUDA OOM / VRAM exhaustion or a GPU driver reset. "
-                "Try reducing batch size/resolution, closing other GPU apps, or using a lower-memory model path."
+                "This can be caused by CUDA OOM, Windows commit-limit/pagefile pressure, or a GPU driver reset. "
+                "It can happen even when Task Manager memory is not maxed, because commit limit (RAM + page file) "
+                "can still be exhausted or a CUDA kernel/library can crash (for example bitsandbytes 4-bit paths). "
+                "Try reducing batch size/resolution, updating GPU driver/CUDA stack or increasing page file size"
             )
+            lower_cmd = cmd_text.lower()
+            if "ltx2_cache_text_encoder_outputs.py" in lower_cmd and "--gemma_load_in_4bit" in lower_cmd:
+                message += (
+                    "\nLTX Gemma 4-bit cache hint: disable gemma_load_in_4bit or use a non-4-bit Gemma loading path "
+                    "to rule out bitsandbytes kernel instability on this setup."
+                )
         return message
 
     def _cancel_subprocess(proc: subprocess.Popen) -> None:
@@ -605,6 +613,8 @@ def run_command(
                         logger("\r" + cleaned)
                 else:
                     _echo_console(cleaned)
+                    if stream_to_logger and logger is not None:
+                        logger(cleaned)
             elif stream_mode == "train_progress":
                 if train_progress_re.search(cleaned):
                     _echo_console(cleaned, "\r")
@@ -612,6 +622,8 @@ def run_command(
                         logger("\r" + cleaned)
                 else:
                     _echo_console(cleaned)
+                    if stream_to_logger and logger is not None:
+                        logger(cleaned)
             else:
                 _echo_console(cleaned)
                 if stream_to_logger and logger is not None:
@@ -630,6 +642,8 @@ def run_command(
                     logger("\r" + cleaned)
             else:
                 _echo_console(cleaned)
+                if stream_to_logger and logger is not None:
+                    logger(cleaned)
         elif stream_mode == "train_progress":
             if train_progress_re.search(cleaned):
                 _echo_console(cleaned, "\r")
@@ -637,6 +651,8 @@ def run_command(
                     logger("\r" + cleaned)
             else:
                 _echo_console(cleaned)
+                if stream_to_logger and logger is not None:
+                    logger(cleaned)
         else:
             _echo_console(cleaned)
             if stream_to_logger and logger is not None:
@@ -737,12 +753,33 @@ def run_command(
                                     output_tail = "\n".join(lines[-40:])
                             except OSError:
                                 output_tail = ""
+                        failure_message = _format_command_failure(return_code)
+                        lower_tail = output_tail.lower()
+                        if (
+                            os.name == "nt"
+                            and (
+                                "os error 1455" in lower_tail
+                                or "paging file is too small" in lower_tail
+                            )
+                        ):
+                            failure_message += (
+                                "\nWindows virtual-memory error 1455 detected (paging file too small for this load). "
+                                "This can fail even with free RAM because safetensors memory-maps large checkpoint files and "
+                                "requires enough commit limit (RAM + page file). Task Manager RAM may still look below max. "
+                                "Increase the page file size, reboot, and retry."
+                            )
+                        if logger is not None:
+                            logger(failure_message)
+                            if output_tail:
+                                logger("--- command output (tail) ---")
+                                for tail_line in output_tail.splitlines():
+                                    logger(tail_line.lstrip("\r"))
                         if output_tail:
                             raise RuntimeError(
-                                f"{_format_command_failure(return_code)}\n"
+                                f"{failure_message}\n"
                                 f"--- command output (tail) ---\n{output_tail}"
                             )
-                        raise RuntimeError(_format_command_failure(return_code))
+                        raise RuntimeError(failure_message)
                     return
                 time.sleep(0.2)
     finally:

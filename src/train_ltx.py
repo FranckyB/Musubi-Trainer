@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import shlex
 import re
+import traceback
 from pathlib import Path
 from typing import Callable
 
@@ -646,8 +647,16 @@ def run_job(
         logger("Job cancelled by user.")
         return JOB_EXIT_CANCELLED
     except Exception as exc:
-        message = str(exc)
+        message = str(exc).strip()
+        if not message:
+            message = f"{exc.__class__.__name__}: {exc!r}"
         logger(f"Job failed for '{output_name}': {message}")
+        trace_text = traceback.format_exc().rstrip()
+        if trace_text:
+            logger(trace_text)
         if on_error:
-            on_error(message)
+            if trace_text:
+                on_error(f"{message}\n\nTraceback:\n{trace_text}")
+            else:
+                on_error(message)
         return JOB_EXIT_FAILED

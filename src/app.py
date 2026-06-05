@@ -4323,12 +4323,28 @@ def _launch_ui_impl() -> int:
                     ):
                         log_status(f"[Train] Stopped: {job_name}")
                     else:
-                        log_status(f"[Train] Failed: {job_name}")
+                        failure_status = f"[Train] Failed: {job_name}"
+                        failure_details = (job_error_details or "").strip()
+                        if failure_details:
+                            failure_headline = failure_details.splitlines()[0].strip()
+                            if failure_headline:
+                                failure_status = f"{failure_status} - {failure_headline}"
+                        log_status(failure_status)
 
                     if (
                         exit_code not in {JOB_EXIT_SUCCESS, JOB_EXIT_CANCELLED}
                         and not (run_cancel_event is not None and run_cancel_event.is_set())
                     ):
+                        details_text = (job_error_details or "").strip()
+                        if details_text:
+                            log(f"[Queue] Failure details for {job_name}:")
+                            log(details_text)
+                            # Mirror full details to the main console as well.
+                            log_status(f"[Queue] Failure details for {job_name}:\n{details_text}")
+                        else:
+                            log_status(
+                                f"[Queue] Failure details for {job_name}: (no extended details captured)"
+                            )
                         notify_job_failure_popup(job_name, job_error_details)
                         log(
                             "[Queue] Tip: If this started after changing dataset repeats/resolution/model settings, "
