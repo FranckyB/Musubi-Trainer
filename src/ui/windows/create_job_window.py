@@ -58,6 +58,14 @@ class CreateJobWindow:
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(0, weight=1)
 
+        def _clear_focus(event: EventType) -> None:
+            dialog.focus_set()
+        
+        dialog.bind_class("TEntry", "<Return>", _clear_focus)
+        dialog.bind_class("TEntry", "<KP_Enter>", _clear_focus)
+        dialog.bind_class("TSpinbox", "<Return>", _clear_focus)
+        dialog.bind_class("TSpinbox", "<KP_Enter>", _clear_focus)
+
         outer = self.ttk.Frame(dialog, padding=10)
         outer.grid(row=0, column=0, sticky="nsew")
         outer.columnconfigure(0, weight=1)
@@ -209,7 +217,42 @@ class CreateJobWindow:
                 if isinstance(k, str) and isinstance(v, str)
             }
 
-        self.ttk.Label(header_frame, text="LoRA name:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.ttk.Style().configure(
+            "MultiJobBar.TFrame",
+            background="#0090d8",
+        )
+        self.ttk.Style().configure(
+            "MultiJob.TCheckbutton",
+            foreground="#ffffff",
+            font=("Segoe UI", 9, "bold"),
+            background="#0090d8",
+        )
+        self.ttk.Style().map(
+            "MultiJob.TCheckbutton",
+            background=[("active", "#0090d8")],
+            foreground=[("active", "#ffffff")]
+        )
+
+        multi_job_var = self.tk.BooleanVar(value=False)
+        multi_job_frame = self.ttk.Frame(header_frame, style="MultiJobBar.TFrame")
+        
+        self.ttk.Checkbutton(
+            multi_job_frame,
+            text=" Create 1 Job per Dataset",
+            variable=multi_job_var,
+            style="MultiJob.TCheckbutton",
+            padding=(6, 4)
+        ).pack(side="left", fill="both", expand=True)
+
+        def _on_multi_job_toggle(*_args: object) -> None:
+            if multi_job_var.get():
+                _lora_name_entry.configure(state="disabled")
+            else:
+                _lora_name_entry.configure(state="normal")
+        multi_job_var.trace_add("write", _on_multi_job_toggle)
+
+        label_lora = self.ttk.Label(header_frame, text="LoRA name:")
+        label_lora.grid(row=0, column=0, sticky="w", padx=(0, 8))
         _lora_name_entry = self.ttk.Entry(header_frame, textvariable=job_name_var, style="Flat.TEntry")
         _lora_name_entry.grid(row=0, column=1, sticky="ew")
         _lora_name_entry.bind("<Key>", lambda _e: _job_name_user_edited.__setitem__(0, True))
@@ -566,12 +609,16 @@ class CreateJobWindow:
             self.attach_hover_tooltip(input_widget, text)
 
         def _spinbox_positive_int_validator(proposed: str) -> bool:
-            if not proposed or not proposed.isdigit():
+            if not proposed:
+                return True
+            if not proposed.isdigit():
                 return False
             return int(proposed) >= 1
 
         def _spinbox_non_negative_int_validator(proposed: str) -> bool:
-            if not proposed or not proposed.isdigit():
+            if not proposed:
+                return True
+            if not proposed.isdigit():
                 return False
             return int(proposed) >= 0
 
@@ -1112,19 +1159,55 @@ class CreateJobWindow:
         # Resolution row (written to [general] section of dataset.toml)
         res_row = self.ttk.Frame(datasets_section)
         res_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        res_row.columnconfigure(1, weight=1)
         _saved_res = int((existing_job or {}).get("resolution", str(self.DEFAULT_RESOLUTION)))
         _saved_res_str = str(_saved_res) if _saved_res in self.RESOLUTION_CHOICES else str(self.RESOLUTION_CHOICES[self.RESOLUTION_CHOICES.index(1024)])
         train_resolution_var = self.tk.StringVar(value=_saved_res_str)
         _ltx_resolution_choices = (1280, 1920)
         _ltx_resolution_choice_values = [str(r) for r in _ltx_resolution_choices]
         _default_resolution_choice_values = [str(r) for r in self.RESOLUTION_CHOICES]
-        self.ttk.Label(res_row, text="Resolution:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        
+        res_left = self.ttk.Frame(res_row)
+        res_left.grid(row=0, column=0, sticky="w")
+        self.ttk.Label(res_left, text="Resolution:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         _resolution_combo = self.ttk.Combobox(
-            res_row, textvariable=train_resolution_var,
+            res_left, textvariable=train_resolution_var,
             values=_default_resolution_choice_values,
             state="readonly", width=7,
         )
         _resolution_combo.grid(row=0, column=1, sticky="w")
+        
+        # Apply to all repeats controls
+        global_repeats_var = self.tk.StringVar(value="1")
+        global_repeats_frame = self.ttk.Frame(res_row)
+        global_repeats_frame.grid(row=0, column=2, sticky="e", padx=(0, 36))
+        
+        def _apply_global_repeats(*_args: object) -> None:
+            val = global_repeats_var.get().strip()
+            if not val or not val.isdigit():
+                return
+            for entry in dataset_entries:
+                entry["num_repeats_var"].set(val)
+        
+        self.ttk.Label(global_repeats_frame, text="Repeats All:", style="CardMeta.TLabel").grid(row=0, column=0, sticky="e", padx=(0, 6))
+        self.ttk.Spinbox(
+            global_repeats_frame,
+            textvariable=global_repeats_var,
+            from_=1, to=9999, increment=1,
+            validate="key", validatecommand=_positive_int_spin_validate_cmd,
+            width=8, style="Flat.TEntry",
+        ).grid(row=0, column=1, sticky="e")
+        self.ttk.Button(
+            global_repeats_frame, text="-", style="QueueAction.TButton", width=2,
+            command=lambda: (_step_positive_int_var(global_repeats_var, -1), _apply_global_repeats())
+        ).grid(row=0, column=2, sticky="e", padx=(4, 0))
+        self.ttk.Button(
+            global_repeats_frame, text="+", style="QueueAction.TButton", width=2,
+            command=lambda: (_step_positive_int_var(global_repeats_var, 1), _apply_global_repeats())
+        ).grid(row=0, column=3, sticky="e", padx=(2, 0))
+        
+        # We bind return key to unfocus, and trace write so direct typing also syncs
+        global_repeats_var.trace_add("write", _apply_global_repeats)
 
         def _sync_resolution_controls() -> None:
             model_name = model_var.get().strip()
@@ -1424,6 +1507,12 @@ class CreateJobWindow:
             )
 
         def _rebuild_ds_rows() -> None:
+            if len(dataset_entries) > 1:
+                multi_job_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            else:
+                multi_job_var.set(False)
+                multi_job_frame.grid_remove()
+
             for child in ds_inner.winfo_children():
                 child.destroy()
             for idx, entry in enumerate(dataset_entries):
@@ -1670,171 +1759,267 @@ class CreateJobWindow:
                     return
                 datasets_config.append({"name": entry["name"], "num_repeats": repeats})
 
-            existing_index: int | None = None
-            if existing_job is not None:
-                try:
-                    existing_index = self.job_queue.index(existing_job)
-                except ValueError:
-                    existing_index = None
+            is_multi_job = multi_job_var.get() and existing_job is None
+            jobs_to_create: list[tuple[str, str, list[dict]]] = []
 
-            for idx, queued_job in enumerate(self.job_queue):
-                if existing_index is not None and idx == existing_index:
-                    continue
-                if queued_job.get("job_name", "").strip().lower() == job_name.lower():
-                    self.messagebox.showerror("Duplicate name", "LoRA name already exists in queue.", parent=dialog)
-                    return
-
-            existing_training_name = ""
-            if existing_job is not None:
-                existing_training_name = (
-                    (existing_job or {}).get("training_name", "").strip()
-                    or (existing_job or {}).get("job_name", "").strip()
-                )
-
-            training_name = job_name
-            renamed_training_folder = False
-
-            if existing_job is not None and existing_training_name and training_name != existing_training_name:
-                source_training_dir = self.training_job_dir_path(existing_training_name).expanduser()
-                target_training_dir = self.training_job_dir_path(training_name).expanduser()
-
-                if target_training_dir.exists():
-                    self.messagebox.showerror(
-                        "Duplicate name",
-                        (
-                            "A job folder with this LoRA name already exists:\n"
-                            f"{target_training_dir}\n\n"
-                            "Choose a different name."
-                        ),
-                        parent=dialog,
-                    )
-                    return
-
-                if source_training_dir.exists() and source_training_dir.is_dir():
+            if is_multi_job:
+                selected_model = model_var.get().strip() or "Klein"
+                fam_label = _family_label(selected_model)
+                for ds in datasets_config:
+                    base_name = f"{ds['name']}_{fam_label}"
+                    final_name = self.unique_job_name(base_name)
+                    jobs_to_create.append((final_name, final_name, [ds]))
+            else:
+                existing_index: int | None = None
+                if existing_job is not None:
                     try:
-                        shutil.move(str(source_training_dir), str(target_training_dir))
-                        renamed_training_folder = True
-                    except OSError as exc:
+                        existing_index = self.job_queue.index(existing_job)
+                    except ValueError:
+                        existing_index = None
+
+                for idx, queued_job in enumerate(self.job_queue):
+                    if existing_index is not None and idx == existing_index:
+                        continue
+                    if queued_job.get("job_name", "").strip().lower() == job_name.lower():
+                        self.messagebox.showerror("Duplicate name", "LoRA name already exists in queue.", parent=dialog)
+                        return
+
+                existing_training_name = ""
+                if existing_job is not None:
+                    existing_training_name = (
+                        (existing_job or {}).get("training_name", "").strip()
+                        or (existing_job or {}).get("job_name", "").strip()
+                    )
+
+                training_name = job_name
+                jobs_to_create.append((job_name, training_name, datasets_config))
+
+            created_count = 0
+
+            # ── Async creation loop so UI and loader can animate ──
+            loading_overlay = self.tk.Toplevel(dialog)
+            loading_overlay.overrideredirect(True)
+            loading_overlay.configure(bg=self.bg_panel, bd=2, relief="solid")
+            loading_overlay.attributes("-topmost", True)
+            
+            dialog.update_idletasks()
+            ox = dialog.winfo_x() + max(0, (dialog.winfo_width() - 320) // 2)
+            oy = dialog.winfo_y() + max(0, (dialog.winfo_height() - 120) // 2)
+            loading_overlay.geometry(f"320x120+{ox}+{oy}")
+            
+            total_jobs = len(jobs_to_create)
+            
+            _lbl = self.ttk.Label(
+                loading_overlay, 
+                text=f"Creating Jobs... 0/{total_jobs}", 
+                font=("Segoe UI", 11, "bold"), 
+                background=self.bg_panel,
+                foreground="#ffffff"
+            )
+            _lbl.pack(pady=(25, 6))
+
+            _pb_frame = self.tk.Frame(loading_overlay, height=8, width=240, bg=self.bg_panel)
+            _pb_frame.pack_propagate(False)
+            _pb_frame.pack(pady=(0, 12))
+
+            _pb_bg = self.tk.Canvas(
+                _pb_frame,
+                width=240,
+                height=8,
+                bg="#1e1e1e",
+                bd=0,
+                highlightthickness=0,
+            )
+            _pb_bg.pack(fill="both", expand=True)
+            _pb_fill = _pb_bg.create_rectangle(0, 0, 0, 8, fill="#0090d8", width=0)
+
+            def _set_progress(value: int) -> None:
+                clamped = max(0, min(value, total_jobs))
+                ratio = 0.0 if total_jobs <= 0 else (clamped / total_jobs)
+                width = int(240 * ratio)
+                _pb_bg.coords(_pb_fill, 0, 0, width, 8)
+                _pb_bg.update_idletasks()
+
+            _set_progress(0)
+            
+            loading_overlay.update()  # Force render immediately 
+
+            jobs_to_process = list(jobs_to_create)
+            
+            def _process_next_job() -> None:
+                nonlocal created_count
+                if not jobs_to_process:
+                    _finalize_jobs()
+                    return
+
+                current_job_name, current_training_name, current_datasets_config = jobs_to_process.pop(0)
+
+                renamed_training_folder = False
+
+                if existing_job is not None and existing_training_name and current_training_name != existing_training_name:
+                    source_training_dir = self.training_job_dir_path(existing_training_name).expanduser()
+                    target_training_dir = self.training_job_dir_path(current_training_name).expanduser()
+
+                    if target_training_dir.exists():
+                        loading_overlay.destroy()
                         self.messagebox.showerror(
-                            "Rename failed",
-                            f"Could not rename job folder:\n{exc}",
+                            "Duplicate name",
+                            (
+                                "A job folder with this LoRA name already exists:\n"
+                                f"{target_training_dir}\n\n"
+                                "Choose a different name."
+                            ),
                             parent=dialog,
                         )
                         return
 
-            try:
-                training_dir_path, output_root, created_captions = self.ensure_training_job_structure(
-                    training_name=training_name,
-                    datasets=datasets_config,
-                    resolution=resolution_value,
-                    batch_size=batch_size_value,
-                    default_caption_keyword=self.settings_state.get(self.DEFAULT_CAPTION_KEYWORD_KEY, ""),
-                    model_name=model_var.get().strip(),
-                )
-            except Exception as exc:
-                self.messagebox.showerror("Create job failed", str(exc), parent=dialog)
-                return
+                    if source_training_dir.exists() and source_training_dir.is_dir():
+                        try:
+                            shutil.move(str(source_training_dir), str(target_training_dir))
+                            renamed_training_folder = True
+                        except OSError as exc:
+                            loading_overlay.destroy()
+                            self.messagebox.showerror(
+                                "Rename failed",
+                                f"Could not rename job folder:\n{exc}",
+                                parent=dialog,
+                            )
+                            return
 
-            primary_dataset = datasets_config[0]["name"]
-            tracker_name = self.settings_state.get(self.TRAIN_LOG_TRACKER_NAME_KEY, "").strip() or job_name
+                try:
+                    training_dir_path, output_root, created_captions = self.ensure_training_job_structure(
+                        training_name=current_training_name,
+                        datasets=current_datasets_config,
+                        resolution=resolution_value,
+                        batch_size=batch_size_value,
+                        default_caption_keyword=self.settings_state.get(self.DEFAULT_CAPTION_KEYWORD_KEY, ""),
+                        model_name=model_var.get().strip(),
+                    )
+                except Exception as exc:
+                    loading_overlay.destroy()
+                    self.messagebox.showerror("Create job failed", str(exc), parent=dialog)
+                    return
 
-            new_job = {
-                "id": training_name,
-                "dataset_name": primary_dataset,
-                "datasets_json": json.dumps(datasets_config),
-                "training_name": training_name,
-                "training_dir": str(training_dir_path),
-                "job_name": job_name,
-                "model": model_var.get().strip() or "Klein",
-                "ltx_mode": _normalize_ltx_mode_ui(ltx_mode_var.get()),
-                "output_dir": str(output_root),
-                "resolution": str(resolution_value),
-                "batch_size": str(batch_size_value),
-                "save_every_n_steps": str(save_every_n_steps_value),
-                "network_dim": train_network_dim_var.get().strip(),
-                "network_alpha": train_network_alpha_var.get().strip(),
-                "optimizer_type": train_optimizer,
-                "optimizer_args": train_optimizer_args,
-                "learning_rate": train_learning_rate,
-                "train_steps": train_steps_var.get().strip(),
-                "lr_scheduler": lr_scheduler_value,
-                "lr_warmup_steps": str(lr_warmup_steps_value),
-                "gradient_accumulation_steps": str(grad_accum_value),
-                "blocks_to_swap": str(blocks_to_swap_value),
-                "timestep_sampling": timestep_sampling_value,
-                "ltx_lora_target_preset": ltx_lora_target_preset_value,
-                "ltx_first_frame_conditioning_p": str(ltx_first_frame_conditioning_p_value),
-                "ltx_gemma_load_in_4bit": self.bool_to_flag(ltx_gemma_load_in_4bit_var.get()),
-                "sd_unet_lr": sd_unet_lr_value,
-                "sd_text_encoder_lr": sd_text_encoder_lr_value,
-                "enable_compile": self.bool_to_flag(compile_var.get()),
-                "enable_tf32": self.bool_to_flag(tf32_var.get()),
-                "enable_cudnn": self.bool_to_flag(cudnn_var.get()),
-                "enable_fp8": self.bool_to_flag(fp8_var.get()),
-                "enable_gc": self.bool_to_flag(gc_var.get()),
-                "enable_grad_ckpt": self.bool_to_flag(sdxl_grad_ckpt_var.get()),
-                "enable_logging": self.bool_to_flag(self.is_truthy(self.settings_state.get(self.TRAIN_ENABLE_LOGGING_KEY), default=True)),
-                "tracker_name": tracker_name,
-                "stream_output": self.bool_to_flag(self.is_truthy(self.settings_state.get(self.TRAIN_STREAM_TO_LOGGER_KEY), default=False)),
-                "auto_cleanup": (existing_job or {}).get("auto_cleanup", "1"),
-                "hold": (existing_job or {}).get("hold", "0"),
-                "status": "queued",
-            }
+                primary_dataset = current_datasets_config[0]["name"]
+                tracker_name = self.settings_state.get(self.TRAIN_LOG_TRACKER_NAME_KEY, "").strip() or current_job_name
 
-            new_job["status"] = self.detect_job_status(new_job)
+                new_job = {
+                    "id": current_training_name,
+                    "dataset_name": primary_dataset,
+                    "datasets_json": json.dumps(current_datasets_config),
+                    "training_name": current_training_name,
+                    "training_dir": str(training_dir_path),
+                    "job_name": current_job_name,
+                    "model": model_var.get().strip() or "Klein",
+                    "ltx_mode": _normalize_ltx_mode_ui(ltx_mode_var.get()),
+                    "output_dir": str(output_root),
+                    "resolution": str(resolution_value),
+                    "batch_size": str(batch_size_value),
+                    "save_every_n_steps": str(save_every_n_steps_value),
+                    "network_dim": train_network_dim_var.get().strip(),
+                    "network_alpha": train_network_alpha_var.get().strip(),
+                    "optimizer_type": train_optimizer,
+                    "optimizer_args": train_optimizer_args,
+                    "learning_rate": train_learning_rate,
+                    "train_steps": train_steps_var.get().strip(),
+                    "lr_scheduler": lr_scheduler_value,
+                    "lr_warmup_steps": str(lr_warmup_steps_value),
+                    "gradient_accumulation_steps": str(grad_accum_value),
+                    "blocks_to_swap": str(blocks_to_swap_value),
+                    "timestep_sampling": timestep_sampling_value,
+                    "ltx_lora_target_preset": ltx_lora_target_preset_value,
+                    "ltx_first_frame_conditioning_p": str(ltx_first_frame_conditioning_p_value),
+                    "ltx_gemma_load_in_4bit": self.bool_to_flag(ltx_gemma_load_in_4bit_var.get()),
+                    "sd_unet_lr": sd_unet_lr_value,
+                    "sd_text_encoder_lr": sd_text_encoder_lr_value,
+                    "enable_compile": self.bool_to_flag(compile_var.get()),
+                    "enable_tf32": self.bool_to_flag(tf32_var.get()),
+                    "enable_cudnn": self.bool_to_flag(cudnn_var.get()),
+                    "enable_fp8": self.bool_to_flag(fp8_var.get()),
+                    "enable_gc": self.bool_to_flag(gc_var.get()),
+                    "enable_grad_ckpt": self.bool_to_flag(sdxl_grad_ckpt_var.get()),
+                    "enable_logging": self.bool_to_flag(self.is_truthy(self.settings_state.get(self.TRAIN_ENABLE_LOGGING_KEY), default=True)),
+                    "tracker_name": tracker_name,
+                    "stream_output": self.bool_to_flag(self.is_truthy(self.settings_state.get(self.TRAIN_STREAM_TO_LOGGER_KEY), default=False)),
+                    "auto_cleanup": (existing_job or {}).get("auto_cleanup", "1"),
+                    "hold": (existing_job or {}).get("hold", "0"),
+                    "status": "queued",
+                }
 
-            auto_fixed_elements = 0
-            if existing_job is not None:
-                for _attempt in range(5):
-                    has_mismatch, source_base = self.detect_job_element_base_mismatch(new_job)
-                    if not has_mismatch or source_base is None:
-                        break
-                    renamed_count, _conflicts = self.rename_job_elements_to_training_name(new_job, source_base)
-                    auto_fixed_elements += renamed_count
-                    if renamed_count == 0:
-                        break
+                new_job["status"] = self.detect_job_status(new_job)
 
-            if existing_job is None:
-                self.job_queue.append(new_job)
-            else:
-                if existing_index is None:
+                auto_fixed_elements = 0
+                if existing_job is not None:
+                    for _attempt in range(5):
+                        has_mismatch, source_base = self.detect_job_element_base_mismatch(new_job)
+                        if not has_mismatch or source_base is None:
+                            break
+                        renamed_count, _conflicts = self.rename_job_elements_to_training_name(new_job, source_base)
+                        auto_fixed_elements += renamed_count
+                        if renamed_count == 0:
+                            break
+                
+                if existing_job is None:
                     self.job_queue.append(new_job)
                 else:
-                    self.job_queue[existing_index] = new_job
+                    if existing_index is None:
+                        self.job_queue.append(new_job)
+                    else:
+                        self.job_queue[existing_index] = new_job
 
-            self.save_job_to_disk(new_job)
-            generated_training_args = True
-            generator = getattr(self, "ensure_job_training_args_toml", None)
-            if callable(generator):
-                try:
-                    generated_training_args = bool(generator(new_job))
-                except Exception:
-                    generated_training_args = False
-            self.save_job_order()
-            if renamed_training_folder:
-                self.load_job_queue_from_disk()
-            self.refresh_job_queue_list()
-            self.update_start_button_state()
+                self.save_job_to_disk(new_job)
+                
+                generated_training_args = True
+                generator = getattr(self, "ensure_job_training_args_toml", None)
+                if callable(generator):
+                    try:
+                        # To avoid UI access to dialog vars inside generator, it uses job dict
+                        generated_training_args = bool(generator(new_job))
+                    except Exception:
+                        generated_training_args = False
 
-            if not generated_training_args:
-                self.log(
-                    f"[Queue] Note: Could not pre-generate training_args.toml for {job_name}; "
-                    "it will be generated at launch if missing."
-                )
+                if not generated_training_args:
+                    self.log(
+                        f"[Queue] Note: Could not pre-generate training_args.toml for {current_job_name}; "
+                        "it will be generated at launch if missing."
+                    )
 
-            ds_names = ", ".join(d["name"] for d in datasets_config)
-            if existing_job is None:
-                self.log(f"[Queue] Created job: {job_name} (datasets: {ds_names}, training: {training_name}, captions added: {created_captions})")
-                for var in self.vars_by_name.values():
-                    var.set(False)
-                for name in list(self.card_frame_by_name.keys()):
-                    self.apply_card_style(name)
-            else:
-                if auto_fixed_elements > 0:
-                    self.log(f"[Queue] Updated job: {job_name} (datasets: {ds_names}, training: {training_name}, captions added: {created_captions}, renamed elements: {auto_fixed_elements})")
+                ds_names = ", ".join(d["name"] for d in current_datasets_config)
+                if existing_job is None:
+                    self.log(f"[Queue] Created job: {current_job_name} (datasets: {ds_names}, training: {current_training_name}, captions added: {created_captions})")
                 else:
-                    self.log(f"[Queue] Updated job: {job_name} (datasets: {ds_names}, training: {training_name}, captions added: {created_captions})")
-            dialog.destroy()
+                    if auto_fixed_elements > 0:
+                        self.log(f"[Queue] Updated job: {current_job_name} (datasets: {ds_names}, training: {current_training_name}, captions added: {created_captions}, renamed elements: {auto_fixed_elements})")
+                    else:
+                        self.log(f"[Queue] Updated job: {current_job_name} (datasets: {ds_names}, training: {current_training_name}, captions added: {created_captions})")
+                
+                created_count += 1
+                
+                # Update animated UI
+                _set_progress(created_count)
+                _lbl.configure(text=f"Creating Jobs... {created_count}/{total_jobs}")
+                loading_overlay.update_idletasks()
+                
+                # Re-schedule safely back into the event loop
+                dialog.after_idle(_process_next_job)
+                
+            def _finalize_jobs() -> None:
+                loading_overlay.destroy()
+                self.save_job_order()
+                self.refresh_job_queue_list()
+                self.update_start_button_state()
+                if existing_job is None:
+                    for var in self.vars_by_name.values():
+                        var.set(False)
+                    for card in self.card_frame_by_name.values():
+                        if callable(getattr(self, "dataset_name_from_widget", None)):
+                            self.apply_card_style(self.dataset_name_from_widget(card))
+                    for name in list(self.card_frame_by_name.keys()):
+                        self.apply_card_style(name)
+                
+                dialog.destroy()
+
+            _process_next_job()
 
         # ── Footer buttons ─────────────────────────────────────────────────
         buttons = self.ttk.Frame(outer, padding=(0, 10, 0, 0))

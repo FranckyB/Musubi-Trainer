@@ -154,6 +154,9 @@ def _launch_ui_impl() -> int:
     color_start_enabled_active = "#4dd97f"
     color_start_disabled = "#3b3b3b"
     color_start_in_progress = "#ff8c00"
+    color_create_job_enabled = "#2f7de1"
+    color_create_job_enabled_active = "#4b93ec"
+    color_create_job_disabled = "#3b3b3b"
     workspace_dir = Path(__file__).resolve().parent.parent
     default_models_dir = workspace_dir / "Models"
     app_user_model_id = "MusubiTrainer.Launcher"
@@ -592,8 +595,15 @@ def _launch_ui_impl() -> int:
         foreground=fg_text,
         font=("Segoe UI", 10),
         borderwidth=0,
+        bordercolor="#141924",
+        lightcolor="#141924",
+        darkcolor="#141924",
         relief="flat",
         rowheight=52,
+    )
+    style.layout(
+        "Queue.Treeview",
+        [("Treeview.treearea", {"sticky": "nswe"})],
     )
     style.map(
         "Queue.Treeview",
@@ -614,16 +624,21 @@ def _launch_ui_impl() -> int:
     )
     style.configure(
         "QueueAction.TButton",
-        background="#1f1f1f",
-        padding=(0, 0),
-        borderwidth=0,
-        relief="flat",
-        focuscolor="#1f1f1f",
-        font=("Segoe UI Emoji", 10),
+        background="#3b3b3b",
+        foreground=fg_text,
+        padding=(10, 3),
+        borderwidth=1,
+        bordercolor="#505050",
+        lightcolor="#6a6a6a",
+        darkcolor="#2d2d2d",
+        relief="raised",
+        focuscolor="#3b3b3b",
+        font=("Segoe UI", 9),
     )
     style.map(
         "QueueAction.TButton",
-        background=[("active", "#1f1f1f"), ("disabled", "#1f1f1f")],
+        background=[("active", "#4a4a4a"), ("disabled", "#2f2f2f")],
+        foreground=[("disabled", "#8a8a8a")],
     )
     style.configure(
         "StartDisabled.TButton",
@@ -677,6 +692,23 @@ def _launch_ui_impl() -> int:
         foreground=[("active", "#ffffff"), ("disabled", "#ffffff")],
     )
     style.configure(
+        "CreateJobLarge.TButton",
+        background=color_create_job_enabled,
+        foreground="#ffffff",
+        padding=(10, 4),
+        borderwidth=1,
+        bordercolor="#2a64ad",
+        lightcolor="#6fa8f4",
+        darkcolor="#1f4d84",
+        relief="raised",
+        font=("Segoe UI", 9, "bold"),
+    )
+    style.map(
+        "CreateJobLarge.TButton",
+        background=[("active", color_create_job_enabled_active), ("disabled", color_create_job_disabled)],
+        foreground=[("active", "#ffffff"), ("disabled", "#c6c6c6")],
+    )
+    style.configure(
         "Sash",
         sashthickness=6,
         sashrelief="flat",
@@ -718,6 +750,12 @@ def _launch_ui_impl() -> int:
     queue_row_dividers: dict[str, tk.Frame] = {}
     queue_col_dividers: list[tk.Frame] = []
     queue_thumb_by_item: dict[str, ImageTk.PhotoImage] = {}
+    queue_selection_anchor: int | None = None
+    queue_select_toggle_var: tk.StringVar | None = None
+    queue_select_toggle_button: ttk.Button | None = None
+    queue_archive_button: ttk.Button | None = None
+    queue_restore_button: ttk.Button | None = None
+    queue_delete_button: ttk.Button | None = None
     runtime_config = runtime_config_from_settings(settings_state)
     tensorboard_host = "127.0.0.1"
     tensorboard_port = 6006
@@ -1210,12 +1248,11 @@ def _launch_ui_impl() -> int:
     header = ttk.Frame(root, padding=8)
     header.grid(row=0, column=0, sticky="ew")
     header.columnconfigure(0, weight=1)
-    training_path_var = tk.StringVar(value=f"Training folder: {runtime_config.training_dir}")
-    ttk.Label(header, textvariable=training_path_var).grid(row=0, column=0, sticky="w")
+    ttk.Label(header, text="Datasets:").grid(row=0, column=0, sticky="w")
 
-    controls = ttk.Frame(root, padding=(8, 0, 8, 8))
+    controls = ttk.Frame(root, padding=(8, 0, 8, 4))
     controls.grid(row=1, column=0, sticky="ew")
-    controls.columnconfigure(3, weight=1)
+    controls.columnconfigure(4, weight=1)
 
     def apply_settings_from_dialog(required: bool = False) -> bool:
         nonlocal runtime_config, dataset_order
@@ -1224,7 +1261,6 @@ def _launch_ui_impl() -> int:
             return False
 
         runtime_config = updated
-        training_path_var.set(f"Training folder: {runtime_config.training_dir}")
         dataset_order = load_dataset_order(settings_state)
         rebuild_folder_list(force=True)
         load_job_queue_from_disk()
@@ -2159,6 +2195,248 @@ def _launch_ui_impl() -> int:
         update_start_button_state()
         log(f"[Archive] Job '{job_name}' archived to: {dest}")
 
+    def archive_selected_jobs() -> None:
+        selected_indices = selected_queue_indices()
+        if not selected_indices:
+            messagebox.showinfo("Archive Jobs", "Select at least one job first.", parent=root)
+            return
+
+        selected_names = [job_queue[idx].get("job_name", "unnamed") for idx in selected_indices]
+        preview = "\n".join(f"- {name}" for name in selected_names[:12])
+        if len(selected_names) > 12:
+            preview += f"\n...and {len(selected_names) - 12} more"
+        if not messagebox.askyesno(
+            "Archive Jobs",
+            f"Archive {len(selected_indices)} selected job(s)?\n\n{preview}",
+            parent=root,
+        ):
+            return
+
+        dest_parent = archive_root_dir() / "Jobs"
+        archived_names: list[str] = []
+        errors: list[str] = []
+
+        for idx in sorted(selected_indices, reverse=True):
+            if idx < 0 or idx >= len(job_queue):
+                continue
+            job = job_queue[idx]
+            job_name = job.get("job_name", "unnamed")
+            training_name = job.get("training_name", "").strip() or job_name
+            training_dir = Path(job.get("training_dir", "")).expanduser()
+            if not training_dir.exists() and training_name:
+                training_dir = training_job_dir_path(training_name).expanduser()
+            dest = dest_parent / training_dir.name
+
+            overwrite = False
+            if dest.exists():
+                overwrite = messagebox.askyesno(
+                    "Archive Jobs",
+                    f"Archived job '{training_dir.name}' already exists. Overwrite it?",
+                    parent=root,
+                )
+                if not overwrite:
+                    continue
+
+            removed = job_queue.pop(idx)
+            remove_job_from_disk(removed)
+            archived_names.append(job_name)
+
+            if training_dir.exists() and training_dir.is_dir():
+                try:
+                    dest_parent.mkdir(parents=True, exist_ok=True)
+                    if overwrite and dest.exists():
+                        shutil.rmtree(dest)
+                    shutil.move(str(training_dir), str(dest))
+                except OSError as exc:
+                    errors.append(f"{job_name}: {exc}")
+
+        save_job_order()
+        refresh_job_queue_list()
+        update_start_button_state()
+
+        if archived_names:
+            log(f"[Archive] Archived {len(archived_names)} job(s): {', '.join(archived_names)}")
+        if errors:
+            messagebox.showerror(
+                "Archive Jobs",
+                "Some jobs were archived from the queue but their folders could not be moved:\n\n" + "\n".join(errors),
+                parent=root,
+            )
+
+    def open_restore_jobs_dialog() -> None:
+        archive_jobs_dir = archive_root_dir() / "Jobs"
+        if not archive_jobs_dir.exists() or not archive_jobs_dir.is_dir():
+            messagebox.showinfo("Restore Jobs", "No archived jobs found.", parent=root)
+            return
+
+        archived_names = sorted(
+            [child.name for child in archive_jobs_dir.iterdir() if child.is_dir()],
+            key=str.casefold,
+        )
+        if not archived_names:
+            messagebox.showinfo("Restore Jobs", "No archived jobs found.", parent=root)
+            return
+
+        dialog = tk.Toplevel(root)
+        dialog.title("Restore Archived Jobs")
+        dialog.transient(root)
+        dialog.grab_set()
+        dialog.configure(bg=bg_panel)
+        dialog.resizable(False, False)
+
+        outer = ttk.Frame(dialog, padding=10)
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
+
+        ttk.Label(outer, text="Archived Jobs:").grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        listbox = tk.Listbox(
+            outer,
+            selectmode="extended",
+            height=min(18, max(8, len(archived_names))),
+            bg="#0f1724",
+            fg=fg_text,
+            selectbackground="#1e4a7a",
+            selectforeground="#ffffff",
+            activestyle="none",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#2a4a72",
+            highlightcolor="#2a4a72",
+        )
+        listbox.grid(row=1, column=0, sticky="nsew")
+        for name in archived_names:
+            listbox.insert("end", name)
+
+        buttons = ttk.Frame(outer, padding=(0, 8, 0, 0))
+        buttons.grid(row=2, column=0, sticky="ew")
+
+        def _select_all() -> None:
+            listbox.selection_set(0, "end")
+
+        def _select_none() -> None:
+            listbox.selection_clear(0, "end")
+
+        def _restore_selected() -> None:
+            selected_positions = listbox.curselection()
+            if not selected_positions:
+                messagebox.showwarning("Restore Jobs", "Select at least one archived job.", parent=dialog)
+                return
+
+            selected_names = [listbox.get(pos) for pos in selected_positions]
+            jobs_root = jobs_storage_dir()
+            jobs_root.mkdir(parents=True, exist_ok=True)
+
+            restored: list[str] = []
+            errors: list[str] = []
+
+            for name in selected_names:
+                src = archive_jobs_dir / name
+                dest = jobs_root / name
+                if not src.exists() or not src.is_dir():
+                    errors.append(f"{name}: archived folder missing")
+                    continue
+
+                overwrite = False
+                if dest.exists():
+                    overwrite = messagebox.askyesno(
+                        "Restore Jobs",
+                        f"Job '{name}' already exists. Overwrite it?",
+                        parent=dialog,
+                    )
+                    if not overwrite:
+                        continue
+
+                try:
+                    if overwrite and dest.exists():
+                        shutil.rmtree(dest)
+                    shutil.move(str(src), str(dest))
+                    restored.append(name)
+                except OSError as exc:
+                    errors.append(f"{name}: {exc}")
+
+            if restored:
+                load_job_queue_from_disk()
+                refresh_job_queue_list()
+                update_start_button_state()
+                log(f"[Restore] Restored {len(restored)} job(s): {', '.join(restored)}")
+
+            if errors:
+                messagebox.showerror(
+                    "Restore Jobs",
+                    "Some jobs could not be restored:\n\n" + "\n".join(errors),
+                    parent=dialog,
+                )
+
+            if restored:
+                dialog.destroy()
+
+        ttk.Button(buttons, text="Select All", command=_select_all).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(buttons, text="Select None", command=_select_none).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(buttons, text="Restore Selected", style="QueueAction.TButton", command=_restore_selected).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=3)
+
+        center_window(dialog)
+
+    def delete_selected_jobs_with_confirmation() -> None:
+        selected_indices = selected_queue_indices()
+        if not selected_indices:
+            messagebox.showinfo("Delete Jobs", "Select at least one job first.", parent=root)
+            return
+
+        selected_names = [job_queue[idx].get("job_name", "unnamed") for idx in selected_indices]
+        preview = "\n".join(f"- {name}" for name in selected_names[:12])
+        if len(selected_names) > 12:
+            preview += f"\n...and {len(selected_names) - 12} more"
+        if not messagebox.askyesno(
+            "Delete Jobs",
+            (
+                f"Delete {len(selected_indices)} selected job(s)?\n\n"
+                "This removes them from the queue and deletes each job folder if it exists.\n\n"
+                f"{preview}"
+            ),
+            parent=root,
+        ):
+            return
+
+        deleted_names: list[str] = []
+        errors: list[str] = []
+
+        for idx in sorted(selected_indices, reverse=True):
+            if idx < 0 or idx >= len(job_queue):
+                continue
+            job = job_queue[idx]
+            job_name = job.get("job_name", "unnamed")
+            training_name = job.get("training_name", "").strip() or job_name
+            training_dir = Path(job.get("training_dir", "")).expanduser()
+            if not training_dir.exists() and training_name:
+                training_dir = training_job_dir_path(training_name).expanduser()
+
+            removed = job_queue.pop(idx)
+            remove_job_from_disk(removed)
+
+            if training_dir.exists() and training_dir.is_dir():
+                try:
+                    shutil.rmtree(training_dir)
+                except OSError as exc:
+                    errors.append(f"{job_name}: {exc}")
+
+            deleted_names.append(job_name)
+
+        save_job_order()
+        refresh_job_queue_list()
+        update_start_button_state()
+
+        if deleted_names:
+            log(f"[Queue] Deleted {len(deleted_names)} job(s): {', '.join(deleted_names)}")
+        if errors:
+            messagebox.showerror(
+                "Delete Jobs",
+                "Some job folders could not be deleted:\n\n" + "\n".join(errors),
+                parent=root,
+            )
+
     def show_thumbnail_context_menu(event: tk.Event, dataset_name: str) -> str:
         menu = tk.Menu(root, tearoff=0)
         menu.add_command(label="Edit Dataset", command=lambda: open_edit_dataset_dialog(dataset_name))
@@ -2183,8 +2461,13 @@ def _launch_ui_impl() -> int:
     top_pane.rowconfigure(1, weight=0)
     paned.add(top_pane, weight=3)
 
-    list_container = ttk.LabelFrame(top_pane, text="Datasets (click thumbnail to select)", padding=8)
-    list_container.grid(row=0, column=0, sticky="nsew")
+    dataset_table_border = tk.Frame(top_pane, bg="#2a4a72", bd=0, highlightthickness=0)
+    dataset_table_border.grid(row=0, column=0, sticky="nsew")
+    dataset_table_border.columnconfigure(0, weight=1)
+    dataset_table_border.rowconfigure(0, weight=1)
+
+    list_container = ttk.Frame(dataset_table_border, padding=2)
+    list_container.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
     list_container.columnconfigure(0, weight=1)
     list_container.columnconfigure(1, weight=0, minsize=12)
     list_container.rowconfigure(0, weight=1)
@@ -2227,26 +2510,19 @@ def _launch_ui_impl() -> int:
     start_bar.grid(row=1, column=0, sticky="ew")
     start_bar.columnconfigure(0, weight=1)
 
-    queue_container = ttk.LabelFrame(bottom_pane, text="", padding=8)
+    queue_container = ttk.Frame(bottom_pane, padding=(8, 0, 8, 8))
     queue_container.grid(row=0, column=0, sticky="nsew", pady=(0, 0))
     queue_container.columnconfigure(0, weight=1)
     queue_container.rowconfigure(1, weight=1)
 
     queue_header = ttk.Frame(queue_container)
-    queue_header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+    queue_header.grid(row=0, column=0, sticky="ew", pady=(0, 2))
     queue_header.columnconfigure(0, weight=1)
     ttk.Label(queue_header, text="Queue:", style="TLabel").grid(row=0, column=0, sticky="w")
-    ttk.Button(
-        queue_header,
-        text="Reload",
-        style="QueueAction.TButton",
-        command=lambda: (
-            load_job_queue_from_disk(),
-            refresh_job_queue_list(),
-            sync_queue_row_action_buttons(),
-            update_start_button_state(),
-        ),
-    ).grid(row=0, column=1, sticky="e")
+
+    queue_actions_bar = ttk.Frame(queue_header, padding=(0, 2, 0, 4))
+    queue_actions_bar.grid(row=1, column=0, columnspan=2, sticky="ew")
+    queue_actions_bar.columnconfigure(4, weight=1)
 
     queue_table_border = tk.Frame(queue_container, bg="#2a4a72", bd=0, highlightthickness=0)
     queue_table_border.grid(row=1, column=0, columnspan=2, sticky="nsew")
@@ -2257,8 +2533,9 @@ def _launch_ui_impl() -> int:
         queue_table_border,
         columns=("run", "thumb", "name", "source", "status", "actions"),
         show="tree headings",
-        selectmode="browse",
+        selectmode="extended",
         height=6,
+        takefocus=False,
         style="Queue.Treeview",
     )
     queue_list.heading("#0", text="", anchor="center")
@@ -2275,7 +2552,7 @@ def _launch_ui_impl() -> int:
     queue_list.column("source", width=118, minwidth=90, stretch=True, anchor="w")
     queue_list.column("status", width=96, minwidth=82, stretch=False, anchor="center")
     queue_list.column("actions", width=36, minwidth=32, stretch=False, anchor="center")
-    queue_list.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+    queue_list.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
     queue_list.tag_configure("row_even", background="#1c2534")
     queue_list.tag_configure("row_odd", background="#17202e")
     queue_list.tag_configure("row_running", background="#163326", foreground="#a7f3cc")
@@ -2960,27 +3237,104 @@ def _launch_ui_impl() -> int:
     def selected_dataset_names() -> list[str]:
         return [name for name, var in vars_by_name.items() if var.get()]
 
+    def update_dataset_select_toggle_state() -> None:
+        if dataset_select_toggle_var is None:
+            return
+        total_count = len(vars_by_name)
+        selected_count = sum(1 for var in vars_by_name.values() if var.get())
+        all_selected = total_count > 0 and selected_count == total_count
+        dataset_select_toggle_var.set("Select None" if all_selected else "Select All")
+        if dataset_select_toggle_button is not None:
+            dataset_select_toggle_button.state(["!disabled"] if total_count > 0 else ["disabled"])
+
+    def toggle_dataset_select_all_none() -> None:
+        if not vars_by_name:
+            update_dataset_select_toggle_state()
+            return
+
+        all_selected = all(var.get() for var in vars_by_name.values())
+        next_value = not all_selected
+        for name, var in vars_by_name.items():
+            var.set(next_value)
+            apply_card_style(name)
+        update_dataset_select_toggle_state()
+        update_start_button_state()
+
+    def selected_queue_indices() -> list[int]:
+        indices: list[int] = []
+        for item_id in queue_list.selection():
+            try:
+                idx = int(item_id)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < len(job_queue):
+                indices.append(idx)
+        return sorted(set(indices))
+
     def selected_queue_index() -> int | None:
-        selection = queue_list.selection()
-        if not selection:
+        indices = selected_queue_indices()
+        if not indices:
             return None
-        try:
-            index = int(selection[0])
-        except (TypeError, ValueError):
-            return None
-        if index < 0 or index >= len(job_queue):
-            return None
-        return index
+        return indices[0]
+
+    def set_queue_selection_indices(indices: list[int], anchor_index: int | None = None) -> None:
+        nonlocal queue_selection_anchor
+        valid = sorted({idx for idx in indices if 0 <= idx < len(job_queue)})
+        queue_list.selection_set([str(idx) for idx in valid])
+
+        if valid:
+            focus_idx = valid[-1]
+            focus_item = str(focus_idx)
+            queue_list.focus(focus_item)
+            queue_list.see(focus_item)
+
+        if anchor_index is not None and 0 <= anchor_index < len(job_queue):
+            queue_selection_anchor = anchor_index
+        elif valid:
+            queue_selection_anchor = valid[0]
+        else:
+            queue_selection_anchor = None
 
     def set_queue_selection(index: int) -> None:
         if index < 0 or index >= len(job_queue):
             return
-        item_id = str(index)
-        queue_list.selection_set(item_id)
-        queue_list.focus(item_id)
-        queue_list.see(item_id)
+        set_queue_selection_indices([index], anchor_index=index)
+
+    def update_queue_multi_action_state() -> None:
+        if queue_select_toggle_var is None:
+            return
+        selected_count = len(selected_queue_indices())
+        total_count = len(job_queue)
+        all_selected = total_count > 0 and selected_count == total_count
+        queue_select_toggle_var.set("Select None" if all_selected else "Select All")
+
+        if queue_select_toggle_button is not None:
+            queue_select_toggle_button.state(["!disabled"] if total_count > 0 else ["disabled"])
+        if queue_archive_button is not None:
+            queue_archive_button.state(["!disabled"] if selected_count > 0 else ["disabled"])
+        if queue_delete_button is not None:
+            queue_delete_button.state(["!disabled"] if selected_count > 0 else ["disabled"])
+        if queue_restore_button is not None:
+            queue_restore_button.state(["!disabled"])
+
+    def toggle_queue_select_all_none() -> None:
+        if not job_queue:
+            set_queue_selection_indices([])
+            update_queue_multi_action_state()
+            root.after_idle(sync_all_row_overlays)
+            return
+
+        selected = selected_queue_indices()
+        if len(selected) == len(job_queue):
+            set_queue_selection_indices([])
+        else:
+            set_queue_selection_indices(list(range(len(job_queue))), anchor_index=0)
+        update_queue_multi_action_state()
+        root.after_idle(sync_all_row_overlays)
 
     def refresh_job_queue_list() -> None:
+        selected_before = selected_queue_indices()
+        anchor_before = queue_selection_anchor
         queue_list.delete(*queue_list.get_children())
         queue_thumb_by_item.clear()
         for index, job in enumerate(job_queue):
@@ -3040,6 +3394,8 @@ def _launch_ui_impl() -> int:
         build_queue_row_action_buttons()
         build_queue_row_dividers()
         build_queue_col_dividers()
+        set_queue_selection_indices(selected_before, anchor_index=anchor_before)
+        update_queue_multi_action_state()
 
     def move_selected_queue_item(direction: int) -> None:
         idx = selected_queue_index()
@@ -3463,35 +3819,38 @@ def _launch_ui_impl() -> int:
         update_start_button_state()
         log(f"[Queue] Deleted job: {job_name}")
 
-    def on_queue_press(event: tk.Event) -> None:
-        nonlocal queue_drag_index, queue_drag_moved, queue_drag_allowed
+    def on_queue_press(event: tk.Event) -> str:
+        nonlocal queue_drag_index, queue_drag_moved, queue_drag_allowed, queue_selection_anchor
         if len(job_queue) == 0:
             queue_drag_index = None
             queue_drag_moved = False
             queue_drag_allowed = False
-            return
+            return "break"
         clicked_item = queue_list.identify_row(event.y)
+        state_bits = int(event.state or 0)
+        shift_pressed = bool(state_bits & 0x0001)
+        ctrl_pressed = bool(state_bits & 0x0004)
         if not clicked_item:
             queue_list.selection_set([])
+            queue_selection_anchor = None
+            update_queue_multi_action_state()
             root.after_idle(sync_all_row_overlays)
             queue_drag_index = None
             queue_drag_moved = False
             queue_drag_allowed = False
-            return
+            return "break"
         try:
             clicked = int(clicked_item)
         except ValueError:
             queue_drag_index = None
             queue_drag_moved = False
             queue_drag_allowed = False
-            return
+            return "break"
         if clicked < 0 or clicked >= len(job_queue):
             queue_drag_index = None
             queue_drag_moved = False
             queue_drag_allowed = False
-            return
-
-        set_queue_selection(clicked)
+            return "break"
 
         clicked_col = queue_list.identify_column(event.x)
         if clicked_col == "#1":
@@ -3499,11 +3858,32 @@ def _launch_ui_impl() -> int:
             queue_drag_index = None
             queue_drag_moved = False
             queue_drag_allowed = False
-            return
+            return "break"
 
-        queue_drag_allowed = clicked_col in {"#0", "#2", "#3", "#4", "#5"}
+        if shift_pressed:
+            anchor = queue_selection_anchor
+            if anchor is None:
+                existing = selected_queue_indices()
+                anchor = existing[0] if existing else clicked
+            start = min(anchor, clicked)
+            end = max(anchor, clicked)
+            set_queue_selection_indices(list(range(start, end + 1)), anchor_index=anchor)
+        elif ctrl_pressed:
+            current = set(selected_queue_indices())
+            if clicked in current:
+                current.remove(clicked)
+            else:
+                current.add(clicked)
+            set_queue_selection_indices(sorted(current), anchor_index=clicked)
+        else:
+            set_queue_selection(clicked)
+
+        update_queue_multi_action_state()
+
+        queue_drag_allowed = (not shift_pressed) and (not ctrl_pressed) and clicked_col in {"#0", "#2", "#3", "#4", "#5"}
         queue_drag_index = clicked if queue_drag_allowed else None
         queue_drag_moved = False
+        return "break"
 
     def on_queue_motion(event: tk.Event) -> None:
         nonlocal queue_drag_index, queue_drag_moved, queue_drag_allowed
@@ -3601,6 +3981,7 @@ def _launch_ui_impl() -> int:
             "set_dark_title_bar": set_dark_title_bar,
             "settings_state": settings_state,
             "training_job_dir_path": training_job_dir_path,
+            "unique_job_name": unique_job_name,
             "update_start_button_state": update_start_button_state,
             "vars_by_name": vars_by_name,
             "messagebox": messagebox,
@@ -3706,6 +4087,7 @@ def _launch_ui_impl() -> int:
             return
         vars_by_name[name].set(not vars_by_name[name].get())
         apply_card_style(name)
+        update_dataset_select_toggle_state()
 
     def apply_card_style(name: str) -> None:
         card = card_frame_by_name.get(name)
@@ -3853,6 +4235,7 @@ def _launch_ui_impl() -> int:
             empty_label = ttk.Label(inner, text="No datasets found.")
             empty_label.grid(row=0, column=0, sticky="w")
             card_widgets.append(empty_label)
+            update_dataset_select_toggle_state()
             update_start_button_state()
             return
 
@@ -3912,6 +4295,7 @@ def _launch_ui_impl() -> int:
             card_widgets.append(card)
 
         update_start_button_state()
+        update_dataset_select_toggle_state()
 
     def request_relayout(canvas_width: int | None = None) -> None:
         nonlocal resize_after_id, last_canvas_width
@@ -3944,8 +4328,14 @@ def _launch_ui_impl() -> int:
         first, last = canvas.yview()
         return first > 0.0 or last < 0.999
 
+    def _get_hovered_widget() -> tk.Misc | None:
+        try:
+            return root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
+        except KeyError:
+            return None
+
     def on_mousewheel(event: tk.Event) -> str | None:
-        hovered = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
+        hovered = _get_hovered_widget()
         if not is_widget_in_dataset_panel(hovered):
             return None
         if not is_dataset_panel_scrollable():
@@ -3957,7 +4347,7 @@ def _launch_ui_impl() -> int:
         return "break"
 
     def on_mousewheel_linux_up(_event: tk.Event) -> str | None:
-        hovered = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
+        hovered = _get_hovered_widget()
         if not is_widget_in_dataset_panel(hovered):
             return None
         if not is_dataset_panel_scrollable():
@@ -3966,7 +4356,7 @@ def _launch_ui_impl() -> int:
         return "break"
 
     def on_mousewheel_linux_down(_event: tk.Event) -> str | None:
-        hovered = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
+        hovered = _get_hovered_widget()
         if not is_widget_in_dataset_panel(hovered):
             return None
         if not is_dataset_panel_scrollable():
@@ -4394,7 +4784,14 @@ def _launch_ui_impl() -> int:
 
         threading.Thread(target=background_train, daemon=True).start()
 
-    scan_button = ttk.Button(controls, text="Scan Datasets", command=lambda: rebuild_folder_list(force=True))
+    scan_button = ttk.Button(controls, text="↻", style="QueueAction.TButton", width=3, command=lambda: rebuild_folder_list(force=True))
+    dataset_select_toggle_var = tk.StringVar(value="Select All")
+    dataset_select_toggle_button = ttk.Button(
+        controls,
+        textvariable=dataset_select_toggle_var,
+        style="QueueAction.TButton",
+        command=toggle_dataset_select_all_none,
+    )
     restore_datasets_button = ttk.Button(controls, text="Restore Datasets", command=open_restore_datasets_dialog)
     archive_datasets_button = ttk.Button(controls, text="Archive Datasets", command=archive_selected_datasets)
     create_dataset_button = ttk.Button(controls, text="Create Dataset", command=create_dataset)
@@ -4419,17 +4816,66 @@ def _launch_ui_impl() -> int:
         settings_button.configure(text="Settings")
     create_job_large_button = ttk.Button(dataset_actions_bar, text="Create Job", command=open_create_job_dialog)
     run_button = ttk.Button(start_bar, text="START QUEUE", command=run_queue, style="StartDisabled.TButton")
+    queue_reload_button = ttk.Button(
+        queue_actions_bar,
+        text="↻",
+        style="QueueAction.TButton",
+        width=3,
+        command=lambda: (
+            load_job_queue_from_disk(),
+            refresh_job_queue_list(),
+            sync_queue_row_action_buttons(),
+            update_start_button_state(),
+        ),
+    )
+    queue_select_toggle_var = tk.StringVar(value="Select All")
+    queue_select_toggle_button = ttk.Button(
+        queue_actions_bar,
+        textvariable=queue_select_toggle_var,
+        style="QueueAction.TButton",
+        command=toggle_queue_select_all_none,
+    )
+    queue_archive_button = ttk.Button(
+        queue_actions_bar,
+        text="Archive Jobs",
+        style="QueueAction.TButton",
+        command=archive_selected_jobs,
+    )
+    queue_restore_button = ttk.Button(
+        queue_actions_bar,
+        text="Restore Jobs",
+        style="QueueAction.TButton",
+        command=open_restore_jobs_dialog,
+    )
+    queue_delete_button = ttk.Button(
+        queue_actions_bar,
+        text="Delete Jobs",
+        style="QueueAction.TButton",
+        command=delete_selected_jobs_with_confirmation,
+    )
+
+    restore_datasets_button.configure(style="QueueAction.TButton")
+    archive_datasets_button.configure(style="QueueAction.TButton")
+    create_dataset_button.configure(style="QueueAction.TButton")
+    metrics_viewer_button.configure(style="QueueAction.TButton")
+    lora_merge_tool_button.configure(style="QueueAction.TButton")
 
     scan_button.grid(row=0, column=0, padx=(0, 8), sticky="w")
-    archive_datasets_button.grid(row=0, column=1, padx=(0, 8), sticky="w")
-    restore_datasets_button.grid(row=0, column=2, padx=(0, 8), sticky="w")
-    create_dataset_button.grid(row=0, column=4, padx=(0, 8), sticky="e")
-    metrics_viewer_button.grid(row=0, column=5, padx=(0, 8), sticky="e")
-    lora_merge_tool_button.grid(row=0, column=6, padx=(0, 8), sticky="e")
-    settings_button.grid(row=0, column=7, sticky="e")
+    dataset_select_toggle_button.grid(row=0, column=1, padx=(0, 8), sticky="w")
+    archive_datasets_button.grid(row=0, column=2, padx=(0, 8), sticky="w")
+    restore_datasets_button.grid(row=0, column=3, padx=(0, 8), sticky="w")
+    create_dataset_button.grid(row=0, column=5, padx=(0, 8), sticky="e")
+    metrics_viewer_button.grid(row=0, column=6, padx=(0, 8), sticky="e")
+    lora_merge_tool_button.grid(row=0, column=7, padx=(0, 8), sticky="e")
+    settings_button.grid(row=0, column=8, sticky="e")
 
-    create_job_large_button.configure(style="TButton")
+    create_job_large_button.configure(style="CreateJobLarge.TButton")
     create_job_large_button.grid(row=0, column=0, sticky="ew")
+    queue_reload_button.grid(row=0, column=0, padx=(0, 8), sticky="w")
+    queue_select_toggle_button.grid(row=0, column=1, padx=(0, 8), sticky="w")
+    queue_archive_button.grid(row=0, column=2, padx=(0, 8), sticky="w")
+    queue_restore_button.grid(row=0, column=3, padx=(0, 8), sticky="w")
+    queue_delete_button.grid(row=0, column=5, sticky="e")
 
     queue_list.bind("<Button-3>", show_queue_context_menu)
     queue_list.bind("<ButtonPress-1>", on_queue_press)
@@ -4494,7 +4940,7 @@ def _launch_ui_impl() -> int:
         widget = event.widget
         x = widget.winfo_x() + event.x
         y = widget.winfo_y() + event.y
-        queue_list.event_generate(sequence, x=x, y=y)
+        queue_list.event_generate(sequence, x=x, y=y, state=event.state)
         return "break"
 
     def bind_thumb_overlay_events(widget: tk.Widget) -> None:
@@ -4742,6 +5188,7 @@ def _launch_ui_impl() -> int:
 
     def sync_queue_row_action_buttons(_event: tk.Event | None = None) -> None:
         sync_all_row_overlays()
+        update_queue_multi_action_state()
 
     def on_queue_yscroll(first: str, last: str) -> None:
         queue_scroll.set(first, last)
