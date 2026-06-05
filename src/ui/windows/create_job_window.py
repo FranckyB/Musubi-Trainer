@@ -222,19 +222,33 @@ class CreateJobWindow:
             }
 
         self.ttk.Style().configure(
-            "MultiJobBar.TFrame",
+            "MultiJobBarOn.TFrame",
             background="#0090d8",
         )
         self.ttk.Style().configure(
+            "MultiJobBarOff.TFrame",
+            background="#353535",
+        )
+        self.ttk.Style().configure(
             "MultiJob.TCheckbutton",
-            foreground="#ffffff",
-            font=("Segoe UI", 9, "bold"),
-            background="#0090d8",
+            foreground="#e8eaed",
+            font=("Segoe UI", 11, "bold"),
+            background="#353535",
         )
         self.ttk.Style().map(
             "MultiJob.TCheckbutton",
-            background=[("active", "#0090d8")],
-            foreground=[("active", "#ffffff")]
+            background=[
+                ("selected", "#0090d8"),
+                ("!selected", "#353535"),
+                ("active selected", "#0090d8"),
+                ("active !selected", "#404040"),
+            ],
+            foreground=[
+                ("selected", "#ffffff"),
+                ("!selected", "#e8eaed"),
+                ("active selected", "#ffffff"),
+                ("active !selected", "#e8eaed"),
+            ]
         )
         self.ttk.Style().configure(
             "CreateJobAction.TButton",
@@ -274,8 +288,12 @@ class CreateJobWindow:
             foreground=[("disabled", "#8a8a8a")],
         )
 
-        multi_job_var = self.tk.BooleanVar(value=False)
-        multi_job_frame = self.ttk.Frame(header_frame, style="MultiJobBar.TFrame")
+        default_multi_job = existing_job is None and len(initial_datasets) > 1
+        multi_job_var = self.tk.BooleanVar(value=default_multi_job)
+        multi_job_frame = self.ttk.Frame(
+            header_frame,
+            style="MultiJobBarOn.TFrame" if default_multi_job else "MultiJobBarOff.TFrame",
+        )
         
         self.ttk.Checkbutton(
             multi_job_frame,
@@ -286,6 +304,9 @@ class CreateJobWindow:
         ).pack(side="left", fill="both", expand=True)
 
         def _on_multi_job_toggle(*_args: object) -> None:
+            multi_job_frame.configure(
+                style="MultiJobBarOn.TFrame" if multi_job_var.get() else "MultiJobBarOff.TFrame"
+            )
             if multi_job_var.get():
                 _lora_name_entry.configure(state="disabled")
             else:
@@ -1960,6 +1981,7 @@ class CreateJobWindow:
                         batch_size=batch_size_value,
                         default_caption_keyword=self.settings_state.get(self.DEFAULT_CAPTION_KEYWORD_KEY, ""),
                         model_name=selected_model_name,
+                        create_missing_captions=False,
                     )
                 except Exception as exc:
                     loading_overlay.destroy()
@@ -2034,19 +2056,18 @@ class CreateJobWindow:
                         self.job_queue[existing_index] = new_job
 
                 self.save_job_to_disk(new_job)
-                
+
                 generated_training_args = True
                 generator = getattr(self, "ensure_job_training_args_toml", None)
                 if callable(generator):
                     try:
-                        # To avoid UI access to dialog vars inside generator, it uses job dict
                         generated_training_args = bool(generator(new_job))
                     except Exception:
                         generated_training_args = False
 
                 if not generated_training_args:
                     self.log(
-                        f"[Queue] Note: Could not pre-generate training_args.toml for {current_job_name}; "
+                        f"[Queue] Note: Could not generate training_args.toml for {current_job_name}; "
                         "it will be generated at launch if missing."
                     )
 

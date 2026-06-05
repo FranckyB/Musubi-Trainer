@@ -2,6 +2,7 @@ import sys
 import argparse
 import os
 import re
+import inspect
 import json
 import ctypes
 import socket
@@ -1127,6 +1128,7 @@ def _launch_ui_impl() -> int:
         resolution: int = DEFAULT_RESOLUTION,
         batch_size: int = 1,
         model_name: str = "",
+        create_missing_captions: bool = True,
     ) -> tuple[Path, Path, int]:
         # Normalise: support legacy single-dataset callers via dataset_name=
         if not datasets:
@@ -1170,12 +1172,13 @@ def _launch_ui_impl() -> int:
                 raise RuntimeError(f"Dataset images not found for: {ds_name}")
             images_dir = image_files[0].parent
 
-            for image_path in image_files:
-                caption_path = image_path.with_suffix(".txt")
-                if caption_path.exists():
-                    continue
-                caption_path.write_text(caption_text, encoding="utf-8")
-                created_captions += 1
+            if create_missing_captions:
+                for image_path in image_files:
+                    caption_path = image_path.with_suffix(".txt")
+                    if caption_path.exists():
+                        continue
+                    caption_path.write_text(caption_text, encoding="utf-8")
+                    created_captions += 1
 
             # First dataset uses "cache" for backward compatibility; additional use "cache_{name}"
             cache_dir = job_dir / "cache" if ds_idx == 0 else job_dir / f"cache_{ds_name}"
@@ -2798,7 +2801,15 @@ def _launch_ui_impl() -> int:
             nonlocal error_message
             error_message = message
 
-        run_job_kwargs = {
+        ltx_first_frame_conditioning_p_value = 0.1
+        try:
+            ltx_first_frame_conditioning_p_value = float(
+                str(job.get("ltx_first_frame_conditioning_p", "0.1") or "0.1")
+            )
+        except ValueError:
+            ltx_first_frame_conditioning_p_value = 0.1
+
+        run_job_kwargs_all = {
             "dataset_name": training_name,
             "output_name": job.get("job_name", training_name),
             "output_dir": output_dir,
@@ -2829,30 +2840,32 @@ def _launch_ui_impl() -> int:
             "generate_training_args_only": True,
             "cancel_requested": None,
             "on_error": capture_job_error,
+            # Optional params used by some model trainers.
+            "lr_scheduler": str(job.get("lr_scheduler", "constant") or "constant"),
+            "lr_warmup_steps": get_non_negative_int_setting(job, "lr_warmup_steps", 0),
+            "gradient_accumulation_steps": get_positive_int_setting(job, "gradient_accumulation_steps", 1, minimum=1),
+            "blocks_to_swap": get_non_negative_int_setting(job, "blocks_to_swap", 0),
+            "timestep_sampling": str(job.get("timestep_sampling", "sigma") or "sigma"),
+            "ltx_mode": str(job.get("ltx_mode", "video") or "video"),
+            "ltx_lora_target_preset": str(job.get("ltx_lora_target_preset", "t2v") or "t2v"),
+            "ltx_first_frame_conditioning_p": ltx_first_frame_conditioning_p_value,
+            "ltx_gemma_load_in_4bit": flag_to_bool(job.get("ltx_gemma_load_in_4bit", "1")),
+            "unet_lr": str(job.get("sd_unet_lr", "") or ""),
+            "text_encoder_lr": str(job.get("sd_text_encoder_lr", "") or ""),
+            "enable_gradient_checkpointing": flag_to_bool(job.get("enable_grad_ckpt", "1")),
         }
 
-        if job_run_fn is _run_job_ltx:
-            run_job_kwargs["ltx_mode"] = str(job.get("ltx_mode", "video"))
-            run_job_kwargs["ltx_gemma_load_in_4bit"] = flag_to_bool(job.get("ltx_gemma_load_in_4bit", "1"))
-            run_job_kwargs["lr_scheduler"] = str(job.get("lr_scheduler", "constant"))
-            run_job_kwargs["lr_warmup_steps"] = get_non_negative_int_setting(job, "lr_warmup_steps", 0)
-            run_job_kwargs["gradient_accumulation_steps"] = get_positive_int_setting(job, "gradient_accumulation_steps", 1, minimum=1)
-            run_job_kwargs["blocks_to_swap"] = get_non_negative_int_setting(job, "blocks_to_swap", 0)
-            run_job_kwargs["timestep_sampling"] = str(job.get("timestep_sampling", "sigma") or "sigma")
-            run_job_kwargs["ltx_lora_target_preset"] = str(job.get("ltx_lora_target_preset", "t2v") or "t2v")
-            try:
-                run_job_kwargs["ltx_first_frame_conditioning_p"] = float(
-                    str(job.get("ltx_first_frame_conditioning_p", "0.1") or "0.1")
-                )
-            except ValueError:
-                run_job_kwargs["ltx_first_frame_conditioning_p"] = 0.1
-        elif job_run_fn is _run_job_sdxl:
-            run_job_kwargs["lr_scheduler"] = str(job.get("lr_scheduler", "constant") or "constant")
-            run_job_kwargs["lr_warmup_steps"] = get_non_negative_int_setting(job, "lr_warmup_steps", 0)
-            run_job_kwargs["gradient_accumulation_steps"] = get_positive_int_setting(job, "gradient_accumulation_steps", 1, minimum=1)
-            run_job_kwargs["unet_lr"] = str(job.get("sd_unet_lr", "") or "")
-            run_job_kwargs["text_encoder_lr"] = str(job.get("sd_text_encoder_lr", "") or "")
-            run_job_kwargs["enable_gradient_checkpointing"] = flag_to_bool(job.get("enable_grad_ckpt", "1"))
+        signature = inspect.signature(job_run_fn)
+        accepted_param_names = {
+            name
+            for name, param in signature.parameters.items()
+            if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+        run_job_kwargs = {
+            key: value
+            for key, value in run_job_kwargs_all.items()
+            if key in accepted_param_names
+        }
 
         exit_code = job_run_fn(job_runtime_config, **run_job_kwargs)
         config_path = output_dir.parent / "training_args.toml"
@@ -3171,6 +3184,10 @@ def _launch_ui_impl() -> int:
         if has_name_mismatch:
             return "broken"
 
+        status = job.get("status", "queued").strip().lower()
+        if status == "running" and run_in_progress:
+            return "running"
+
         target_steps = get_positive_int_setting(job, "train_steps", DEFAULT_TRAIN_STEPS)
         progress_step, has_resume_data = job_resume_progress(job)
         has_finished_output = any((output_dir / f"{name}.safetensors").exists() for name in output_names)
@@ -3185,7 +3202,6 @@ def _launch_ui_impl() -> int:
         if hold:
             return "paused"
 
-        status = job.get("status", "queued").strip().lower()
         if status == "running":
             return "running" if run_in_progress else "queued"
         if status == "cancelled":
@@ -3349,7 +3365,7 @@ def _launch_ui_impl() -> int:
             toggleable_indices = [
                 idx
                 for idx in selected
-                if 0 <= idx < len(job_queue) and detect_job_status(job_queue[idx]) != "done"
+                if 0 <= idx < len(job_queue) and detect_job_status(job_queue[idx]) not in {"done", "running"}
             ]
             if toggleable_indices:
                 all_enabled = all(not flag_to_bool(job_queue[idx].get("hold", "0")) for idx in toggleable_indices)
@@ -3359,7 +3375,7 @@ def _launch_ui_impl() -> int:
             toggleable_count = sum(
                 1
                 for idx in selected
-                if 0 <= idx < len(job_queue) and detect_job_status(job_queue[idx]) != "done"
+                if 0 <= idx < len(job_queue) and detect_job_status(job_queue[idx]) not in {"done", "running"}
             )
             queue_hold_toggle_button.state(["!disabled"] if toggleable_count > 0 else ["disabled"])
         if queue_archive_button is not None:
@@ -3377,7 +3393,7 @@ def _launch_ui_impl() -> int:
         toggleable_indices = [
             idx
             for idx in selected
-            if 0 <= idx < len(job_queue) and detect_job_status(job_queue[idx]) != "done"
+            if 0 <= idx < len(job_queue) and detect_job_status(job_queue[idx]) not in {"done", "running"}
         ]
         if not toggleable_indices:
             return
@@ -3503,7 +3519,11 @@ def _launch_ui_impl() -> int:
         idx = index
         if idx < 0 or idx >= len(job_queue):
             return
-        if detect_job_status(job_queue[idx]) == "done":
+        status_now = detect_job_status(job_queue[idx])
+        if status_now == "done":
+            return
+        if status_now == "running":
+            log("[Queue] Running job cannot be unchecked. Use Stop to cancel and pause it.")
             return
         current = flag_to_bool(job_queue[idx].get("hold", "0"))
         next_hold = not current
@@ -3917,8 +3937,19 @@ def _launch_ui_impl() -> int:
             parent=root,
         ):
             return
+
+        running_index: int | None = None
+        for idx, job in enumerate(job_queue):
+            if detect_job_status(job) == "running":
+                running_index = idx
+                break
+        if running_index is not None:
+            job_queue[running_index]["hold"] = "1"
+            save_job_to_disk(job_queue[running_index])
+
         run_cancel_event.set()
-        log("Stop requested for running job. Queue play mode remains active.")
+        refresh_job_queue_list()
+        log("Stop requested for running job. It will be paused after cancellation.")
         update_start_button_state()
 
     def on_queue_press(event: tk.Event) -> str:
@@ -4695,6 +4726,7 @@ def _launch_ui_impl() -> int:
                                 batch_size=batch_size_value,
                                 default_caption_keyword=settings_state.get(app_settings.DEFAULT_CAPTION_KEYWORD_KEY, ""),
                                 model_name=model_name,
+                                create_missing_captions=True,
                             )
                             if captions_added > 0:
                                 ds_label = ", ".join(d["name"] for d in runner_datasets)

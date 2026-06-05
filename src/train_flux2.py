@@ -224,6 +224,9 @@ def run_steps_for_model(
             raise TrainingCancelledError("Cancelled by user.")
 
     def module_available(module_name: str) -> bool:
+        cached = _module_available_cache.get(module_name)
+        if cached is not None:
+            return cached
         result = subprocess.run(
             [str(musubi_python), "-c", f"import {module_name}"],
             cwd=str(runtime_config.musubi_dir),
@@ -231,7 +234,9 @@ def run_steps_for_model(
             stderr=subprocess.DEVNULL,
             env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
         )
-        return result.returncode == 0
+        available = result.returncode == 0
+        _module_available_cache[module_name] = available
+        return available
 
     def wandb_key_available() -> bool:
         if os.environ.get("WANDB_API_KEY", "").strip():
@@ -250,6 +255,7 @@ def run_steps_for_model(
         return False
 
     musubi_python = require_musubi_python()
+    _module_available_cache: dict[str, bool] = {}
 
     dataset_config = runtime_config.training_dir / model_name / "dataset.toml"
     output_dir = output_dir_override if output_dir_override is not None else (runtime_config.training_dir / model_name / "output")
@@ -378,6 +384,7 @@ def run_steps_for_model(
         check_cancel()
         current_step += 1
         logger(f"[{current_step}/{total_steps}]   Train:")
+        args_only_mode = bool(generate_training_args_only)
         dit_path = require_model_file(runtime_config.dit, "FLUX.2 Model")
         vae_path = require_model_file(runtime_config.vae, "FLUX.2 VAE")
         text_encoder_path = resolve_text_encoder_file(runtime_config.text_encoder)
@@ -391,7 +398,7 @@ def run_steps_for_model(
         compile_enabled = bool(enable_compile_optimizations and not enable_fp8_dit)
         if enable_compile_optimizations and enable_fp8_dit:
             logger("  compile note: ignoring --compile because FP8 is enabled")
-        if compile_enabled and not module_available("triton"):
+        if compile_enabled and (not args_only_mode) and not module_available("triton"):
             logger("  compile note: ignoring --compile because triton is not installed/available")
             compile_enabled = False
         compile_flags: list[str] = []
@@ -410,57 +417,58 @@ def run_steps_for_model(
             log_backend = (training_log_backend or "tensorboard").strip().lower()
             if log_backend not in {"tensorboard", "wandb", "all"}:
                 log_backend = "tensorboard"
-            has_tensorboard = module_available("tensorboard")
-            has_wandb = module_available("wandb")
-            has_wandb_key = wandb_key_available()
-            requirements_hint = (
-                "Run Setup.bat (or install from Musubi-Trainer requirements.txt) "
-                "to ensure logging dependencies are available in the shared app venv."
-            )
-            if log_backend == "tensorboard":
-                if not has_tensorboard:
-                    raise RuntimeError(
-                        "Logging backend 'tensorboard' requires the tensorboard package. "
-                        f"{requirements_hint}"
-                    )
-            elif log_backend == "wandb":
-                if not has_wandb:
-                    raise RuntimeError(
-                        "Logging backend 'wandb' requires the wandb package. "
-                        f"{requirements_hint}"
-                    )
-                if not has_wandb_key:
-                    raise RuntimeError(
-                        "Logging backend 'wandb' requires a configured W&B API key "
-                        "(WANDB_API_KEY env var or wandb login)."
-                    )
-            else:
-                if has_tensorboard and has_wandb:
-                    if not has_wandb_key:
-                        logger("  logging note: W&B API key not configured; using tensorboard only")
-                        log_backend = "tensorboard"
-                elif has_tensorboard:
-                    logger("  logging note: wandb is not installed in Musubi venv; using tensorboard only")
-                    log_backend = "tensorboard"
-                elif has_wandb:
+            if not args_only_mode:
+                has_tensorboard = module_available("tensorboard")
+                has_wandb = module_available("wandb")
+                has_wandb_key = wandb_key_available()
+                requirements_hint = (
+                    "Run Setup.bat (or install from Musubi-Trainer requirements.txt) "
+                    "to ensure logging dependencies are available in the shared app venv."
+                )
+                if log_backend == "tensorboard":
+                    if not has_tensorboard:
+                        raise RuntimeError(
+                            "Logging backend 'tensorboard' requires the tensorboard package. "
+                            f"{requirements_hint}"
+                        )
+                elif log_backend == "wandb":
+                    if not has_wandb:
+                        raise RuntimeError(
+                            "Logging backend 'wandb' requires the wandb package. "
+                            f"{requirements_hint}"
+                        )
                     if not has_wandb_key:
                         raise RuntimeError(
-                            "Logging backend 'all' could only use wandb, but W&B API key is not configured "
+                            "Logging backend 'wandb' requires a configured W&B API key "
                             "(WANDB_API_KEY env var or wandb login)."
                         )
-                    logger("  logging note: tensorboard is not installed in Musubi venv; using wandb only")
-                    log_backend = "wandb"
                 else:
-                    raise RuntimeError(
-                        "Logging backend 'all' requires tensorboard and wandb, but neither package is installed. "
-                        f"{requirements_hint}"
-                    )
+                    if has_tensorboard and has_wandb:
+                        if not has_wandb_key:
+                            logger("  logging note: W&B API key not configured; using tensorboard only")
+                            log_backend = "tensorboard"
+                    elif has_tensorboard:
+                        logger("  logging note: wandb is not installed in Musubi venv; using tensorboard only")
+                        log_backend = "tensorboard"
+                    elif has_wandb:
+                        if not has_wandb_key:
+                            raise RuntimeError(
+                                "Logging backend 'all' could only use wandb, but W&B API key is not configured "
+                                "(WANDB_API_KEY env var or wandb login)."
+                            )
+                        logger("  logging note: tensorboard is not installed in Musubi venv; using wandb only")
+                        log_backend = "wandb"
+                    else:
+                        raise RuntimeError(
+                            "Logging backend 'all' requires tensorboard and wandb, but neither package is installed. "
+                            f"{requirements_hint}"
+                        )
             logging_dir, auto_tracker_name = next_dataset_log_run_dir(runtime_config.training_dir, model_name)
             tracker_name = training_log_tracker_name.strip() or auto_tracker_name
             logger(f"  logging_dir: {logging_dir}")
             logger(f"  log_tracker_name: {tracker_name}")
         optimizer_key = (optimizer_type or "adamw8bit").strip().lower()
-        if optimizer_key == "prodigy" and not module_available("prodigyopt"):
+        if optimizer_key == "prodigy" and (not args_only_mode) and not module_available("prodigyopt"):
             raise RuntimeError(
                 "Optimizer 'prodigy' requires the prodigyopt package. "
                 "Run Setup.bat (or install from Musubi-Trainer requirements.txt) "
@@ -828,15 +836,22 @@ def run_job(
 
     output_name_resolved = output_name.strip()
     output_dir_resolved = output_dir.resolve()
-    resume_checkpoint, resume_step = latest_checkpoint_for_output(output_dir_resolved, output_name_resolved)
-    finished_checkpoint = finished_checkpoint_for_output(output_dir_resolved, output_name_resolved)
-    resume_state_dir, resume_state_step = latest_resume_state_for_output(
-        output_dir_resolved,
-        output_name_resolved,
-        resume_step,
-    )
-    recorded_completed_step = read_recorded_completed_steps(output_dir_resolved, output_name_resolved)
-    progress_step = max(resume_step, resume_state_step, recorded_completed_step)
+    resume_checkpoint: Path | None = None
+    finished_checkpoint: Path | None = None
+    resume_state_dir: Path | None = None
+    resume_step = 0
+    resume_state_step = 0
+    progress_step = 0
+    if not generate_training_args_only:
+        resume_checkpoint, resume_step = latest_checkpoint_for_output(output_dir_resolved, output_name_resolved)
+        finished_checkpoint = finished_checkpoint_for_output(output_dir_resolved, output_name_resolved)
+        resume_state_dir, resume_state_step = latest_resume_state_for_output(
+            output_dir_resolved,
+            output_name_resolved,
+            resume_step,
+        )
+        recorded_completed_step = read_recorded_completed_steps(output_dir_resolved, output_name_resolved)
+        progress_step = max(resume_step, resume_state_step, recorded_completed_step)
     effective_resume_state: Path | None = None
     resume_step_offset = 0
     effective_warmstart_checkpoint: Path | None = None
