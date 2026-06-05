@@ -105,9 +105,13 @@ class CreateJobWindow:
                 return "Flux2"
             return fam or mn
 
-        model_var = self.tk.StringVar(value=(existing_job or {}).get("model", "klein-base-9b"))
+        _MODEL_UNSELECTED_LABEL = "-------------"
+        model_var = self.tk.StringVar(value=(existing_job or {}).get("model", "").strip())
         ltx_mode_var = self.tk.StringVar(value=(existing_job or {}).get("ltx_mode", "video"))
-        default_job_name = f"{dataset_name}_{_family_label(model_var.get())}"
+        if model_var.get().strip():
+            default_job_name = f"{dataset_name}_{_family_label(model_var.get().strip())}"
+        else:
+            default_job_name = dataset_name
         if existing_job is not None:
             default_job_name = existing_job.get("job_name", default_job_name)
         job_name_var = self.tk.StringVar(value=default_job_name)
@@ -161,9 +165,9 @@ class CreateJobWindow:
             )
             dialog.destroy()
             return
-        if model_var.get() not in _avail_models:
+        if existing_job is not None and model_var.get() not in _avail_models:
             model_var.set(_avail_models[0])
-        _display_values = [self.DOWNLOAD_MODEL_DISPLAY_NAMES.get(mn, mn) for mn in _avail_models]
+        _display_values = [_MODEL_UNSELECTED_LABEL] + [self.DOWNLOAD_MODEL_DISPLAY_NAMES.get(mn, mn) for mn in _avail_models]
         _ltx_mode_display_to_value = {"Image Training": "video"}
         _ltx_mode_value_to_display = {
             value: key for key, value in _ltx_mode_display_to_value.items()
@@ -232,6 +236,43 @@ class CreateJobWindow:
             background=[("active", "#0090d8")],
             foreground=[("active", "#ffffff")]
         )
+        self.ttk.Style().configure(
+            "CreateJobAction.TButton",
+            background="#353535",
+            foreground="#e8eaed",
+            padding=(6, 1),
+            borderwidth=1,
+            relief="flat",
+            bordercolor="#474747",
+            lightcolor="#4b4b4b",
+            darkcolor="#2b2b2b",
+            focuscolor="#353535",
+            font=("Segoe UI", 9),
+        )
+        self.ttk.Style().map(
+            "CreateJobAction.TButton",
+            background=[("active", "#404040"), ("disabled", "#2f2f2f")],
+            foreground=[("disabled", "#8a8a8a")],
+        )
+        self.ttk.Style().configure(
+            "CreateJobStepper.TButton",
+            background="#353535",
+            foreground="#e8eaed",
+            padding=(0, 0),
+            borderwidth=1,
+            relief="flat",
+            bordercolor="#474747",
+            lightcolor="#4b4b4b",
+            darkcolor="#2b2b2b",
+            focuscolor="#353535",
+            font=("Segoe UI", 9),
+            anchor="center",
+        )
+        self.ttk.Style().map(
+            "CreateJobStepper.TButton",
+            background=[("active", "#404040"), ("disabled", "#2f2f2f")],
+            foreground=[("disabled", "#8a8a8a")],
+        )
 
         multi_job_var = self.tk.BooleanVar(value=False)
         multi_job_frame = self.ttk.Frame(header_frame, style="MultiJobBar.TFrame")
@@ -257,10 +298,16 @@ class CreateJobWindow:
         _lora_name_entry.grid(row=0, column=1, sticky="ew")
         _lora_name_entry.bind("<Key>", lambda _e: _job_name_user_edited.__setitem__(0, True))
         self.ttk.Label(header_frame, text="Model:").grid(row=0, column=2, sticky="w", padx=(12, 8))
-        _model_display_var = self.tk.StringVar(value=self.DOWNLOAD_MODEL_DISPLAY_NAMES.get(model_var.get(), model_var.get()))
+        _model_display_default = self.DOWNLOAD_MODEL_DISPLAY_NAMES.get(model_var.get(), model_var.get()) if model_var.get().strip() else _MODEL_UNSELECTED_LABEL
+        _model_display_var = self.tk.StringVar(value=_model_display_default)
 
         def _on_model_display_change(*_a: object) -> None:
             disp = _model_display_var.get()
+            if disp == _MODEL_UNSELECTED_LABEL:
+                model_var.set("")
+                _sync_model_specific_controls()
+                _refresh_preset_combo()
+                return
             for mn, dn in self.DOWNLOAD_MODEL_DISPLAY_NAMES.items():
                 if dn == disp:
                     model_var.set(mn)
@@ -532,6 +579,9 @@ class CreateJobWindow:
 
         def _save_preset() -> None:
             current_model = model_var.get().strip()
+            if not current_model:
+                self.messagebox.showerror("Save preset", "Select a model first.", parent=dialog)
+                return
             current_family = _model_to_family.get(current_model, "") or current_model
             initial_name = preset_name_var.get().strip()
             if not initial_name or initial_name == preset_none_label:
@@ -569,6 +619,9 @@ class CreateJobWindow:
                 return
 
             current_model = model_var.get().strip()
+            if not current_model:
+                self.messagebox.showerror("Delete preset", "Select a model first.", parent=dialog)
+                return
             payload = _preset_payload_for_model_name(current_model, selected_name)
             if not isinstance(payload, dict):
                 self.messagebox.showerror("Delete preset", "Preset could not be found on disk.", parent=dialog)
@@ -595,11 +648,11 @@ class CreateJobWindow:
             _refresh_preset_combo()
             preset_name_var.set(preset_none_label)
 
-        _reload_preset_button = self.ttk.Button(preset_section, text="\u21bb", command=_reload_presets, width=3)
+        _reload_preset_button = self.ttk.Button(preset_section, text="\u21bb", command=_reload_presets, width=3, style="CreateJobAction.TButton")
         _reload_preset_button.grid(row=0, column=2, sticky="e")
-        _save_preset_button = self.ttk.Button(preset_section, text="Save preset", command=_save_preset)
+        _save_preset_button = self.ttk.Button(preset_section, text="Save preset", command=_save_preset, style="CreateJobAction.TButton")
         _save_preset_button.grid(row=0, column=3, sticky="e", padx=(6, 0))
-        _delete_preset_button = self.ttk.Button(preset_section, text="\U0001F5D1", command=_delete_preset, width=3)
+        _delete_preset_button = self.ttk.Button(preset_section, text="\U0001F5D1", command=_delete_preset, width=3, style="CreateJobAction.TButton")
         _delete_preset_button.grid(row=0, column=4, sticky="e", padx=(6, 0))
         self.attach_hover_tooltip(_reload_preset_button, "Reload presets from disk")
         self.attach_hover_tooltip(_delete_preset_button, "Delete selected preset")
@@ -758,7 +811,7 @@ class CreateJobWindow:
         _grad_accum_down_button = self.ttk.Button(
             _grad_accum_controls,
             text="-",
-            style="QueueAction.TButton",
+            style="CreateJobAction.TButton",
             width=2,
             command=lambda: _step_positive_int_var(gradient_accumulation_steps_var, -1),
         )
@@ -766,7 +819,7 @@ class CreateJobWindow:
         _grad_accum_up_button = self.ttk.Button(
             _grad_accum_controls,
             text="+",
-            style="QueueAction.TButton",
+            style="CreateJobAction.TButton",
             width=2,
             command=lambda: _step_positive_int_var(gradient_accumulation_steps_var, 1),
         )
@@ -791,7 +844,7 @@ class CreateJobWindow:
         _batch_size_down_button = self.ttk.Button(
             _batch_size_controls,
             text="-",
-            style="QueueAction.TButton",
+            style="CreateJobAction.TButton",
             width=2,
             command=lambda: _step_positive_int_var(train_batch_var, -1),
         )
@@ -799,7 +852,7 @@ class CreateJobWindow:
         _batch_size_up_button = self.ttk.Button(
             _batch_size_controls,
             text="+",
-            style="QueueAction.TButton",
+            style="CreateJobAction.TButton",
             width=2,
             command=lambda: _step_positive_int_var(train_batch_var, 1),
         )
@@ -824,7 +877,7 @@ class CreateJobWindow:
         _blocks_to_swap_down_button = self.ttk.Button(
             _blocks_to_swap_controls,
             text="-",
-            style="QueueAction.TButton",
+            style="CreateJobAction.TButton",
             width=2,
             command=lambda: _step_non_negative_int_var(blocks_to_swap_var, -1),
         )
@@ -832,7 +885,7 @@ class CreateJobWindow:
         _blocks_to_swap_up_button = self.ttk.Button(
             _blocks_to_swap_controls,
             text="+",
-            style="QueueAction.TButton",
+            style="CreateJobAction.TButton",
             width=2,
             command=lambda: _step_non_negative_int_var(blocks_to_swap_var, 1),
         )
@@ -1180,7 +1233,8 @@ class CreateJobWindow:
         # Apply to all repeats controls
         global_repeats_var = self.tk.StringVar(value="1")
         global_repeats_frame = self.ttk.Frame(res_row)
-        global_repeats_frame.grid(row=0, column=2, sticky="e", padx=(0, 36))
+        global_repeats_frame.grid(row=0, column=2, sticky="e", padx=(0, 8))
+        global_repeats_frame.columnconfigure(4, minsize=26)
         
         def _apply_global_repeats(*_args: object) -> None:
             val = global_repeats_var.get().strip()
@@ -1198,13 +1252,15 @@ class CreateJobWindow:
             width=8, style="Flat.TEntry",
         ).grid(row=0, column=1, sticky="e")
         self.ttk.Button(
-            global_repeats_frame, text="-", style="QueueAction.TButton", width=2,
+            global_repeats_frame, text="-", style="CreateJobStepper.TButton", width=2,
             command=lambda: (_step_positive_int_var(global_repeats_var, -1), _apply_global_repeats())
         ).grid(row=0, column=2, sticky="e", padx=(4, 0))
         self.ttk.Button(
-            global_repeats_frame, text="+", style="QueueAction.TButton", width=2,
+            global_repeats_frame, text="+", style="CreateJobStepper.TButton", width=2,
             command=lambda: (_step_positive_int_var(global_repeats_var, 1), _apply_global_repeats())
         ).grid(row=0, column=3, sticky="e", padx=(2, 0))
+        # Reserve the same trailing slot used by per-row remove buttons so +/- align vertically.
+        self.ttk.Frame(global_repeats_frame).grid(row=0, column=4, sticky="e")
         
         # We bind return key to unfocus, and trace write so direct typing also syncs
         global_repeats_var.trace_add("write", _apply_global_repeats)
@@ -1392,6 +1448,12 @@ class CreateJobWindow:
         ds_scrollbar = self.ttk.Scrollbar(list_host, orient="vertical", command=ds_canvas.yview, style="Dark.Vertical.TScrollbar")
         ds_scrollbar.grid(row=0, column=1, sticky="ns")
         ds_canvas.configure(yscrollcommand=ds_scrollbar.set)
+        try:
+            _scrollbar_width = int(str(ds_scrollbar.cget("width") or "12"))
+        except Exception:
+            _scrollbar_width = 12
+        # Match right edge with rows inside the canvas (which exclude scrollbar width).
+        global_repeats_frame.grid_configure(padx=(0, 12 + _scrollbar_width))
 
         ds_inner = self.ttk.Frame(ds_canvas)
         ds_inner_id = ds_canvas.create_window((0, 0), window=ds_inner, anchor="nw")
@@ -1549,14 +1611,14 @@ class CreateJobWindow:
                 self.ttk.Button(
                     _repeats_controls,
                     text="-",
-                    style="QueueAction.TButton",
+                    style="CreateJobStepper.TButton",
                     width=2,
                     command=lambda v=entry["num_repeats_var"]: _step_positive_int_var(v, -1),
                 ).grid(row=0, column=1, sticky="e", padx=(4, 0))
                 self.ttk.Button(
                     _repeats_controls,
                     text="+",
-                    style="QueueAction.TButton",
+                    style="CreateJobStepper.TButton",
                     width=2,
                     command=lambda v=entry["num_repeats_var"]: _step_positive_int_var(v, 1),
                 ).grid(row=0, column=2, sticky="e", padx=(2, 0))
@@ -1567,7 +1629,7 @@ class CreateJobWindow:
                     _refresh_add_combo()
                     _refresh_estimated_epochs()
 
-                self.ttk.Button(row_frame, text="✕", style="QueueAction.TButton", command=_make_remove, width=2).grid(
+                self.ttk.Button(row_frame, text="✕", style="CreateJobAction.TButton", command=_make_remove, width=2).grid(
                     row=0, column=4, sticky="e"
                 )
 
@@ -1615,7 +1677,7 @@ class CreateJobWindow:
             _refresh_add_combo()
             _refresh_estimated_epochs()
 
-        self.ttk.Button(add_row, text="Add", command=_add_dataset).grid(row=0, column=2, sticky="w")
+        self.ttk.Button(add_row, text="Add", command=_add_dataset, style="CreateJobAction.TButton").grid(row=0, column=2, sticky="w")
         train_steps_var.trace_add("write", lambda *_args: _refresh_estimated_epochs())
         train_batch_var.trace_add("write", lambda *_args: _refresh_estimated_epochs())
         gradient_accumulation_steps_var.trace_add("write", lambda *_args: _refresh_estimated_epochs())
@@ -1626,6 +1688,10 @@ class CreateJobWindow:
             job_name = job_name_var.get().strip()
             if not job_name:
                 self.messagebox.showerror("Missing value", "LoRA name is required.", parent=dialog)
+                return
+            selected_model_name = model_var.get().strip()
+            if not selected_model_name or selected_model_name not in _avail_models:
+                self.messagebox.showerror("Missing value", "Select a model before creating the job.", parent=dialog)
                 return
             if not self.is_valid_folder_name(job_name):
                 self.messagebox.showerror(
@@ -1763,7 +1829,7 @@ class CreateJobWindow:
             jobs_to_create: list[tuple[str, str, list[dict]]] = []
 
             if is_multi_job:
-                selected_model = model_var.get().strip() or "Klein"
+                selected_model = selected_model_name
                 fam_label = _family_label(selected_model)
                 for ds in datasets_config:
                     base_name = f"{ds['name']}_{fam_label}"
@@ -1893,7 +1959,7 @@ class CreateJobWindow:
                         resolution=resolution_value,
                         batch_size=batch_size_value,
                         default_caption_keyword=self.settings_state.get(self.DEFAULT_CAPTION_KEYWORD_KEY, ""),
-                        model_name=model_var.get().strip(),
+                        model_name=selected_model_name,
                     )
                 except Exception as exc:
                     loading_overlay.destroy()
@@ -1910,7 +1976,7 @@ class CreateJobWindow:
                     "training_name": current_training_name,
                     "training_dir": str(training_dir_path),
                     "job_name": current_job_name,
-                    "model": model_var.get().strip() or "Klein",
+                    "model": selected_model_name,
                     "ltx_mode": _normalize_ltx_mode_ui(ltx_mode_var.get()),
                     "output_dir": str(output_root),
                     "resolution": str(resolution_value),
@@ -1942,7 +2008,7 @@ class CreateJobWindow:
                     "tracker_name": tracker_name,
                     "stream_output": self.bool_to_flag(self.is_truthy(self.settings_state.get(self.TRAIN_STREAM_TO_LOGGER_KEY), default=False)),
                     "auto_cleanup": (existing_job or {}).get("auto_cleanup", "1"),
-                    "hold": (existing_job or {}).get("hold", "0"),
+                    "hold": (existing_job or {}).get("hold", "1"),
                     "status": "queued",
                 }
 
@@ -2026,8 +2092,8 @@ class CreateJobWindow:
         buttons.grid(row=2, column=0, sticky="ew")
         buttons.columnconfigure(0, weight=1)
         self.ttk.Label(buttons, textvariable=estimated_epochs_var, style="Dim.TLabel").grid(row=0, column=0, sticky="w")
-        self.ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=1, padx=(0, 8))
-        self.ttk.Button(buttons, text="Save" if existing_job is not None else "Create Job", command=create_job).grid(row=0, column=2)
+        self.ttk.Button(buttons, text="Cancel", command=dialog.destroy, style="CreateJobAction.TButton").grid(row=0, column=1, padx=(0, 8))
+        self.ttk.Button(buttons, text="Save" if existing_job is not None else "Create Job", command=create_job, style="CreateJobAction.TButton").grid(row=0, column=2)
 
         _fit_create_job_dialog_to_content()
         self.center_window(dialog)

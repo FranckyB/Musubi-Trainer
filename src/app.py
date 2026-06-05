@@ -383,6 +383,7 @@ def _launch_ui_impl() -> int:
         bordercolor=border_dark,
         lightcolor=border_dark,
         darkcolor=border_dark,
+        focuscolor="#353535",
         relief="flat",
     )
     style.map("TButton", background=[("active", "#404040")])
@@ -422,6 +423,7 @@ def _launch_ui_impl() -> int:
         font=("Segoe UI", 9, "bold"),
         anchor="w",
         padding=(8, 4),
+        focuscolor="#2d2d2d",
     )
     style.map(
         "FamilyHeader.TButton",
@@ -649,6 +651,7 @@ def _launch_ui_impl() -> int:
         bordercolor="#4a4a4a",
         lightcolor="#565656",
         darkcolor="#2f2f2f",
+        focuscolor=color_start_disabled,
         relief="raised",
         font=("Segoe UI", 9, "bold"),
     )
@@ -656,6 +659,24 @@ def _launch_ui_impl() -> int:
         "StartDisabled.TButton",
         background=[("active", color_start_disabled), ("disabled", color_start_disabled)],
         foreground=[("disabled", "#c6c6c6")],
+    )
+    style.configure(
+        "StartPlay.TButton",
+        background=color_start_disabled,
+        foreground="#ffffff",
+        padding=(10, 4),
+        borderwidth=1,
+        bordercolor="#2ea95a",
+        lightcolor="#63e394",
+        darkcolor="#238149",
+        focuscolor=color_start_disabled,
+        relief="raised",
+        font=("Segoe UI", 9, "bold"),
+    )
+    style.map(
+        "StartPlay.TButton",
+        background=[("active", "#484848"), ("disabled", color_start_disabled)],
+        foreground=[("active", "#ffffff"), ("disabled", "#c6c6c6")],
     )
     style.configure(
         "StartEnabled.TButton",
@@ -666,6 +687,7 @@ def _launch_ui_impl() -> int:
         bordercolor="#2ea95a",
         lightcolor="#63e394",
         darkcolor="#238149",
+        focuscolor=color_start_enabled,
         relief="raised",
         font=("Segoe UI", 9, "bold"),
     )
@@ -683,6 +705,7 @@ def _launch_ui_impl() -> int:
         bordercolor="#cc7000",
         lightcolor="#ffb347",
         darkcolor="#a85b00",
+        focuscolor=color_start_in_progress,
         relief="raised",
         font=("Segoe UI", 9, "bold"),
     )
@@ -700,6 +723,7 @@ def _launch_ui_impl() -> int:
         bordercolor="#2a64ad",
         lightcolor="#6fa8f4",
         darkcolor="#1f4d84",
+        focuscolor=color_create_job_enabled,
         relief="raised",
         font=("Segoe UI", 9, "bold"),
     )
@@ -753,9 +777,13 @@ def _launch_ui_impl() -> int:
     queue_selection_anchor: int | None = None
     queue_select_toggle_var: tk.StringVar | None = None
     queue_select_toggle_button: ttk.Button | None = None
+    queue_hold_toggle_var: tk.StringVar | None = None
+    queue_hold_toggle_button: ttk.Button | None = None
     queue_archive_button: ttk.Button | None = None
     queue_restore_button: ttk.Button | None = None
     queue_delete_button: ttk.Button | None = None
+    queue_play_mode = False
+    queue_worker_thread: threading.Thread | None = None
     runtime_config = runtime_config_from_settings(settings_state)
     tensorboard_host = "127.0.0.1"
     tensorboard_port = 6006
@@ -2506,10 +2534,6 @@ def _launch_ui_impl() -> int:
     bottom_pane.rowconfigure(0, weight=1)
     paned.add(bottom_pane, weight=2)
 
-    start_bar = ttk.Frame(bottom_pane, padding=(0, 0, 0, 8))
-    start_bar.grid(row=1, column=0, sticky="ew")
-    start_bar.columnconfigure(0, weight=1)
-
     queue_container = ttk.Frame(bottom_pane, padding=(8, 0, 8, 8))
     queue_container.grid(row=0, column=0, sticky="nsew", pady=(0, 0))
     queue_container.columnconfigure(0, weight=1)
@@ -2522,7 +2546,7 @@ def _launch_ui_impl() -> int:
 
     queue_actions_bar = ttk.Frame(queue_header, padding=(0, 2, 0, 4))
     queue_actions_bar.grid(row=1, column=0, columnspan=2, sticky="ew")
-    queue_actions_bar.columnconfigure(4, weight=1)
+    queue_actions_bar.columnconfigure(6, weight=1)
 
     queue_table_border = tk.Frame(queue_container, bg="#2a4a72", bd=0, highlightthickness=0)
     queue_table_border.grid(row=1, column=0, columnspan=2, sticky="nsew")
@@ -2597,8 +2621,14 @@ def _launch_ui_impl() -> int:
     log_scroll_x.grid(row=1, column=0, sticky="ew")
     log_box.configure(yscrollcommand=log_scroll_y.set, xscrollcommand=log_scroll_x.set)
     log_box.configure(bg="#0e1319", fg=fg_text, insertbackground=fg_text, relief="flat", borderwidth=0)
+    log_box.configure(state="disabled")
     log_progress_active = False
     log_progress_mark = "log_progress_line_start"
+
+    def _clear_log_box() -> None:
+        log_box.configure(state="normal")
+        log_box.delete("1.0", "end")
+        log_box.configure(state="disabled")
 
     def _show_log_context_menu(event: "tk.Event[tk.Text]") -> None:
         menu = tk.Menu(
@@ -2607,7 +2637,7 @@ def _launch_ui_impl() -> int:
             activebackground="#3a3f4b", activeforeground=fg_text,
             bd=0, relief="flat",
         )
-        menu.add_command(label="Clear console", command=lambda: log_box.delete("1.0", "end"))
+        menu.add_command(label="Clear console", command=_clear_log_box)
         menu.tk_popup(event.x_root, event.y_root)
 
     log_box.bind("<Button-3>", _show_log_context_menu)
@@ -2623,6 +2653,7 @@ def _launch_ui_impl() -> int:
                 return
 
             at_bottom = is_log_scrolled_to_bottom()
+            log_box.configure(state="normal")
             if message.startswith("\r"):
                 progress_text = message[1:]
                 if not log_progress_active:
@@ -2636,6 +2667,8 @@ def _launch_ui_impl() -> int:
             else:
                 log_progress_active = False
                 log_box.insert("end", message + "\n")
+
+            log_box.configure(state="disabled")
 
             if at_bottom:
                 log_box.see("end")
@@ -3310,12 +3343,68 @@ def _launch_ui_impl() -> int:
 
         if queue_select_toggle_button is not None:
             queue_select_toggle_button.state(["!disabled"] if total_count > 0 else ["disabled"])
+        if queue_hold_toggle_var is not None:
+            queue_hold_toggle_var.set("Enable Selected")
+            selected = selected_queue_indices()
+            toggleable_indices = [
+                idx
+                for idx in selected
+                if 0 <= idx < len(job_queue) and detect_job_status(job_queue[idx]) != "done"
+            ]
+            if toggleable_indices:
+                all_enabled = all(not flag_to_bool(job_queue[idx].get("hold", "0")) for idx in toggleable_indices)
+                queue_hold_toggle_var.set("Disable Selected" if all_enabled else "Enable Selected")
+        if queue_hold_toggle_button is not None:
+            selected = selected_queue_indices()
+            toggleable_count = sum(
+                1
+                for idx in selected
+                if 0 <= idx < len(job_queue) and detect_job_status(job_queue[idx]) != "done"
+            )
+            queue_hold_toggle_button.state(["!disabled"] if toggleable_count > 0 else ["disabled"])
         if queue_archive_button is not None:
             queue_archive_button.state(["!disabled"] if selected_count > 0 else ["disabled"])
         if queue_delete_button is not None:
             queue_delete_button.state(["!disabled"] if selected_count > 0 else ["disabled"])
         if queue_restore_button is not None:
             queue_restore_button.state(["!disabled"])
+
+    def toggle_hold_selected_jobs() -> None:
+        selected = selected_queue_indices()
+        if not selected:
+            return
+
+        toggleable_indices = [
+            idx
+            for idx in selected
+            if 0 <= idx < len(job_queue) and detect_job_status(job_queue[idx]) != "done"
+        ]
+        if not toggleable_indices:
+            return
+
+        all_enabled = all(not flag_to_bool(job_queue[idx].get("hold", "0")) for idx in toggleable_indices)
+        target_hold = all_enabled
+
+        changed = False
+        for idx in toggleable_indices:
+            current = flag_to_bool(job_queue[idx].get("hold", "0"))
+            if current == target_hold:
+                continue
+            job_queue[idx]["hold"] = bool_to_flag(target_hold)
+            if target_hold and job_queue[idx].get("status", "") in {"queued", "failed", "running", "resume"}:
+                job_queue[idx]["status"] = "paused"
+            elif (not target_hold) and job_queue[idx].get("status", "") == "paused":
+                job_queue[idx]["status"] = "queued"
+            save_job_to_disk(job_queue[idx])
+            changed = True
+
+        if not changed:
+            update_queue_multi_action_state()
+            return
+
+        refresh_job_queue_list()
+        set_queue_selection_indices(selected, anchor_index=selected[0])
+        update_start_button_state()
 
     def toggle_queue_select_all_none() -> None:
         if not job_queue:
@@ -3818,6 +3907,19 @@ def _launch_ui_impl() -> int:
         refresh_job_queue_list()
         update_start_button_state()
         log(f"[Queue] Deleted job: {job_name}")
+
+    def stop_running_job() -> None:
+        if not run_in_progress or run_cancel_event is None or run_cancel_event.is_set():
+            return
+        if not messagebox.askyesno(
+            "Stop Job",
+            "Stop the currently running job and continue to the next available queued job?",
+            parent=root,
+        ):
+            return
+        run_cancel_event.set()
+        log("Stop requested for running job. Queue play mode remains active.")
+        update_start_button_state()
 
     def on_queue_press(event: tk.Event) -> str:
         nonlocal queue_drag_index, queue_drag_moved, queue_drag_allowed, queue_selection_anchor
@@ -4368,105 +4470,56 @@ def _launch_ui_impl() -> int:
     root.bind_all("<Button-4>", on_mousewheel_linux_up)
     root.bind_all("<Button-5>", on_mousewheel_linux_down)
 
+    def update_queue_border_state() -> None:
+        if queue_play_mode:
+            border_color = "#2ea95a"
+            border_pad = 2
+        else:
+            border_color = "#2a4a72"
+            border_pad = 1
+
+        queue_table_border.configure(bg=border_color)
+        queue_list.grid_configure(padx=border_pad, pady=border_pad)
+        queue_scroll.grid_configure(pady=border_pad, padx=(0, border_pad))
+
     def update_start_button_state() -> None:
-        if run_in_progress:
-            if run_cancel_event is not None and run_cancel_event.is_set():
-                run_button.configure(text="Cancelling...", style="StartDisabled.TButton")
-                run_button.state(["disabled"])
+        if queue_play_mode:
+            if run_in_progress and run_cancel_event is not None and run_cancel_event.is_set():
+                run_button.configure(text="Stopping", style="StartInProgress.TButton")
             else:
-                run_button.configure(text="Queue In Progress (Press to Cancel)", style="StartInProgress.TButton")
-                run_button.state(["!disabled"])
+                run_button.configure(text="Pause", style="StartEnabled.TButton")
+            run_button.state(["!disabled"])
+            update_queue_border_state()
             return
 
-        run_button.configure(text="START QUEUE")
-        has_runnable_jobs = any(
-            (not flag_to_bool(job.get("hold", "0"))) and job.get("status", "queued") in {"queued", "failed", "resume"}
-            for job in job_queue
-        )
-        if has_runnable_jobs:
-            run_button.configure(style="StartEnabled.TButton")
-            run_button.state(["!disabled"])
-        else:
-            run_button.configure(style="StartDisabled.TButton")
-            run_button.state(["disabled"])
+        run_button.configure(text="Start", style="StartPlay.TButton")
+        run_button.state(["!disabled"])
+        update_queue_border_state()
 
     def run_queue() -> None:
-        nonlocal run_in_progress, run_cancel_event
-        if run_in_progress:
-            if run_cancel_event is not None and not run_cancel_event.is_set():
+        nonlocal run_in_progress, run_cancel_event, queue_play_mode, queue_worker_thread
+
+        if queue_play_mode:
+            if run_in_progress and run_cancel_event is not None and not run_cancel_event.is_set():
                 should_cancel = messagebox.askyesno(
-                    "Cancel Queue",
-                    "Stop current job and cancel all remaining queued jobs?",
+                    "Stop Current Job",
+                    "Queue is running. Stop the current job now and switch queue to paused mode?",
+                    parent=root,
                 )
                 if should_cancel:
                     run_cancel_event.set()
-                    log("Cancellation requested. Stopping remaining queued jobs...")
-                    update_start_button_state()
+                    log("Cancellation requested. Queue will pause after current stop completes.")
+            queue_play_mode = False
+            update_start_button_state()
             return
 
-        runnable_indices = [
-            idx
-            for idx, job in enumerate(job_queue)
-            if (not flag_to_bool(job.get("hold", "0"))) and job.get("status", "queued") in {"queued", "failed", "paused", "resume"}
-        ]
-        if not runnable_indices:
-            messagebox.showinfo("Queue is empty", "Add jobs and ensure at least one job is not on hold.", parent=root)
-            return
-
-        if runtime_config is None or runtime_config.dit is None or runtime_config.vae is None or runtime_config.text_encoder is None:
-            missing = []
-            if runtime_config is None or runtime_config.dit is None:
-                missing.append("Model (DiT)")
-            if runtime_config is None or runtime_config.vae is None:
-                missing.append("VAE")
-            if runtime_config is None or runtime_config.text_encoder is None:
-                missing.append("Text Encoder")
-            messagebox.showerror(
-                "Model paths not configured",
-                "The following model paths are not set:\n\n"
-                + "\n".join(f"  \u2022 {m}" for m in missing)
-                + "\n\nOpen Settings and configure the paths before starting training.",
-                parent=root,
-            )
-            return
-
-        run_cancel_event = threading.Event()
-        run_in_progress = True
+        queue_play_mode = True
         update_start_button_state()
+
+        if queue_worker_thread is not None and queue_worker_thread.is_alive():
+            return
+
         model_error_popup_shown = False
-
-        def _compact_failure_summary(details: str) -> str:
-            text = (details or "").replace("\r\n", "\n").strip()
-            if not text:
-                return ""
-
-            # Keep only high-signal lines and never include raw command/path dumps.
-            compact_lines: list[str] = []
-            for raw_line in text.splitlines():
-                line = raw_line.strip()
-                if not line:
-                    continue
-
-                lowered = line.lower()
-
-                # If this line reports a failed command, keep that one line and stop.
-                if lowered.startswith("details: command failed with exit code") or lowered.startswith("command failed with exit code"):
-                    compact_lines.append(line)
-                    break
-
-                # Skip explicit command/path lines from subprocess output.
-                if line.lower().startswith("command:"):
-                    continue
-                if ":\\" in line and (".py" in lowered or "python.exe" in lowered):
-                    continue
-                if line.startswith("--"):
-                    continue
-
-                compact_lines.append(line)
-                if len(compact_lines) >= 6:
-                    break
-
-            return "\n".join(compact_lines) if compact_lines else text.splitlines()[0].strip()
 
         def notify_job_failure_popup(job_name: str, details: str = "") -> None:
             message = f"Job '{job_name}' failed.\n\nSee queue log for full details."
@@ -4550,14 +4603,56 @@ def _launch_ui_impl() -> int:
             done.wait(timeout=10)
 
         def background_train() -> None:
-            nonlocal model_error_popup_shown
+            nonlocal model_error_popup_shown, run_in_progress, run_cancel_event, queue_play_mode
             try:
                 log("")
-                log("Queue is in progress...")
+                log("Queue play mode enabled.")
                 failed_jobs: list[str] = []
-                for queue_index in runnable_indices:
-                    if run_cancel_event is not None and run_cancel_event.is_set():
+                while queue_play_mode and root.winfo_exists():
+                    runnable_indices = [
+                        idx
+                        for idx, job in enumerate(job_queue)
+                        if (not flag_to_bool(job.get("hold", "0")))
+                        and job.get("status", "queued") in {"queued", "failed", "paused", "resume"}
+                    ]
+
+                    if not runnable_indices:
+                        run_in_progress = False
+                        run_cancel_event = None
+                        root.after(0, update_start_button_state)
+                        time.sleep(0.3)
+                        continue
+
+                    if runtime_config is None or runtime_config.dit is None or runtime_config.vae is None or runtime_config.text_encoder is None:
+                        missing = []
+                        if runtime_config is None or runtime_config.dit is None:
+                            missing.append("Model (DiT)")
+                        if runtime_config is None or runtime_config.vae is None:
+                            missing.append("VAE")
+                        if runtime_config is None or runtime_config.text_encoder is None:
+                            missing.append("Text Encoder")
+
+                        queue_play_mode = False
+
+                        def show_missing_model_error() -> None:
+                            if not root.winfo_exists():
+                                return
+                            messagebox.showerror(
+                                "Model paths not configured",
+                                "The following model paths are not set:\n\n"
+                                + "\n".join(f"  \u2022 {m}" for m in missing)
+                                + "\n\nOpen Settings and configure the paths before starting training.",
+                                parent=root,
+                            )
+                            update_start_button_state()
+
+                        root.after(0, show_missing_model_error)
                         break
+
+                    queue_index = runnable_indices[0]
+                    run_cancel_event = threading.Event()
+                    run_in_progress = True
+                    root.after(0, update_start_button_state)
 
                     job = job_queue[queue_index]
                     job_name = job.get("job_name", f"job_{queue_index + 1}")
@@ -4744,13 +4839,14 @@ def _launch_ui_impl() -> int:
 
                     if not (run_cancel_event is not None and run_cancel_event.is_set()):
                         refresh_ui_now_from_worker()
+                    run_in_progress = False
+                    run_cancel_event = None
+                    root.after(0, update_start_button_state)
 
-                if run_cancel_event is not None and run_cancel_event.is_set():
-                    log_status("Queue cancelled by user.")
-                elif failed_jobs:
-                    log_status(f"Queue completed with failures: {', '.join(failed_jobs)}")
-                else:
-                    log_status("Queue completed.")
+                if failed_jobs:
+                    log_status(f"Queue processed with failures: {', '.join(failed_jobs)}")
+                if not queue_play_mode:
+                    log_status("Queue paused.")
             except Exception as exc:
                 log_status(f"Queue failed unexpectedly: {exc}")
                 log(traceback.format_exc())
@@ -4771,18 +4867,20 @@ def _launch_ui_impl() -> int:
                 root.after(0, show_unexpected_queue_failure_popup)
             finally:
                 def finish_ui() -> None:
-                    nonlocal run_in_progress, run_cancel_event
+                    nonlocal run_in_progress, run_cancel_event, queue_worker_thread
                     if not root.winfo_exists():
                         return
                     rebuild_folder_list(force=True)
                     run_in_progress = False
                     run_cancel_event = None
+                    queue_worker_thread = None
                     refresh_job_queue_list()
                     update_start_button_state()
 
                 root.after(0, finish_ui)
 
-        threading.Thread(target=background_train, daemon=True).start()
+        queue_worker_thread = threading.Thread(target=background_train, daemon=True)
+        queue_worker_thread.start()
 
     scan_button = ttk.Button(controls, text="↻", style="QueueAction.TButton", width=3, command=lambda: rebuild_folder_list(force=True))
     dataset_select_toggle_var = tk.StringVar(value="Select All")
@@ -4815,7 +4913,7 @@ def _launch_ui_impl() -> int:
     else:
         settings_button.configure(text="Settings")
     create_job_large_button = ttk.Button(dataset_actions_bar, text="Create Job", command=open_create_job_dialog)
-    run_button = ttk.Button(start_bar, text="START QUEUE", command=run_queue, style="StartDisabled.TButton")
+    run_button = ttk.Button(queue_actions_bar, text="▶ Play", command=run_queue, style="StartPlay.TButton")
     queue_reload_button = ttk.Button(
         queue_actions_bar,
         text="↻",
@@ -4834,6 +4932,13 @@ def _launch_ui_impl() -> int:
         textvariable=queue_select_toggle_var,
         style="QueueAction.TButton",
         command=toggle_queue_select_all_none,
+    )
+    queue_hold_toggle_var = tk.StringVar(value="Enable Selected")
+    queue_hold_toggle_button = ttk.Button(
+        queue_actions_bar,
+        textvariable=queue_hold_toggle_var,
+        style="QueueAction.TButton",
+        command=toggle_hold_selected_jobs,
     )
     queue_archive_button = ttk.Button(
         queue_actions_bar,
@@ -4873,9 +4978,11 @@ def _launch_ui_impl() -> int:
     create_job_large_button.grid(row=0, column=0, sticky="ew")
     queue_reload_button.grid(row=0, column=0, padx=(0, 8), sticky="w")
     queue_select_toggle_button.grid(row=0, column=1, padx=(0, 8), sticky="w")
-    queue_archive_button.grid(row=0, column=2, padx=(0, 8), sticky="w")
-    queue_restore_button.grid(row=0, column=3, padx=(0, 8), sticky="w")
-    queue_delete_button.grid(row=0, column=5, sticky="e")
+    queue_hold_toggle_button.grid(row=0, column=2, padx=(0, 8), sticky="w")
+    queue_archive_button.grid(row=0, column=3, padx=(0, 8), sticky="w")
+    queue_restore_button.grid(row=0, column=4, padx=(0, 8), sticky="w")
+    queue_delete_button.grid(row=0, column=5, padx=(0, 8), sticky="w")
+    run_button.grid(row=0, column=7, sticky="e")
 
     queue_list.bind("<Button-3>", show_queue_context_menu)
     queue_list.bind("<ButtonPress-1>", on_queue_press)
@@ -5129,19 +5236,19 @@ def _launch_ui_impl() -> int:
         queue_row_action_buttons.clear()
 
     def place_queue_row_action_buttons() -> None:
-        for item_id, delete_button in queue_row_action_buttons.items():
+        for item_id, action_button in queue_row_action_buttons.items():
             cell_bbox = queue_list.bbox(item_id, "actions")
             if not cell_bbox:
-                delete_button.place_forget()
+                action_button.place_forget()
                 continue
 
             x, y, width, height = cell_bbox
             if width <= 0 or height <= 0:
-                delete_button.place_forget()
+                action_button.place_forget()
                 continue
 
             row_bg = row_background_for_item(item_id)
-            delete_button.configure(bg=row_bg)
+            action_button.configure(bg=row_bg)
 
             button_height = max(20, height - 10)
             delete_width = 24
@@ -5149,7 +5256,7 @@ def _launch_ui_impl() -> int:
             start_x = x + max(2, (width - total_width) // 2)
             start_y = y + max(2, (height - button_height) // 2)
 
-            delete_button.place(x=start_x, y=start_y, width=delete_width, height=button_height)
+            action_button.place(x=start_x, y=start_y, width=delete_width, height=button_height)
 
     def build_queue_row_action_buttons() -> None:
         clear_queue_row_action_buttons()
@@ -5160,9 +5267,11 @@ def _launch_ui_impl() -> int:
             except (TypeError, ValueError):
                 continue
 
-            delete_button = tk.Label(
+            status = detect_job_status(job_queue[index])
+            is_running_row = status == "running" and run_in_progress
+            action_button = tk.Label(
                 queue_list,
-                text="✕",
+                text="■" if is_running_row else "✕",
                 font=("Segoe UI", 13, "bold"),
                 bd=0,
                 padx=0,
@@ -5170,11 +5279,14 @@ def _launch_ui_impl() -> int:
                 relief="flat",
                 highlightthickness=0,
                 cursor="hand2",
-                fg="#e05252",
+                fg="#f0a341" if is_running_row else "#e05252",
                 bg="#1c2534",
             )
-            delete_button.bind("<Button-1>", lambda _event, idx=index: delete_job_with_confirmation(idx))
-            queue_row_action_buttons[item_id] = delete_button
+            if is_running_row:
+                action_button.bind("<Button-1>", lambda _event: stop_running_job())
+            else:
+                action_button.bind("<Button-1>", lambda _event, idx=index: delete_job_with_confirmation(idx))
+            queue_row_action_buttons[item_id] = action_button
 
         place_queue_row_action_buttons()
 
@@ -5215,7 +5327,6 @@ def _launch_ui_impl() -> int:
     queue_list.bind("<<TreeviewSelect>>", sync_queue_row_action_buttons)
     queue_list.bind("<Double-1>", on_queue_double_click)
     queue_list.bind("<Configure>", lambda _event: root.after_idle(sync_all_row_overlays))
-    run_button.grid(row=0, column=0, sticky="ew")
 
     def on_canvas_configure(_event: tk.Event) -> None:
         update_scrollbar_visibility()
