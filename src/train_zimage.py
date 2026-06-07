@@ -13,6 +13,7 @@ Note: ``--network_module networks.lora_zimage`` is REQUIRED for Z-Image training
 
 from __future__ import annotations
 
+import os
 import shlex
 from pathlib import Path
 from typing import Callable
@@ -54,6 +55,11 @@ NETWORK_MODULE = "networks.lora_zimage"
 
 def _output_name_default(dataset_name: str) -> str:
     return f"{dataset_name}_ZImage"
+
+
+def _recommended_zimage_dataloader_workers() -> int:
+    cpu_count = os.cpu_count() or 8
+    return max(2, min(8, cpu_count // 2))
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -213,6 +219,7 @@ def run_steps_for_model(
         optimizer_key = (optimizer_type or "adamw8bit").strip().lower()
         optimizer_arg = "prodigyopt.Prodigy" if optimizer_key == "prodigy" else (optimizer_type or "adamw8bit").strip()
         learning_rate_for_run = "1" if optimizer_key == "prodigy" else learning_rate
+        max_data_loader_n_workers = _recommended_zimage_dataloader_workers()
 
         compile_enabled = bool(enable_compile_optimizations and not enable_fp8_dit)
         if enable_compile_optimizations and enable_fp8_dit:
@@ -259,6 +266,8 @@ def run_steps_for_model(
             "sdpa = true",
             "gradient_checkpointing = true",
             f"gradient_checkpointing_cpu_offload = {'true' if enable_gradient_checkpointing_cpu_offload else 'false'}",
+            "persistent_data_loader_workers = true",
+            f"max_data_loader_n_workers = {max_data_loader_n_workers}",
             f"fp8_base = {'true' if enable_fp8_dit else 'false'}",
             f"fp8_scaled = {'true' if enable_fp8_dit else 'false'}",
             f"compile = {'true' if compile_enabled else 'false'}",

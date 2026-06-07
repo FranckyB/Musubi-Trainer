@@ -24,6 +24,7 @@ from .download_models import (
     COMPONENT_FRIENDLY_NAMES as DOWNLOAD_COMPONENT_FRIENDLY_NAMES,
     DOWNLOAD_LOCATIONS,
     DOWNLOAD_LOCATION_MODELS_FOLDER,
+    DOWNLOAD_LOCATION_HUGGINGFACE,
     find_component,
     find_in_extra_paths,
     auto_resolve_klein,
@@ -1554,267 +1555,32 @@ def _launch_ui_impl() -> int:
             )
 
     def open_edit_dataset_dialog(dataset_name: str) -> None:
-        columns = 4
-        tile_size_px = 300
-        tile_gap_px = 4
-        grid_width_px = (tile_size_px * columns) + (tile_gap_px * (columns + 1))
-        # Include dialog frame padding and the vertical scrollbar lane.
-        dialog_width_px = grid_width_px + 80
-        tile_side_pad_px = tile_gap_px // 2
+        from .ui.windows import dataset_editor_window
 
-        dataset_dir = dataset_dir_path(dataset_name)
-        if not dataset_dir.exists() or not dataset_dir.is_dir():
-            messagebox.showerror("Edit dataset", f"Dataset folder not found:\n{dataset_dir}", parent=root)
-            return
-
-        image_paths = dataset_image_files(datasets_root_dir(), dataset_name)
-        if not image_paths:
-            messagebox.showinfo("Edit dataset", "No images found in this dataset.", parent=root)
-            return
-
-        dialog = tk.Toplevel(root)
-        dialog.withdraw()
-        dialog.title(f"Edit Dataset: {dataset_name}")
-        dialog.transient(root)
-        dialog.grab_set()
-        dialog.configure(bg=bg_panel)
-        dialog.resizable(False, True)
-        set_dark_title_bar(dialog)
-        dialog.minsize(dialog_width_px, 760)
-        dialog.geometry(f"{dialog_width_px}x920")
-
-        outer = ttk.Frame(dialog, padding=10)
-        outer.grid(row=0, column=0, sticky="nsew")
-        outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(1, weight=1)
-        dialog.columnconfigure(0, weight=1)
-        dialog.rowconfigure(0, weight=1)
-
-        ttk.Label(
-            outer,
-            text=f"{dataset_name} ({len(image_paths)} images)",
-            style="TLabel",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
-
-        grid_host = ttk.Frame(outer)
-        grid_host.grid(row=1, column=0, sticky="nsew")
-        grid_host.columnconfigure(0, weight=1)
-        grid_host.rowconfigure(0, weight=1)
-
-        editor_canvas = tk.Canvas(grid_host, highlightthickness=0, bg=bg_panel)
-        editor_scroll = ttk.Scrollbar(grid_host, orient="vertical", command=editor_canvas.yview, style="Dark.Vertical.TScrollbar")
-        editor_inner = ttk.Frame(editor_canvas)
-        editor_inner_id = editor_canvas.create_window((0, 0), window=editor_inner, anchor="nw")
-        editor_canvas.configure(yscrollcommand=editor_scroll.set)
-
-        editor_canvas.grid(row=0, column=0, sticky="nsew")
-        editor_scroll.grid(row=0, column=1, sticky="ns")
-
-        thumb_refs: list[ImageTk.PhotoImage] = []
-        caption_path_by_widget: dict[tk.Text, Path] = {}
-        pending_save_by_widget: dict[tk.Text, str] = {}
-
-        def build_caption_thumb(image_path: Path) -> ImageTk.PhotoImage:
-            thumb_size = (tile_size_px, tile_size_px)
-            try:
-                image = Image.open(image_path).convert("RGB")
-                src_w, src_h = image.size
-                dst_w, dst_h = thumb_size
-                # Fit the full image inside the tile without cropping.
-                scale = min(dst_w / src_w, dst_h / src_h)
-                resized_w = max(1, int(round(src_w * scale)))
-                resized_h = max(1, int(round(src_h * scale)))
-                resized = image.resize((resized_w, resized_h), Image.Resampling.LANCZOS)
-                image = Image.new("RGB", thumb_size, color="#000000")
-                paste_x = (dst_w - resized_w) // 2
-                paste_y = (dst_h - resized_h) // 2
-                image.paste(resized, (paste_x, paste_y))
-            except Exception:
-                image = Image.new("RGB", thumb_size, color="#000000")
-
-            image_rgba = image.convert("RGBA")
-            border_overlay = Image.new("RGBA", thumb_size, (0, 0, 0, 0))
-            border_draw = ImageDraw.Draw(border_overlay)
-            border_draw.rectangle((0, 0, thumb_size[0] - 1, thumb_size[1] - 1), outline=(255, 255, 255, 96), width=1)
-            composited = Image.alpha_composite(image_rgba, border_overlay).convert("RGB")
-            return ImageTk.PhotoImage(composited, master=root)
-
-        def flush_caption_save(widget: tk.Text) -> None:
-            after_id = pending_save_by_widget.pop(widget, None)
-            if after_id is not None:
-                try:
-                    dialog.after_cancel(after_id)
-                except Exception:
-                    pass
-            caption_path = caption_path_by_widget.get(widget)
-            if caption_path is None:
-                return
-            content = widget.get("1.0", "end-1c")
-            try:
-                caption_path.write_text(content, encoding="utf-8")
-            except OSError as exc:
-                log(f"[Dataset Editor] Failed to save caption '{caption_path.name}': {exc}")
-
-        def schedule_caption_save(event: tk.Event) -> None:
-            widget = event.widget
-            if not isinstance(widget, tk.Text):
-                return
-            if not widget.edit_modified():
-                return
-            widget.edit_modified(False)
-
-            previous_after_id = pending_save_by_widget.get(widget)
-            if previous_after_id is not None:
-                try:
-                    dialog.after_cancel(previous_after_id)
-                except Exception:
-                    pass
-            pending_save_by_widget[widget] = dialog.after(220, lambda w=widget: flush_caption_save(w))
-
-        def on_caption_focus_out(event: tk.Event) -> None:
-            widget = event.widget
-            if isinstance(widget, tk.Text):
-                flush_caption_save(widget)
-
-        def on_editor_inner_configure(_event: tk.Event) -> None:
-            editor_canvas.configure(scrollregion=editor_canvas.bbox("all"))
-
-        def on_editor_canvas_configure(event: tk.Event) -> None:
-            editor_canvas.itemconfigure(editor_inner_id, width=event.width)
-
-        def on_editor_mousewheel(event: tk.Event) -> str:
-            delta = int(-event.delta / 120)
-            if delta == 0:
-                delta = -1 if event.delta > 0 else 1
-            editor_canvas.yview_scroll(delta, "units")
-            return "break"
-
-        def on_editor_linux_up(_event: tk.Event) -> str:
-            editor_canvas.yview_scroll(-1, "units")
-            return "break"
-
-        def on_editor_linux_down(_event: tk.Event) -> str:
-            editor_canvas.yview_scroll(1, "units")
-            return "break"
-
-        def attach_autohide_scrollbar(text_widget: tk.Text, scrollbar_widget: ttk.Scrollbar) -> None:
-            scroll_state = {"visible": False}
-
-            def on_yscroll(first: str, last: str) -> None:
-                scrollbar_widget.set(first, last)
-                try:
-                    first_value = float(first)
-                    last_value = float(last)
-                except (TypeError, ValueError):
-                    first_value = 0.0
-                    last_value = 1.0
-
-                needs_scrollbar = first_value > 0.0 or last_value < 0.999
-                if needs_scrollbar and not scroll_state["visible"]:
-                    scrollbar_widget.pack(side="right", fill="y")
-                    scroll_state["visible"] = True
-                elif (not needs_scrollbar) and scroll_state["visible"]:
-                    scrollbar_widget.pack_forget()
-                    scroll_state["visible"] = False
-
-            text_widget.configure(yscrollcommand=on_yscroll)
-
-            def prime_scrollbar() -> None:
-                first_value, last_value = text_widget.yview()
-                on_yscroll(str(first_value), str(last_value))
-
-            dialog.after_idle(prime_scrollbar)
-
-        for column_index in range(columns):
-            editor_inner.columnconfigure(column_index, weight=0, minsize=tile_size_px)
-
-        for idx, image_path in enumerate(image_paths):
-            caption_path = image_path.with_suffix(".txt")
-            caption_text = ""
-            if caption_path.exists() and caption_path.is_file():
-                try:
-                    caption_text = caption_path.read_text(encoding="utf-8")
-                except OSError:
-                    caption_text = ""
-
-            item_frame = ttk.Frame(editor_inner, padding=(4, 4, 4, 6), style="TFrame")
-            item_frame.grid(row=idx // columns, column=idx % columns, sticky="n", padx=tile_side_pad_px, pady=4)
-            item_frame.columnconfigure(0, weight=1)
-
-            photo = build_caption_thumb(image_path)
-            thumb_refs.append(photo)
-            image_label = ttk.Label(item_frame, image=photo, anchor="center")
-            image_label.grid(row=0, column=0, sticky="n")
-            image_label.bind("<MouseWheel>", on_editor_mousewheel)
-            image_label.bind("<Button-4>", on_editor_linux_up)
-            image_label.bind("<Button-5>", on_editor_linux_down)
-
-            caption_shell = tk.Frame(
-                item_frame,
-                width=tile_size_px,
-                height=64,
-                bg="#111826",
-                highlightthickness=1,
-                highlightbackground="#2a3a50",
-                highlightcolor="#4a6ea3",
-                bd=0,
-            )
-            caption_shell.grid(row=1, column=0, sticky="ew", pady=(4, 0))
-            caption_shell.grid_propagate(False)
-
-            caption_widget = tk.Text(
-                caption_shell,
-                width=1,
-                height=3,
-                wrap="word",
-                bg="#111826",
-                fg=fg_text,
-                insertbackground=fg_text,
-                relief="flat",
-                borderwidth=0,
-                highlightthickness=0,
-                padx=6,
-                pady=5,
-            )
-            caption_widget.pack(side="left", fill="both", expand=True)
-
-            caption_scroll = ttk.Scrollbar(
-                caption_shell,
-                orient="vertical",
-                command=caption_widget.yview,
-                style="Dark.Vertical.TScrollbar",
-            )
-            attach_autohide_scrollbar(caption_widget, caption_scroll)
-            caption_widget.insert("1.0", caption_text)
-            caption_widget.edit_modified(False)
-            caption_widget.bind("<<Modified>>", schedule_caption_save)
-            caption_widget.bind("<FocusOut>", on_caption_focus_out)
-            caption_widget.bind("<MouseWheel>", on_editor_mousewheel)
-            caption_widget.bind("<Button-4>", on_editor_linux_up)
-            caption_widget.bind("<Button-5>", on_editor_linux_down)
-            caption_path_by_widget[caption_widget] = caption_path
-
-        def close_editor() -> None:
-            for text_widget in list(caption_path_by_widget.keys()):
-                flush_caption_save(text_widget)
-            dialog.destroy()
-
-        actions = ttk.Frame(outer)
-        actions.grid(row=2, column=0, sticky="e", pady=(10, 0))
-        ttk.Button(actions, text="Close", command=close_editor).grid(row=0, column=0)
-
-        editor_inner.bind("<Configure>", on_editor_inner_configure)
-        editor_canvas.bind("<MouseWheel>", on_editor_mousewheel)
-        editor_canvas.bind("<Button-4>", on_editor_linux_up)
-        editor_canvas.bind("<Button-5>", on_editor_linux_down)
-        editor_inner.bind("<MouseWheel>", on_editor_mousewheel)
-        editor_inner.bind("<Button-4>", on_editor_linux_up)
-        editor_inner.bind("<Button-5>", on_editor_linux_down)
-        dialog.protocol("WM_DELETE_WINDOW", close_editor)
-
-        center_window(dialog)
-        dialog.deiconify()
-        root.wait_window(dialog)
+        dependencies = {
+            "DOWNLOAD_LOCATION_HUGGINGFACE": DOWNLOAD_LOCATION_HUGGINGFACE,
+            "DOWNLOAD_LOCATION_MODELS_FOLDER": DOWNLOAD_LOCATION_MODELS_FOLDER,
+            "Image": Image,
+            "ImageDraw": ImageDraw,
+            "ImageTk": ImageTk,
+            "Path": Path,
+            "app_settings": app_settings,
+            "bg_panel": bg_panel,
+            "center_window": center_window,
+            "dataset_dir_path": dataset_dir_path,
+            "dataset_image_files": dataset_image_files,
+            "datasets_root_dir": datasets_root_dir,
+            "download_workspace_root": download_workspace_root,
+            "fg_text": fg_text,
+            "log": log,
+            "messagebox": messagebox,
+            "root": root,
+            "set_dark_title_bar": set_dark_title_bar,
+            "settings_state": settings_state,
+            "tk": tk,
+            "ttk": ttk,
+        }
+        return dataset_editor_window.DatasetEditorWindow(**dependencies).open(dataset_name)
 
     def dataset_output_safetensors(dataset_name: str) -> list[Path]:
         output_dir = runtime_config.training_dir / dataset_name / "output"

@@ -23,6 +23,7 @@ sentencepiece==0.2.1
 toml==0.10.2
 tqdm==4.67.1
 transformers==4.56.1
+timm>=1.0.0
 voluptuous==0.15.2
 
 # Common training/logging extras already used in this workspace
