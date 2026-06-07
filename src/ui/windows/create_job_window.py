@@ -58,6 +58,14 @@ class CreateJobWindow:
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(0, weight=1)
 
+        job_status_value = ""
+        if existing_job is not None:
+            try:
+                job_status_value = str(self.detect_job_status(existing_job)).strip().lower()
+            except Exception:
+                job_status_value = str((existing_job or {}).get("status", "")).strip().lower()
+        network_type_locked = existing_job is not None and job_status_value == "resume"
+
         def _clear_focus(event: EventType) -> None:
             dialog.focus_set()
         
@@ -113,6 +121,10 @@ class CreateJobWindow:
 
         _MODEL_UNSELECTED_LABEL = "-------------"
         model_var = self.tk.StringVar(value=(existing_job or {}).get("model", "").strip())
+        network_type_var = self.tk.StringVar(value=str((existing_job or {}).get("network_type", "lora")).strip().lower() or "lora")
+        if network_type_var.get() not in {"lora", "lokr"}:
+            network_type_var.set("lora")
+        lokr_factor_var = self.tk.StringVar(value=str((existing_job or {}).get("lokr_factor", "-1")).strip() or "-1")
         ltx_mode_var = self.tk.StringVar(value=(existing_job or {}).get("ltx_mode", "video"))
         if model_var.get().strip():
             default_job_name = f"{dataset_name}_{_family_label(model_var.get().strip())}"
@@ -327,6 +339,21 @@ class CreateJobWindow:
         self.ttk.Label(header_frame, text="Model:").grid(row=0, column=2, sticky="w", padx=(12, 8))
         _model_display_default = self.DOWNLOAD_MODEL_DISPLAY_NAMES.get(model_var.get(), model_var.get()) if model_var.get().strip() else _MODEL_UNSELECTED_LABEL
         _model_display_var = self.tk.StringVar(value=_model_display_default)
+        self.ttk.Label(header_frame, text="Network:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(8, 0))
+        _network_type_combo = self.ttk.Combobox(
+            header_frame,
+            textvariable=network_type_var,
+            values=("lora", "lokr"),
+            state="readonly",
+            width=28,
+        )
+        _network_type_combo.grid(row=1, column=3, sticky="w", pady=(8, 0))
+        if network_type_locked:
+            _network_type_combo.configure(state="disabled")
+            self.attach_hover_tooltip(
+                _network_type_combo,
+                "Network type is locked while this job is in RESUME mode.",
+            )
 
         def _on_model_display_change(*_a: object) -> None:
             disp = _model_display_var.get()
@@ -461,6 +488,8 @@ class CreateJobWindow:
 
         def _collect_preset_values() -> dict[str, str]:
             return {
+                "network_type": network_type_var.get().strip().lower() or "lora",
+                "lokr_factor": lokr_factor_var.get().strip() or "-1",
                 "optimizer_type": train_optimizer_var.get().strip().lower(),
                 "optimizer_args": train_optimizer_args_var.get().strip(),
                 "learning_rate": train_learning_rate_var.get().strip(),
@@ -495,6 +524,18 @@ class CreateJobWindow:
             }
 
         def _apply_preset_values(values: dict[str, str]) -> None:
+            if "network_type" in values:
+                preset_network = str(values["network_type"]).strip().lower()
+                if preset_network in {"lora", "lokr"}:
+                    if network_type_locked:
+                        network_type_var.set(str((existing_job or {}).get("network_type", "lora")).strip().lower() or "lora")
+                    else:
+                        network_type_var.set(preset_network)
+            if "lokr_factor" in values:
+                if network_type_locked:
+                    lokr_factor_var.set(str((existing_job or {}).get("lokr_factor", "-1")).strip() or "-1")
+                else:
+                    lokr_factor_var.set(values["lokr_factor"])
             if "optimizer_type" in values:
                 train_optimizer_var.set(values["optimizer_type"])
             if "optimizer_args" in values:
@@ -771,7 +812,7 @@ class CreateJobWindow:
         _learning_rate_label.grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
         train_learning_rate_entry = self.ttk.Entry(options, textvariable=train_learning_rate_var, style="Flat.TEntry")
         train_learning_rate_entry.grid(row=1, column=1, sticky="ew", pady=(6, 0))
-        _network_dim_label = self.ttk.Label(options, text="LoRA network dim:")
+        _network_dim_label = self.ttk.Label(options, text="Network dim:")
         _network_dim_label.grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
         _network_dim_combo = self.ttk.Combobox(options, textvariable=train_network_dim_var, values=self.TRAIN_DIM_ALPHA_CHOICES, state="readonly")
         _network_dim_combo.grid(
@@ -781,7 +822,7 @@ class CreateJobWindow:
         _save_steps_label.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
         _save_steps_entry = self.ttk.Entry(options, textvariable=train_save_every_var, style="Flat.TEntry")
         _save_steps_entry.grid(row=2, column=1, sticky="ew", pady=(6, 0))
-        _network_alpha_label = self.ttk.Label(options, text="LoRA network alpha:")
+        _network_alpha_label = self.ttk.Label(options, text="Network alpha:")
         _network_alpha_label.grid(row=2, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
         _network_alpha_combo = self.ttk.Combobox(options, textvariable=train_network_alpha_var, values=self.TRAIN_DIM_ALPHA_CHOICES, state="readonly")
         _network_alpha_combo.grid(
@@ -958,6 +999,11 @@ class CreateJobWindow:
         )
         _timestep_sampling_combo.grid(row=2, column=1, sticky="ew", pady=(6, 0))
 
+        _lokr_factor_label = self.ttk.Label(common_advanced, text="LoKr factor:")
+        _lokr_factor_label.grid(row=3, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        _lokr_factor_entry = self.ttk.Entry(common_advanced, textvariable=lokr_factor_var, style="Flat.TEntry")
+        _lokr_factor_entry.grid(row=3, column=3, sticky="ew", pady=(6, 0))
+
         _attach_field_tooltip(
             _lr_scheduler_label,
             _lr_scheduler_combo,
@@ -993,6 +1039,11 @@ class CreateJobWindow:
             _timestep_sampling_label,
             _timestep_sampling_combo,
             "How timesteps are sampled during flow-matching training. Recommended values are model-family dependent.",
+        )
+        _attach_field_tooltip(
+            _lokr_factor_label,
+            _lokr_factor_entry,
+            "LoKr factorization control. Use -1 for automatic balancing (recommended) or a positive integer like 4.",
         )
 
         model_specific = self.ttk.LabelFrame(training_tab, text="Model-specific settings", padding=8)
@@ -1253,11 +1304,32 @@ class CreateJobWindow:
             if not is_ltx and not is_sd_scripts:
                 model_specific.grid_remove()
             _sync_backend_specific_controls()
+            _sync_network_controls()
             _fit_create_job_dialog_to_content()
+
+        def _sync_network_controls() -> None:
+            network_type_value = network_type_var.get().strip().lower() or "lora"
+            if network_type_value not in {"lora", "lokr"}:
+                network_type_value = "lora"
+                network_type_var.set(network_type_value)
+
+            if network_type_value == "lokr":
+                _lokr_factor_label.grid()
+                _lokr_factor_entry.grid()
+                if network_type_locked:
+                    _lokr_factor_entry.configure(state="disabled")
+                else:
+                    _lokr_factor_entry.configure(state="normal")
+            else:
+                _lokr_factor_label.grid_remove()
+                _lokr_factor_entry.grid_remove()
+
+        network_type_var.trace_add("write", lambda *_args: (_sync_network_controls(), _fit_create_job_dialog_to_content()))
 
         train_optimizer_var.trace_add("write", lambda *_args: sync_optimizer_controls())
         sync_optimizer_controls()
         _sync_model_specific_controls()
+        _sync_network_controls()
         _refresh_preset_combo()
 
         # ── Datasets (bottom section) ─────────────────────────────────────
@@ -1776,6 +1848,34 @@ class CreateJobWindow:
                 self.messagebox.showerror("No datasets", "Add at least one dataset in the Datasets section.", parent=dialog)
                 return
 
+            selected_network_type = network_type_var.get().strip().lower() or "lora"
+            if network_type_locked:
+                selected_network_type = str((existing_job or {}).get("network_type", "lora")).strip().lower() or "lora"
+            if selected_network_type not in {"lora", "lokr"}:
+                selected_network_type = "lora"
+
+            lokr_factor_value = -1
+            lokr_factor_raw = lokr_factor_var.get().strip() or "-1"
+            if network_type_locked:
+                lokr_factor_raw = str((existing_job or {}).get("lokr_factor", "-1")).strip() or "-1"
+            if selected_network_type == "lokr":
+                try:
+                    lokr_factor_value = int(lokr_factor_raw)
+                except ValueError:
+                    self.messagebox.showerror(
+                        "Invalid value",
+                        "LoKr factor must be -1 or a positive integer.",
+                        parent=dialog,
+                    )
+                    return
+                if lokr_factor_value != -1 and lokr_factor_value <= 0:
+                    self.messagebox.showerror(
+                        "Invalid value",
+                        "LoKr factor must be -1 or a positive integer.",
+                        parent=dialog,
+                    )
+                    return
+
             resolution_value = int(train_resolution_var.get())
 
             try:
@@ -2050,6 +2150,8 @@ class CreateJobWindow:
                     "training_dir": str(training_dir_path),
                     "job_name": current_job_name,
                     "model": selected_model_name,
+                    "network_type": selected_network_type,
+                    "lokr_factor": str(lokr_factor_value),
                     "ltx_mode": _normalize_ltx_mode_ui(ltx_mode_var.get()),
                     "output_dir": str(output_root),
                     "resolution": str(resolution_value),

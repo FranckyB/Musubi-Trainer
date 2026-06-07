@@ -2480,6 +2480,13 @@ def _launch_ui_impl() -> int:
     def ensure_jobs_storage() -> None:
         jobs_storage_dir().mkdir(parents=True, exist_ok=True)
 
+    def parse_lokr_factor(raw_value: object) -> int:
+        try:
+            value = int(str(raw_value).strip())
+        except Exception:
+            return -1
+        return value if (value == -1 or value > 0) else -1
+
     def save_job_order() -> None:
         ensure_jobs_storage()
         order = [job.get("training_name", "").strip() for job in job_queue if job.get("training_name", "").strip()]
@@ -2584,6 +2591,8 @@ def _launch_ui_impl() -> int:
             "resolution": get_positive_int_setting(job, "resolution", DEFAULT_RESOLUTION, minimum=64),
             "network_dim": get_positive_int_setting(job, "network_dim", DEFAULT_NETWORK_DIM),
             "network_alpha": get_positive_int_setting(job, "network_alpha", DEFAULT_NETWORK_ALPHA),
+            "network_type": str(job.get("network_type", "lora") or "lora"),
+            "lokr_factor": parse_lokr_factor(job.get("lokr_factor", "-1")),
             "optimizer_type": job.get("optimizer_type", "prodigy"),
             "optimizer_args": str(job.get("optimizer_args", "") or ""),
             "learning_rate": job.get("learning_rate", DEFAULT_LEARNING_RATE),
@@ -2915,6 +2924,8 @@ def _launch_ui_impl() -> int:
             "training_dir": str(job_dir),
             "job_name": training_name,
             "model": "Klein",
+            "network_type": "lora",
+            "lokr_factor": "-1",
             "output_dir": str(output_dir),
             "resolution": str(DEFAULT_RESOLUTION),
             "network_dim": str(DEFAULT_NETWORK_DIM),
@@ -4522,6 +4533,8 @@ def _launch_ui_impl() -> int:
                                 "resolution": resolution_value,
                                 "network_dim": get_positive_int_setting(job, "network_dim", DEFAULT_NETWORK_DIM),
                                 "network_alpha": get_positive_int_setting(job, "network_alpha", DEFAULT_NETWORK_ALPHA),
+                                "network_type": str(job.get("network_type", "lora") or "lora"),
+                                "lokr_factor": parse_lokr_factor(job.get("lokr_factor", "-1")),
                                 "optimizer_type": job.get("optimizer_type", "prodigy"),
                                 "optimizer_args": str(job.get("optimizer_args", "") or ""),
                                 "learning_rate": job.get("learning_rate", DEFAULT_LEARNING_RATE),

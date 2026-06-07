@@ -8,7 +8,7 @@ Uses:
   zimage_cache_text_encoder_outputs.py
   zimage_train_network.py
 
-Note: ``--network_module networks.lora_zimage`` is REQUIRED for Z-Image training.
+Note: Defaults to ``--network_module networks.lora_zimage`` in LoRA mode.
 """
 
 from __future__ import annotations
@@ -62,6 +62,12 @@ def _recommended_zimage_dataloader_workers() -> int:
     return max(2, min(8, cpu_count // 2))
 
 
+def _network_settings(network_type: str, lora_module: str) -> tuple[str, bool]:
+    selected = (network_type or "lora").strip().lower()
+    use_lokr = selected == "lokr"
+    return ("networks.lokr" if use_lokr else lora_module, use_lokr)
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Core training pipeline
 # ────────────────────────────────────────────────────────────────────────────
@@ -75,6 +81,8 @@ def run_steps_for_model(
     resolution: int,
     network_dim: int,
     network_alpha: int,
+    network_type: str,
+    lokr_factor: int,
     optimizer_type: str,
     optimizer_args: str,
     learning_rate: str,
@@ -235,11 +243,14 @@ def run_steps_for_model(
             f"output_dir = {toml_quote(str(output_dir))}",
             f"output_name = {toml_quote(output_name)}",
         ]
+        selected_network_module, is_lokr = _network_settings(network_type, NETWORK_MODULE)
         network_lines = [
-            f"network_module = {toml_quote(NETWORK_MODULE)}",
+            f"network_module = {toml_quote(selected_network_module)}",
             f"network_dim = {network_dim}",
             f"network_alpha = {network_alpha}",
         ]
+        if is_lokr and lokr_factor != -1:
+            network_lines.append(f"network_args = {toml_string_list([f'factor={lokr_factor}'])}")
 
         optimizer_args_values: list[str] = []
         if optimizer_key == "prodigy":
@@ -366,6 +377,8 @@ def run_job(
     resolution: int,
     network_dim: int,
     network_alpha: int,
+    network_type: str,
+    lokr_factor: int,
     optimizer_type: str,
     optimizer_args: str,
     learning_rate: str,
@@ -436,7 +449,7 @@ def run_job(
         effective_resume_state = resume_state_dir
         if finished_checkpoint is not None:
             effective_warmstart_checkpoint = finished_checkpoint
-        known_step = max(resume_step, resume_state_step)
+        known_step = max(progress_step, resume_step, resume_state_step)
         resume_step_offset = known_step
         if known_step > 0:
             train_steps_override = max(1, train_steps - known_step)
@@ -445,6 +458,13 @@ def run_job(
         effective_warmstart_checkpoint = resume_checkpoint
         train_steps_override = max(1, train_steps - resume_step)
         logger(f"  warm-starting from {resume_checkpoint.name} (step {resume_step})")
+    elif finished_checkpoint is not None and progress_step > 0:
+        effective_warmstart_checkpoint = finished_checkpoint
+        train_steps_override = max(1, train_steps - progress_step)
+        logger(
+            f"  warm-starting from finished checkpoint {finished_checkpoint.name} "
+            f"(recorded step {progress_step})"
+        )
 
     try:
         run_steps_for_model(
@@ -454,6 +474,8 @@ def run_job(
             resolution=resolution,
             network_dim=network_dim,
             network_alpha=network_alpha,
+            network_type=network_type,
+            lokr_factor=lokr_factor,
             optimizer_type=optimizer_type,
             optimizer_args=optimizer_args,
             learning_rate=learning_rate,

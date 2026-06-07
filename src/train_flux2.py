@@ -160,6 +160,12 @@ def cleanup_step_states_for_cancel(training_dir: Path, dataset_name: str, logger
     )
 
 
+def _network_settings(network_type: str, lora_module: str) -> tuple[str, bool]:
+    selected = (network_type or "lora").strip().lower()
+    use_lokr = selected == "lokr"
+    return ("networks.lokr" if use_lokr else lora_module, use_lokr)
+
+
 
 
 
@@ -170,6 +176,8 @@ def run_steps_for_model(
     resolution: int,
     network_dim: int,
     network_alpha: int,
+    network_type: str,
+    lokr_factor: int,
     optimizer_type: str,
     optimizer_args: str,
     learning_rate: str,
@@ -502,11 +510,14 @@ def run_steps_for_model(
             f"output_dir = {toml_quote(str(output_dir))}",
             f"output_name = {toml_quote(output_name_for_run)}",
         ]
+        _selected_network_module, _is_lokr = _network_settings(network_type, "networks.lora_flux_2")
         network_lines = [
-            'network_module = "networks.lora_flux_2"',
+            f"network_module = {toml_quote(_selected_network_module)}",
             f"network_dim = {network_dim}",
             f"network_alpha = {network_alpha}",
         ]
+        if _is_lokr and lokr_factor != -1:
+            network_lines.append(f"network_args = {toml_string_list([f'factor={lokr_factor}'])}")
         optimization_lines = [
             f"optimizer_type = {toml_quote(optimizer_arg)}",
             f"learning_rate = {learning_rate_for_run}",
@@ -686,7 +697,7 @@ def train_models(
             effective_resume_state = resume_state_dir
             if finished_checkpoint is not None:
                 effective_warmstart_checkpoint = finished_checkpoint
-            known_progress_step = max(resume_step, resume_state_step)
+            known_progress_step = max(progress_step, resume_step, resume_state_step)
             resume_step_offset = known_progress_step
             if known_progress_step > 0:
                 train_steps_override = max(1, train_steps - known_progress_step)
@@ -715,6 +726,8 @@ def train_models(
                 resolution=resolution,
                 network_dim=network_dim,
                 network_alpha=network_alpha,
+                network_type="lora",
+                lokr_factor=-1,
                 optimizer_type=optimizer_type,
                 optimizer_args=optimizer_args,
                 learning_rate=learning_rate,
@@ -789,6 +802,8 @@ def run_job(
     resolution: int,
     network_dim: int,
     network_alpha: int,
+    network_type: str,
+    lokr_factor: int,
     optimizer_type: str,
     optimizer_args: str,
     learning_rate: str,
@@ -852,6 +867,13 @@ def run_job(
         )
         recorded_completed_step = read_recorded_completed_steps(output_dir_resolved, output_name_resolved)
         progress_step = max(resume_step, resume_state_step, recorded_completed_step)
+        logger(
+            "  resume detection: "
+            f"checkpoint_step={resume_step}, "
+            f"resume_state_step={resume_state_step}, "
+            f"recorded_completed_step={recorded_completed_step}, "
+            f"progress_step={progress_step}"
+        )
     effective_resume_state: Path | None = None
     resume_step_offset = 0
     effective_warmstart_checkpoint: Path | None = None
@@ -868,7 +890,7 @@ def run_job(
         effective_resume_state = resume_state_dir
         if finished_checkpoint is not None:
             effective_warmstart_checkpoint = finished_checkpoint
-        known_progress_step = max(resume_step, resume_state_step)
+        known_progress_step = max(progress_step, resume_step, resume_state_step)
         resume_step_offset = known_progress_step
         if known_progress_step > 0:
             train_steps_override = max(1, train_steps - known_progress_step)
@@ -888,6 +910,15 @@ def run_job(
             f"  warm-starting from {resume_checkpoint.name} (step {resume_step}) via --network_weights, "
             f"remaining steps {train_steps_override}"
         )
+    elif finished_checkpoint is not None and progress_step > 0:
+        # Resume can still be valid even when step/state artifacts were cleaned and only
+        # the final output checkpoint remains. Use recorded progress to continue training.
+        effective_warmstart_checkpoint = finished_checkpoint
+        train_steps_override = max(1, train_steps - progress_step)
+        logger(
+            f"  warm-starting from finished checkpoint {finished_checkpoint.name} "
+            f"(recorded step {progress_step}) via --network_weights, remaining steps {train_steps_override}"
+        )
 
     try:
         run_steps_for_model(
@@ -897,6 +928,8 @@ def run_job(
             resolution=resolution,
             network_dim=network_dim,
             network_alpha=network_alpha,
+            network_type=network_type,
+            lokr_factor=lokr_factor,
             optimizer_type=optimizer_type,
             optimizer_args=optimizer_args,
             learning_rate=learning_rate,
