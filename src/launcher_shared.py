@@ -6,6 +6,16 @@ from pathlib import Path
 from . import app_settings
 
 VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+VALID_AUDIO_EXTENSIONS = {
+    ".wav",
+    ".flac",
+    ".mp3",
+    ".m4a",
+    ".ogg",
+    ".opus",
+    ".aac",
+    ".wma",
+}
 LATENT_SUFFIX = "f2k9b"
 DATASET_ORDER_KEY = "dataset_order"
 DRAG_START_THRESHOLD_PX = 20
@@ -114,6 +124,14 @@ def dataset_image_files(training_dir: Path, dataset_name: str) -> list[Path]:
         return []
 
     return sorted([p for p in dataset_dir.iterdir() if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTENSIONS])
+
+
+def dataset_audio_files(training_dir: Path, dataset_name: str) -> list[Path]:
+    dataset_dir = training_dir / dataset_name
+    if not dataset_dir.exists() or not dataset_dir.is_dir():
+        return []
+
+    return sorted([p for p in dataset_dir.iterdir() if p.is_file() and p.suffix.lower() in VALID_AUDIO_EXTENSIONS])
 
 
 def is_step1_ready(training_dir: Path, dataset_name: str) -> bool:

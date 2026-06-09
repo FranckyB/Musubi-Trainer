@@ -77,13 +77,13 @@ class LoraMergeWindow:
         options_frame.columnconfigure(0, weight=1)
         options_frame.columnconfigure(1, weight=1)
 
-        preset_section = self.ttk.LabelFrame(options_frame, text="Preset(s)", padding=6)
-        preset_section.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        self.attach_hover_tooltip(preset_section, self.merge_preset_tooltip_text)
-
         mode_section = self.ttk.LabelFrame(options_frame, text="Mode(s)", padding=6)
-        mode_section.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        mode_section.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         self.attach_hover_tooltip(mode_section, self.merge_mode_tooltip_text)
+
+        preset_section = self.ttk.LabelFrame(options_frame, text="Preset(s)", padding=6)
+        preset_section.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        self.attach_hover_tooltip(preset_section, self.merge_preset_tooltip_text)
 
         preset_balanced_var = self.tk.BooleanVar(value=False)
         preset_smooth_var = self.tk.BooleanVar(value=False)
@@ -95,9 +95,9 @@ class LoraMergeWindow:
         mode_beta_var = self.tk.BooleanVar(value=False)
         mode_beta2_var = self.tk.BooleanVar(value=False)
         mode_sigma_var = self.tk.BooleanVar(value=False)
-        self.ttk.Checkbutton(mode_section, text="BETA (Default)", variable=mode_beta_var).grid(row=0, column=0, sticky="w")
-        self.ttk.Checkbutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.ttk.Checkbutton(mode_section, text="SIGMA_REL", variable=mode_sigma_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.ttk.Checkbutton(mode_section, text="SIGMA_REL", variable=mode_sigma_var).grid(row=0, column=0, sticky="w")
+        self.ttk.Checkbutton(mode_section, text="BETA", variable=mode_beta_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.ttk.Checkbutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
 
         button_row = self.ttk.Frame(frame)
         button_row.grid(row=5, column=0, sticky="ew", pady=(12, 0))
@@ -421,19 +421,19 @@ class LoraMergeWindow:
         preset_smooth_var = self.tk.BooleanVar(value=False)
         preset_anti_overfit_var = self.tk.BooleanVar(value=False)
 
+        mode_group = self.ttk.LabelFrame(mode_section, text="Mode(s)", padding=6)
+        mode_group.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(8, 0))
+        self.attach_hover_tooltip(mode_group, self.merge_mode_tooltip_text)
+        self.ttk.Checkbutton(mode_group, text="SIGMA_REL", variable=mode_sigma_var).grid(row=0, column=0, sticky="w")
+        self.ttk.Checkbutton(mode_group, text="BETA", variable=mode_beta_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.ttk.Checkbutton(mode_group, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
+
         preset_section = self.ttk.LabelFrame(mode_section, text="Preset(s)", padding=6)
-        preset_section.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(8, 0))
+        preset_section.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(8, 0))
         self.attach_hover_tooltip(preset_section, self.merge_preset_tooltip_text)
         self.ttk.Checkbutton(preset_section, text="Balanced", variable=preset_balanced_var).grid(row=0, column=0, sticky="w")
         self.ttk.Checkbutton(preset_section, text="Smooth", variable=preset_smooth_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.ttk.Checkbutton(preset_section, text="Anti-overfit", variable=preset_anti_overfit_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
-
-        mode_group = self.ttk.LabelFrame(mode_section, text="Mode(s)", padding=6)
-        mode_group.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(8, 0))
-        self.attach_hover_tooltip(mode_group, self.merge_mode_tooltip_text)
-        self.ttk.Checkbutton(mode_group, text="BETA (Default)", variable=mode_beta_var).grid(row=0, column=0, sticky="w")
-        self.ttk.Checkbutton(mode_group, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.ttk.Checkbutton(mode_group, text="SIGMA_REL", variable=mode_sigma_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
 
         output_name_var = self.tk.StringVar(value="merged_lora")
         output_dir_var = self.tk.StringVar(value="")

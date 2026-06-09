@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .app_settings import (
     BACKENDS_ROOT_KEY,
+    TRAINERS_ROOT_KEY,
     KLEIN_DIT_KEY,
     KLEIN_MODEL_VERSION_KEY,
     KLEIN_TEXT_ENCODER_KEY,
@@ -32,12 +33,12 @@ class RuntimeConfig:
     text_encoder: Path | None
 
 
-def _default_backends_root(workspace_dir: Path) -> Path:
-    return workspace_dir / "Backends"
+def _default_trainers_root(workspace_dir: Path) -> Path:
+    return workspace_dir / "Trainers"
 
 
 def _default_backend_path(workspace_dir: Path, folder_name: str) -> Path:
-    return _default_backends_root(workspace_dir) / folder_name
+    return _default_trainers_root(workspace_dir) / folder_name
 
 
 def _resolve_musubi_backend_path(settings: dict[str, str], model_name: str) -> Path | None:
@@ -45,8 +46,15 @@ def _resolve_musubi_backend_path(settings: dict[str, str], model_name: str) -> P
     is_ltx_model = (model_name or "").strip().lower() in _LTX_MODELS
     is_sd_scripts_model = (model_name or "").strip().lower() in _SD_SCRIPTS_MODELS
 
-    backends_root_raw = settings.get(BACKENDS_ROOT_KEY, "").strip()
-    backends_root = Path(backends_root_raw).expanduser() if backends_root_raw else _default_backends_root(workspace_dir)
+    trainers_root_raw = settings.get(TRAINERS_ROOT_KEY, "").strip()
+    legacy_backends_root_raw = settings.get(BACKENDS_ROOT_KEY, "").strip()
+    default_trainers_root = _default_trainers_root(workspace_dir)
+    if trainers_root_raw:
+        trainers_root = Path(trainers_root_raw).expanduser()
+    elif legacy_backends_root_raw:
+        trainers_root = Path(legacy_backends_root_raw).expanduser()
+    else:
+        trainers_root = default_trainers_root
 
     legacy_musubi_raw = settings.get(MUSUBI_DIR_KEY, "").strip()
     legacy_musubi_path = Path(legacy_musubi_raw).expanduser() if legacy_musubi_raw else None
@@ -55,9 +63,9 @@ def _resolve_musubi_backend_path(settings: dict[str, str], model_name: str) -> P
     ltx_raw = settings.get(MUSUBI_LTX_DIR_KEY, "").strip()
     sd_raw = settings.get(SD_SCRIPTS_DIR_KEY, "").strip()
 
-    main_path = Path(main_raw).expanduser() if main_raw else (backends_root / "musubi-main")
-    ltx_path = Path(ltx_raw).expanduser() if ltx_raw else (backends_root / "musubi-ltx")
-    sd_path = Path(sd_raw).expanduser() if sd_raw else (backends_root / "sd-scripts")
+    main_path = Path(main_raw).expanduser() if main_raw else (trainers_root / "musubi-main")
+    ltx_path = Path(ltx_raw).expanduser() if ltx_raw else (trainers_root / "musubi-ltx")
+    sd_path = Path(sd_raw).expanduser() if sd_raw else (trainers_root / "sd-scripts")
 
     if is_ltx_model:
         return ltx_path

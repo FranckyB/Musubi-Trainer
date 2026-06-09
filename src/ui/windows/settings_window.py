@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 # pyright: reportUndefinedVariable=false, reportGeneralTypeIssues=false
 
 from pathlib import Path
@@ -26,7 +26,7 @@ class SettingsWindow:
         current_main_dir = str(backend_dirs["musubi-main"])
         current_ltx_dir = str(backend_dirs["musubi-ltx"])
         current_sd_scripts_dir = str(backend_dirs["sd-scripts"])
-        current_backends_root = str(self.configured_backends_root())
+        current_trainers_root = str(self.configured_trainers_root())
         current_musubi_python_path = self.resolve_musubi_python(self.Path(current_main_dir).expanduser()) if current_main_dir else None
         current_default_caption_keyword = self.settings_state.get(self.app_settings.DEFAULT_CAPTION_KEYWORD_KEY, "")
         current_enable_training_logging = self.settings_state.get(
@@ -100,9 +100,9 @@ class SettingsWindow:
         footer.grid(row=1, column=0, sticky="ew")
         footer.columnconfigure(0, weight=1)
 
-        backends_section = self.ttk.LabelFrame(general_tab, text="Backends", padding=8)
-        backends_section.grid(row=0, column=0, sticky="ew")
-        backends_section.columnconfigure(1, weight=1)
+        trainers_section = self.ttk.LabelFrame(general_tab, text="Trainers", padding=8)
+        trainers_section.grid(row=0, column=0, sticky="ew")
+        trainers_section.columnconfigure(1, weight=1)
 
         captions_section = self.ttk.LabelFrame(general_tab, text="Captions", padding=8)
         captions_section.grid(row=1, column=0, sticky="ew", pady=(10, 0))
@@ -115,7 +115,7 @@ class SettingsWindow:
         advanced_section.columnconfigure(2, weight=0)
         advanced_section.columnconfigure(3, weight=1)
 
-        # ── Models tab ────────────────────────────────────────────────────
+        # â”€â”€ Models tab â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         model_loc_frame = self.ttk.Frame(models_tab)
         model_loc_frame.grid(row=0, column=0, sticky="ew")
         model_location_var = self.tk.StringVar(
@@ -134,7 +134,7 @@ class SettingsWindow:
         self.ttk.Entry(model_loc_frame, textvariable=hf_token_var, show="*", width=36, style="Flat.TEntry").grid(row=0, column=3, sticky="ew")
         model_loc_frame.columnconfigure(3, weight=1)
 
-        # ── ComfyUI path + scan ───────────────────────────────────────────
+        # â”€â”€ ComfyUI path + scan â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _raw_extra = self.settings_state.get(self.app_settings.EXTRA_SEARCH_PATHS_KEY, "")
         import json as _json_extra
         try:
@@ -184,7 +184,7 @@ class SettingsWindow:
             else:
                 self.messagebox.showinfo("Scan complete", "No new files found.", parent=dialog)
 
-        self.ttk.Button(extra_paths_frame, text="Browse…", command=_browse_extra_path).grid(row=0, column=2, padx=(6, 0))
+        self.ttk.Button(extra_paths_frame, text="Browseâ€¦", command=_browse_extra_path).grid(row=0, column=2, padx=(6, 0))
         self.ttk.Button(extra_paths_frame, text="Scan for models", command=_scan_all_sources).grid(row=0, column=3, padx=(6, 0))
 
         # Registry of all component StringVars so _scan_extra_path can update them
@@ -215,13 +215,13 @@ class SettingsWindow:
             for child in widget.winfo_children():
                 _bind_mousewheel(child)
 
-        selected_backends_root = current_backends_root
+        selected_trainers_root = current_trainers_root
         selected_musubi_main_path = current_main_dir
         selected_musubi_ltx_path = current_ltx_dir
         selected_sd_scripts_path = current_sd_scripts_dir
         selected_musubi_python = str(current_musubi_python_path) if current_musubi_python_path is not None else ""
 
-        # pending_model_paths: model_name → {component: path_str}
+        # pending_model_paths: model_name â†’ {component: path_str}
         import json as _json_settings
         _raw_model_paths = self.settings_state.get(self.app_settings.MODEL_PATHS_KEY, "")
         try:
@@ -261,7 +261,7 @@ class SettingsWindow:
             return sorted(names, key=str.casefold)
 
         preferred_preset_vars: dict[str, Any] = {}
-        backends_root_var = self.tk.StringVar(value=selected_backends_root)
+        trainers_root_var = self.tk.StringVar(value=selected_trainers_root)
         musubi_main_display_var = self.tk.StringVar(value=selected_musubi_main_path if selected_musubi_main_path else "(none)")
         musubi_ltx_display_var = self.tk.StringVar(value=selected_musubi_ltx_path if selected_musubi_ltx_path else "(none)")
         sd_scripts_display_var = self.tk.StringVar(value=selected_sd_scripts_path if selected_sd_scripts_path else "(none)")
@@ -278,103 +278,103 @@ class SettingsWindow:
         auto_start_tensorboard_var = self.tk.BooleanVar(value=current_auto_start_tensorboard)
         train_save_every_default_var = self.tk.StringVar(value=current_train_save_every_n_steps)
 
-        self.ttk.Label(backends_section, text="Backends root:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.ttk.Label(trainers_section, text="Trainers root:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.ttk.Label(
-            backends_section,
-            textvariable=backends_root_var,
+            trainers_section,
+            textvariable=trainers_root_var,
             anchor="w",
             style="PathDisplay.TLabel",
             padding=(6, 4),
         ).grid(row=0, column=1, sticky="ew")
-        self.ttk.Button(backends_section, text="Browse Root", command=lambda: browse_backends_root()).grid(
+        self.ttk.Button(trainers_section, text="Browse Root", command=lambda: browse_trainers_root()).grid(
             row=0,
             column=2,
             padx=(8, 0),
         )
 
-        self.ttk.Label(backends_section, text="Musubi Main:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        self.ttk.Label(trainers_section, text="Musubi Main:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         self.ttk.Label(
-            backends_section,
+            trainers_section,
             textvariable=musubi_main_display_var,
             anchor="w",
             style="PathDisplay.TLabel",
             padding=(6, 4),
         ).grid(row=1, column=1, sticky="ew", pady=(8, 0))
-        self.ttk.Button(backends_section, text="Browse", command=lambda: browse_backend("musubi-main")).grid(
+        self.ttk.Button(trainers_section, text="Browse", command=lambda: browse_backend("musubi-main")).grid(
             row=1,
             column=2,
             padx=(8, 0),
             pady=(8, 0),
         )
-        self.ttk.Button(backends_section, textvariable=musubi_main_action_var, command=lambda: auto_download_backend("musubi-main")).grid(
+        self.ttk.Button(trainers_section, textvariable=musubi_main_action_var, command=lambda: auto_download_backend("musubi-main")).grid(
             row=1,
             column=3,
             padx=(8, 0),
             pady=(8, 0),
         )
-        self.ttk.Label(backends_section, textvariable=musubi_main_status_var).grid(row=2, column=1, sticky="w")
+        self.ttk.Label(trainers_section, textvariable=musubi_main_status_var).grid(row=2, column=1, sticky="w")
         self.ttk.Label(
-            backends_section,
+            trainers_section,
             text="Used for: FLUX2, QWEN, ZIMAGE, WAN",
             foreground=self.fg_muted,
         ).grid(row=2, column=2, columnspan=2, sticky="w")
 
-        self.ttk.Label(backends_section, text="Musubi LTX:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        self.ttk.Label(trainers_section, text="Musubi LTX:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         self.ttk.Label(
-            backends_section,
+            trainers_section,
             textvariable=musubi_ltx_display_var,
             anchor="w",
             style="PathDisplay.TLabel",
             padding=(6, 4),
         ).grid(row=3, column=1, sticky="ew", pady=(8, 0))
-        self.ttk.Button(backends_section, text="Browse", command=lambda: browse_backend("musubi-ltx")).grid(
+        self.ttk.Button(trainers_section, text="Browse", command=lambda: browse_backend("musubi-ltx")).grid(
             row=3,
             column=2,
             padx=(8, 0),
             pady=(8, 0),
         )
-        self.ttk.Button(backends_section, textvariable=musubi_ltx_action_var, command=lambda: auto_download_backend("musubi-ltx")).grid(
+        self.ttk.Button(trainers_section, textvariable=musubi_ltx_action_var, command=lambda: auto_download_backend("musubi-ltx")).grid(
             row=3,
             column=3,
             padx=(8, 0),
             pady=(8, 0),
         )
-        self.ttk.Label(backends_section, textvariable=musubi_ltx_status_var).grid(row=4, column=1, sticky="w")
+        self.ttk.Label(trainers_section, textvariable=musubi_ltx_status_var).grid(row=4, column=1, sticky="w")
         self.ttk.Label(
-            backends_section,
+            trainers_section,
             text="Used for: LTX",
             foreground=self.fg_muted,
         ).grid(row=4, column=2, columnspan=2, sticky="w")
 
-        self.ttk.Label(backends_section, text="sd-scripts:").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        self.ttk.Label(trainers_section, text="sd-scripts:").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         self.ttk.Label(
-            backends_section,
+            trainers_section,
             textvariable=sd_scripts_display_var,
             anchor="w",
             style="PathDisplay.TLabel",
             padding=(6, 4),
         ).grid(row=5, column=1, sticky="ew", pady=(8, 0))
-        self.ttk.Button(backends_section, text="Browse", command=lambda: browse_backend("sd-scripts")).grid(
+        self.ttk.Button(trainers_section, text="Browse", command=lambda: browse_backend("sd-scripts")).grid(
             row=5,
             column=2,
             padx=(8, 0),
             pady=(8, 0),
         )
-        self.ttk.Button(backends_section, textvariable=sd_scripts_action_var, command=lambda: auto_download_backend("sd-scripts")).grid(
+        self.ttk.Button(trainers_section, textvariable=sd_scripts_action_var, command=lambda: auto_download_backend("sd-scripts")).grid(
             row=5,
             column=3,
             padx=(8, 0),
             pady=(8, 0),
         )
-        self.ttk.Label(backends_section, textvariable=sd_scripts_status_var).grid(row=6, column=1, sticky="w")
+        self.ttk.Label(trainers_section, textvariable=sd_scripts_status_var).grid(row=6, column=1, sticky="w")
         self.ttk.Label(
-            backends_section,
+            trainers_section,
             text="Used for: ANIMA, FLUX, SDXL",
             foreground=self.fg_muted,
         ).grid(row=6, column=2, columnspan=2, sticky="w")
 
         self.ttk.Label(
-            backends_section,
+            trainers_section,
             text="Model families are shown based on backend availability. Python interpreter is managed by this app.",
         ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
@@ -443,7 +443,7 @@ class SettingsWindow:
             text="Logs are stored per job under each Training/<job>/logs folder and can be viewed via TensorBoard.",
         ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
-        # ── Model family sections ──────────────────────────────────────
+        # â”€â”€ Model family sections â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _status_vars: dict[str, Any] = {}
 
         _COMPONENT_LABELS: dict[str, str] = {
@@ -465,7 +465,7 @@ class SettingsWindow:
                 return "Not configured"
             if found < len(components):
                 return f"Partial ({found}/{len(components)})"
-            return "✓ Ready"
+            return "âœ“ Ready"
 
         def _refresh_status(model_name: str) -> None:
             sv = _status_vars.get(model_name)
@@ -474,7 +474,7 @@ class SettingsWindow:
 
         def _apply_status_color(lbl: Any, sv: Any, *_a: object) -> None:
             val = sv.get()
-            if val.startswith("✓"):
+            if val.startswith("âœ“"):
                 lbl.configure(foreground="#6fcf6f")
             elif val.startswith("Partial"):
                 lbl.configure(foreground="#f0b429")
@@ -490,7 +490,7 @@ class SettingsWindow:
 
             fam_header_btn = self.ttk.Button(
                 section_frame,
-                text=f"{'▼' if expanded else '▶'}  {family_name}",
+                text=f"{'â–¼' if expanded else 'â–¶'}  {family_name}",
                 style="FamilyHeader.TButton",
                 command=lambda: _toggle_family(fam_header_btn, fam_body, fam_expanded_var, family_name),
             )
@@ -529,7 +529,7 @@ class SettingsWindow:
                 model_block.grid(row=r, column=0, sticky="ew", pady=(1, 0))
                 model_block.columnconfigure(0, weight=1)
 
-                # ─ Model header row ─────────────────────────────────
+                # â”€ Model header row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 hdr = self.ttk.Frame(model_block)
                 hdr.grid(row=0, column=0, sticky="ew")
                 hdr.columnconfigure(0, weight=1)
@@ -541,7 +541,7 @@ class SettingsWindow:
 
                 expand_btn = self.ttk.Button(
                     hdr,
-                    text=f"▶  {display_name}",
+                    text=f"â–¶  {display_name}",
                     style="FamilyHeader.TButton",
                 )
                 expand_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
@@ -556,7 +556,7 @@ class SettingsWindow:
                     command=lambda mn=mn: _auto_download_model(mn),
                 ).grid(row=0, column=2, padx=(8, 0))
 
-                # ─ Detail rows (component paths) ─────────────────────
+                # â”€ Detail rows (component paths) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 components = list(self.DOWNLOAD_MODELS.get(mn, {}).keys())
                 _comp_path_vars: dict[str, Any] = {}
 
@@ -622,11 +622,11 @@ class SettingsWindow:
                     if var.get():
                         det.grid_remove()
                         var.set(False)
-                        btn.configure(text=f"▶  {dn}")
+                        btn.configure(text=f"â–¶  {dn}")
                     else:
                         det.grid(row=1, column=0, sticky="ew")
                         var.set(True)
-                        btn.configure(text=f"▼  {dn}")
+                        btn.configure(text=f"â–¼  {dn}")
 
                 expand_btn.configure(command=_toggle_detail)
                 _bind_mousewheel(hdr)
@@ -643,11 +643,11 @@ class SettingsWindow:
             if var.get():
                 body.grid_remove()
                 var.set(False)
-                btn.configure(text=f"▶  {family_name}")
+                btn.configure(text=f"â–¶  {family_name}")
             else:
                 body.grid(row=1, column=0, sticky="ew")
                 var.set(True)
-                btn.configure(text=f"▼  {family_name}")
+                btn.configure(text=f"â–¼  {family_name}")
 
         _family_row = 0
         for _fam_name, _fam_models in self.DOWNLOAD_MODEL_FAMILIES.items():
@@ -656,7 +656,7 @@ class SettingsWindow:
 
         _bind_mousewheel(models_inner)
 
-        # ── Auto-download handler ──────────────────────────────────────
+        # â”€â”€ Auto-download handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         def _auto_download_model(model_name: str) -> None:
             location = model_location_var.get()
             ws_root = self.download_workspace_root()
@@ -688,7 +688,7 @@ class SettingsWindow:
             if not confirmed:
                 return
 
-            # Resolve which Python to use — prefer the configured Musubi-Tuner venv
+            # Resolve which Python to use â€” prefer the configured Musubi-Tuner venv
             # so that huggingface_hub is available and the process has a real stdout.
             python_exe = selected_musubi_python
             if not python_exe:
@@ -703,7 +703,7 @@ class SettingsWindow:
             error_holder: list[str] = []
             result_holder: dict[str, object] = {}
 
-            self.log(f"━━━ Downloading {model_name} ({', '.join(missing)}) ━━━")
+            self.log(f"â”â”â” Downloading {model_name} ({', '.join(missing)}) â”â”â”")
 
             def _do_download() -> None:
                 for comp in missing:
@@ -717,7 +717,7 @@ class SettingsWindow:
                     if hf_token:
                         cmd += ["--token", hf_token]
 
-                    self.log(f"  ↓ {comp}…")
+                    self.log(f"  â†“ {comp}â€¦")
                     try:
                         proc = self.subprocess.Popen(
                             cmd,
@@ -789,7 +789,7 @@ class SettingsWindow:
                     self.messagebox.showerror("Download failed", error_holder[0], parent=dialog)
                     return
                 _refresh_status(model_name)
-                self.log(f"━━━ Complete: {model_name} ━━━")
+                self.log(f"â”â”â” Complete: {model_name} â”â”â”")
                 self.messagebox.showinfo(
                     "Download complete",
                     f"'{model_name}' is ready.",
@@ -802,9 +802,9 @@ class SettingsWindow:
             main_path = self.Path(selected_musubi_main_path).expanduser()
             ltx_path = self.Path(selected_musubi_ltx_path).expanduser()
             sd_path = self.Path(selected_sd_scripts_path).expanduser()
-            preferred_main = self.Path(selected_backends_root).expanduser() / "musubi-main"
-            preferred_ltx = self.Path(selected_backends_root).expanduser() / "musubi-ltx"
-            preferred_sd = self.Path(selected_backends_root).expanduser() / "sd-scripts"
+            preferred_main = self.Path(selected_trainers_root).expanduser() / "musubi-main"
+            preferred_ltx = self.Path(selected_trainers_root).expanduser() / "musubi-ltx"
+            preferred_sd = self.Path(selected_trainers_root).expanduser() / "sd-scripts"
 
             main_ok = self.backend_is_valid("musubi-main", main_path)
             ltx_ok = self.backend_is_valid("musubi-ltx", ltx_path)
@@ -822,7 +822,8 @@ class SettingsWindow:
             sd_scripts_action_var.set("Update" if sd_is_preferred else "Auto Download")
 
         def _persist_backend_paths() -> None:
-            self.settings_state[self.app_settings.BACKENDS_ROOT_KEY] = str(self.Path(selected_backends_root).expanduser())
+            trainers_root_value = str(self.Path(selected_trainers_root).expanduser())
+            self.settings_state[self.app_settings.TRAINERS_ROOT_KEY] = trainers_root_value
             self.settings_state[self.app_settings.MUSUBI_MAIN_DIR_KEY] = str(self.Path(selected_musubi_main_path).expanduser())
             self.settings_state[self.app_settings.MUSUBI_LTX_DIR_KEY] = str(self.Path(selected_musubi_ltx_path).expanduser())
             self.settings_state[self.app_settings.SD_SCRIPTS_DIR_KEY] = str(self.Path(selected_sd_scripts_path).expanduser())
@@ -830,18 +831,18 @@ class SettingsWindow:
             self.settings_state[self.app_settings.MUSUBI_DIR_KEY] = self.settings_state[self.app_settings.MUSUBI_MAIN_DIR_KEY]
             self.app_settings.save_settings(self.settings_state)
 
-        def browse_backends_root() -> None:
-            nonlocal selected_backends_root, selected_musubi_main_path, selected_musubi_ltx_path, selected_sd_scripts_path
+        def browse_trainers_root() -> None:
+            nonlocal selected_trainers_root, selected_musubi_main_path, selected_musubi_ltx_path, selected_sd_scripts_path
             picked = self.filedialog.askdirectory(
                 parent=dialog,
-                title="Select Backends root folder",
-                initialdir=selected_backends_root or str(self.default_backends_root()),
+                title="Select Trainers root folder",
+                initialdir=selected_trainers_root or str(self.default_trainers_root()),
             )
             if not picked:
                 return
 
-            selected_backends_root = picked
-            backends_root_var.set(picked)
+            selected_trainers_root = picked
+            trainers_root_var.set(picked)
 
             if not self.settings_state.get(self.app_settings.MUSUBI_MAIN_DIR_KEY, "").strip():
                 selected_musubi_main_path = str(self.Path(picked) / "musubi-main")
@@ -895,14 +896,14 @@ class SettingsWindow:
             clone_confirmed = False
 
             if kind == "musubi-main":
-                current_target = self.Path(selected_musubi_main_path).expanduser() if selected_musubi_main_path else self.Path(selected_backends_root) / "musubi-main"
-                preferred_target = self.Path(selected_backends_root).expanduser() / "musubi-main"
+                current_target = self.Path(selected_musubi_main_path).expanduser() if selected_musubi_main_path else self.Path(selected_trainers_root) / "musubi-main"
+                preferred_target = self.Path(selected_trainers_root).expanduser() / "musubi-main"
             elif kind == "musubi-ltx":
-                current_target = self.Path(selected_musubi_ltx_path).expanduser() if selected_musubi_ltx_path else self.Path(selected_backends_root) / "musubi-ltx"
-                preferred_target = self.Path(selected_backends_root).expanduser() / "musubi-ltx"
+                current_target = self.Path(selected_musubi_ltx_path).expanduser() if selected_musubi_ltx_path else self.Path(selected_trainers_root) / "musubi-ltx"
+                preferred_target = self.Path(selected_trainers_root).expanduser() / "musubi-ltx"
             else:
-                current_target = self.Path(selected_sd_scripts_path).expanduser() if selected_sd_scripts_path else self.Path(selected_backends_root) / "sd-scripts"
-                preferred_target = self.Path(selected_backends_root).expanduser() / "sd-scripts"
+                current_target = self.Path(selected_sd_scripts_path).expanduser() if selected_sd_scripts_path else self.Path(selected_trainers_root) / "sd-scripts"
+                preferred_target = self.Path(selected_trainers_root).expanduser() / "sd-scripts"
 
             target = preferred_target
 
@@ -930,20 +931,20 @@ class SettingsWindow:
                 _persist_backend_paths()
 
             if selected_is_preferred:
-                _settings_log(f"[Backends] {label}: update started")
+                _settings_log(f"[Trainers] {label}: update started")
                 confirm_update = self.messagebox.askyesno(
                     "Update backend",
                     f"Run git pull for {label}?\n\nTarget:\n{target}",
                     parent=dialog,
                 )
                 if not confirm_update:
-                    _settings_log(f"[Backends] {label}: update cancelled")
+                    _settings_log(f"[Trainers] {label}: update cancelled")
                     return
 
                 ok, output = self.update_backend_repo(target, logger=_settings_log)
                 if ok:
                     _apply_selected_backend(target)
-                    _settings_log(f"[Backends] {label}: update done")
+                    _settings_log(f"[Trainers] {label}: update done")
                     self.messagebox.showinfo(
                         "Update complete",
                         f"{label} updated successfully.\n\n{output}",
@@ -951,7 +952,7 @@ class SettingsWindow:
                     )
                     return
 
-                _settings_log(f"[Backends] {label}: update failed")
+                _settings_log(f"[Trainers] {label}: update failed")
 
                 reset_now = self.messagebox.askyesno(
                     "Update failed",
@@ -960,25 +961,25 @@ class SettingsWindow:
                     parent=dialog,
                 )
                 if not reset_now:
-                    _settings_log(f"[Backends] {label}: reset cancelled")
+                    _settings_log(f"[Trainers] {label}: reset cancelled")
                     return
 
-                _settings_log(f"[Backends] {label}: reset started")
+                _settings_log(f"[Trainers] {label}: reset started")
                 try:
                     self.shutil.rmtree(target)
                 except OSError as exc:
-                    _settings_log(f"[Backends] {label}: reset failed")
+                    _settings_log(f"[Trainers] {label}: reset failed")
                     self.messagebox.showerror("Reset failed", f"Could not remove folder:\n{exc}", parent=dialog)
                     return
 
                 ok, err = self.clone_backend_repo(target, repo_url, branch, logger=_settings_log)
                 if not ok:
-                    _settings_log(f"[Backends] {label}: re-download failed")
+                    _settings_log(f"[Trainers] {label}: re-download failed")
                     self.messagebox.showerror("Re-download failed", err, parent=dialog)
                     return
 
                 _apply_selected_backend(target)
-                _settings_log(f"[Backends] {label}: reset done")
+                _settings_log(f"[Trainers] {label}: reset done")
                 self.messagebox.showinfo("Reset complete", f"Re-downloaded {label}:\n{target}", parent=dialog)
                 return
 
@@ -989,8 +990,8 @@ class SettingsWindow:
             if self.backend_is_valid(kind, current_target) and current_target.resolve() != target.resolve():
                 clone_here = self.messagebox.askyesno(
                     "Download backend",
-                    f"{label} is currently configured outside Backends:\n{current_target}\n\n"
-                    f"Clone another copy into Backends and switch to it?\n\nTarget:\n{target}",
+                    f"{label} is currently configured outside Trainers:\n{current_target}\n\n"
+                    f"Clone another copy into Trainers and switch to it?\n\nTarget:\n{target}",
                     parent=dialog,
                 )
                 if not clone_here:
@@ -1005,18 +1006,18 @@ class SettingsWindow:
                     parent=dialog,
                 )
                 if not confirm:
-                    _settings_log(f"[Backends] {label}: download cancelled")
+                    _settings_log(f"[Trainers] {label}: download cancelled")
                     return
 
-            _settings_log(f"[Backends] {label}: download started")
+            _settings_log(f"[Trainers] {label}: download started")
             ok, err = self.clone_backend_repo(target, repo_url, branch, logger=_settings_log)
             if not ok:
-                _settings_log(f"[Backends] {label}: download failed")
+                _settings_log(f"[Trainers] {label}: download failed")
                 self.messagebox.showerror("Clone failed", err, parent=dialog)
                 return
 
             _apply_selected_backend(target)
-            _settings_log(f"[Backends] {label}: download done")
+            _settings_log(f"[Trainers] {label}: download done")
             self.messagebox.showinfo("Clone complete", f"Configured {label}:\n{target}", parent=dialog)
 
         _refresh_backend_status_labels()
@@ -1059,7 +1060,7 @@ class SettingsWindow:
 
         def save_and_close() -> None:
             nonlocal result
-            # Force any focused entry widget to commit (triggers FocusOut → _save_path)
+            # Force any focused entry widget to commit (triggers FocusOut â†’ _save_path)
             dialog.focus_set()
             main_dir = self.Path(selected_musubi_main_path).expanduser()
             ltx_dir = self.Path(selected_musubi_ltx_path).expanduser()
@@ -1100,7 +1101,8 @@ class SettingsWindow:
                 return
 
             import json as _json_save
-            self.settings_state[self.app_settings.BACKENDS_ROOT_KEY] = str(self.Path(selected_backends_root).expanduser())
+            trainers_root_value = str(self.Path(selected_trainers_root).expanduser())
+            self.settings_state[self.app_settings.TRAINERS_ROOT_KEY] = trainers_root_value
             self.settings_state[self.app_settings.MUSUBI_MAIN_DIR_KEY] = str(main_dir)
             self.settings_state[self.app_settings.MUSUBI_LTX_DIR_KEY] = str(ltx_dir)
             self.settings_state[self.app_settings.SD_SCRIPTS_DIR_KEY] = str(sd_scripts_dir)
@@ -1194,5 +1196,6 @@ class SettingsWindow:
             return None
 
         return result
+
 
 

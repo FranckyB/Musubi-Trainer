@@ -5,6 +5,7 @@ Pillow>=11.3.0
 tkinterdnd2==0.4.3
 huggingface-hub==0.34.3
 hf_xet>=1.5.0
+openai-whisper
 
 # Musubi-Tuner core (keep in sync with Musubi-Tuner pyproject where versions are pinned)
 accelerate==1.6.0

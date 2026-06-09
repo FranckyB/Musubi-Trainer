@@ -9,8 +9,8 @@ Archives/*
 !Archives/.gitkeep
 Presets/*
 !Presets/.gitkeep
-Backends/*
-!Backends/.gitkeep
+Trainers/*
+!Trainers/.gitkeep
 
 # Python bytecode and caches
 __pycache__/

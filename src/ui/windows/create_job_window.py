@@ -183,10 +183,45 @@ class CreateJobWindow:
             )
             dialog.destroy()
             return
+        _AUDIO_CAPABLE_MODELS = {"ltx-2.3"}
+        _VALID_AUDIO_EXTENSIONS = {
+            ".wav",
+            ".flac",
+            ".mp3",
+            ".m4a",
+            ".ogg",
+            ".opus",
+            ".aac",
+            ".wma",
+        }
+        selected_dataset_names_for_type_check: list[str] = [
+            str(ds.get("name", "")).strip()
+            for ds in initial_datasets
+            if str(ds.get("name", "")).strip()
+        ]
+
+        def _dataset_audio_files(dataset_name_value: str) -> list[Path]:
+            dataset_dir = self.datasets_root_dir() / dataset_name_value
+            if not dataset_dir.exists() or not dataset_dir.is_dir():
+                return []
+            return sorted(
+                [
+                    path
+                    for path in dataset_dir.iterdir()
+                    if path.is_file() and path.suffix.lower() in _VALID_AUDIO_EXTENSIONS
+                ]
+            )
+
+        def _selected_datasets_require_audio_mode() -> bool:
+            return any(_dataset_audio_files(name) for name in selected_dataset_names_for_type_check)
+
         if existing_job is not None and model_var.get() not in _avail_models:
             model_var.set(_avail_models[0])
         _display_values = [_MODEL_UNSELECTED_LABEL] + [self.DOWNLOAD_MODEL_DISPLAY_NAMES.get(mn, mn) for mn in _avail_models]
-        _ltx_mode_display_to_value = {"Image Training": "video"}
+        _ltx_mode_display_to_value = {
+            "Image Training": "video",
+            "Audio Training": "audio",
+        }
         _ltx_mode_value_to_display = {
             value: key for key, value in _ltx_mode_display_to_value.items()
         }
@@ -199,6 +234,7 @@ class CreateJobWindow:
             "full",
             "lycoris",
         )
+        _ltx_audio_lora_target_choices = ("audio",)
 
         def _normalize_ltx_mode_ui(value: str) -> str:
             mode = (value or "video").strip().lower()
@@ -339,6 +375,8 @@ class CreateJobWindow:
         self.ttk.Label(header_frame, text="Model:").grid(row=0, column=2, sticky="w", padx=(12, 8))
         _model_display_default = self.DOWNLOAD_MODEL_DISPLAY_NAMES.get(model_var.get(), model_var.get()) if model_var.get().strip() else _MODEL_UNSELECTED_LABEL
         _model_display_var = self.tk.StringVar(value=_model_display_default)
+        _selectable_models: list[str] = list(_avail_models)
+        _suppress_model_display_trace = False
         self.ttk.Label(header_frame, text="Network:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(8, 0))
         _network_type_combo = self.ttk.Combobox(
             header_frame,
@@ -355,7 +393,49 @@ class CreateJobWindow:
                 "Network type is locked while this job is in RESUME mode.",
             )
 
+        _model_combo = self.ttk.Combobox(
+            header_frame,
+            textvariable=_model_display_var,
+            values=_display_values,
+            state="readonly",
+            width=28,
+        )
+        _model_combo.grid(row=0, column=3, sticky="w")
+
+        def _refresh_model_choices_for_selected_datasets() -> None:
+            nonlocal _selectable_models, _suppress_model_display_trace
+            requires_audio_mode = _selected_datasets_require_audio_mode()
+            if requires_audio_mode:
+                _selectable_models = [mn for mn in _avail_models if mn in _AUDIO_CAPABLE_MODELS]
+            else:
+                _selectable_models = list(_avail_models)
+
+            display_values = [_MODEL_UNSELECTED_LABEL] + [
+                self.DOWNLOAD_MODEL_DISPLAY_NAMES.get(mn, mn)
+                for mn in _selectable_models
+            ]
+            _model_combo.configure(values=display_values)
+
+            if model_var.get().strip() not in _selectable_models:
+                if existing_job is not None:
+                    model_var.set(_selectable_models[0] if _selectable_models else "")
+                else:
+                    model_var.set("")
+
+            _suppress_model_display_trace = True
+            try:
+                if model_var.get().strip():
+                    _model_display_var.set(
+                        self.DOWNLOAD_MODEL_DISPLAY_NAMES.get(model_var.get(), model_var.get())
+                    )
+                else:
+                    _model_display_var.set(_MODEL_UNSELECTED_LABEL)
+            finally:
+                _suppress_model_display_trace = False
+
         def _on_model_display_change(*_a: object) -> None:
+            if _suppress_model_display_trace:
+                return
             disp = _model_display_var.get()
             if disp == _MODEL_UNSELECTED_LABEL:
                 model_var.set("")
@@ -368,6 +448,13 @@ class CreateJobWindow:
                     break
             else:
                 model_var.set(disp)
+            if model_var.get().strip() not in _selectable_models:
+                self.messagebox.showerror(
+                    "Unsupported model",
+                    "The selected dataset includes audio files. Please use an audio-capable model.",
+                    parent=dialog,
+                )
+                return
             # Auto-update job name suffix if the user hasn't manually edited it
             if not _job_name_user_edited[0]:
                 current = job_name_var.get()
@@ -378,7 +465,7 @@ class CreateJobWindow:
             _refresh_preset_combo()
 
         _model_display_var.trace_add("write", _on_model_display_change)
-        self.ttk.Combobox(header_frame, textvariable=_model_display_var, values=_display_values, state="readonly", width=28).grid(row=0, column=3, sticky="w")
+        _refresh_model_choices_for_selected_datasets()
 
         if _backend_blocked_models:
             blocked_display = sorted(
@@ -613,10 +700,25 @@ class CreateJobWindow:
 
         def _preset_names_for_model(model_name: str) -> list[str]:
             selected_family = _model_to_family.get(model_name, "")
+
+            def _payload_matches_current_ltx_mode(payload: dict[str, object]) -> bool:
+                if selected_family != "LTX":
+                    return True
+                values_raw = payload.get("values", {})
+                if not isinstance(values_raw, dict):
+                    return True
+                values = {str(k): str(v) for k, v in values_raw.items() if isinstance(k, str)}
+                payload_mode = _normalize_ltx_mode_ui(values.get("ltx_mode", ""))
+                payload_target = values.get("ltx_lora_target_preset", "").strip().lower()
+                payload_is_audio = payload_mode == "audio" or payload_target == "audio"
+                current_is_audio = _normalize_ltx_mode_ui(ltx_mode_var.get()) == "audio"
+                return payload_is_audio if current_is_audio else (not payload_is_audio)
+
             names = {
                 str(payload.get("name", "")).strip()
                 for payload in job_presets.values()
                 if isinstance(payload, dict)
+                and _payload_matches_current_ltx_mode(payload)
                 and (
                     str(payload.get("family", "")).strip() == selected_family
                     or str(payload.get("model", "")).strip() == model_name
@@ -635,6 +737,18 @@ class CreateJobWindow:
                     continue
                 if str(payload.get("name", "")).strip() != preset_name:
                     continue
+
+                if selected_family == "LTX":
+                    values_raw = payload.get("values", {})
+                    if isinstance(values_raw, dict):
+                        values = {str(k): str(v) for k, v in values_raw.items() if isinstance(k, str)}
+                        payload_mode = _normalize_ltx_mode_ui(values.get("ltx_mode", ""))
+                        payload_target = values.get("ltx_lora_target_preset", "").strip().lower()
+                        payload_is_audio = payload_mode == "audio" or payload_target == "audio"
+                        current_is_audio = _normalize_ltx_mode_ui(ltx_mode_var.get()) == "audio"
+                        if current_is_audio != payload_is_audio:
+                            continue
+
                 payload_family = str(payload.get("family", "")).strip()
                 payload_model = str(payload.get("model", "")).strip()
                 if payload_family == selected_family:
@@ -1061,8 +1175,26 @@ class CreateJobWindow:
             value=_ltx_mode_value_to_display.get(_normalize_ltx_mode_ui(ltx_mode_var.get()), "Image Training")
         )
 
+        def _sync_ltx_mode_specific_controls() -> None:
+            mode_value = _normalize_ltx_mode_ui(ltx_mode_var.get())
+            if mode_value == "audio":
+                _ltx_lora_target_combo.configure(values=_ltx_audio_lora_target_choices)
+                if ltx_lora_target_preset_var.get().strip() not in _ltx_audio_lora_target_choices:
+                    ltx_lora_target_preset_var.set("audio")
+            else:
+                _ltx_lora_target_combo.configure(values=_ltx_image_lora_target_choices)
+                if ltx_lora_target_preset_var.get().strip() not in _ltx_image_lora_target_choices:
+                    ltx_lora_target_preset_var.set("full")
+
         def _on_ltx_mode_display_change(*_args: object) -> None:
             ltx_mode_var.set(_ltx_mode_display_to_value.get(_ltx_mode_display_var.get(), "video"))
+            _sync_ltx_mode_specific_controls()
+            _refresh_preset_combo()
+            try:
+                _sync_resolution_controls()
+            except NameError:
+                # Resolution controls are declared later in this function.
+                pass
 
         _ltx_mode_display_var.trace_add("write", _on_ltx_mode_display_change)
         _ltx_mode_combo = self.ttk.Combobox(
@@ -1081,6 +1213,7 @@ class CreateJobWindow:
             state="readonly",
         )
         _ltx_lora_target_combo.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        _sync_ltx_mode_specific_controls()
 
         self.ttk.Label(ltx_specific_frame, text="First-frame conditioning p:").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
         _ltx_first_frame_entry = self.ttk.Entry(ltx_specific_frame, textvariable=ltx_first_frame_conditioning_p_var, style="Flat.TEntry")
@@ -1284,14 +1417,20 @@ class CreateJobWindow:
             model_name = model_var.get().strip()
             is_ltx = _model_to_family.get(model_name, "") == "LTX"
             is_sd_scripts = self.backend_kind_for_model(model_name) == "sd-scripts"
+            requires_audio_mode = _selected_datasets_require_audio_mode()
             if is_ltx:
                 model_specific.grid()
                 ltx_specific_frame.grid()
-                _ltx_mode_combo.configure(state="disabled")
-                ltx_mode_var.set("video")
-                _ltx_mode_display_var.set(_ltx_mode_value_to_display["video"])
-                if ltx_lora_target_preset_var.get().strip() not in _ltx_image_lora_target_choices:
-                    ltx_lora_target_preset_var.set("full")
+                if requires_audio_mode:
+                    _ltx_mode_combo.configure(state="disabled")
+                    ltx_mode_var.set("audio")
+                else:
+                    _ltx_mode_combo.configure(state="readonly")
+                    ltx_mode_var.set(_normalize_ltx_mode_ui(ltx_mode_var.get()))
+                _ltx_mode_display_var.set(
+                    _ltx_mode_value_to_display.get(ltx_mode_var.get(), "Image Training")
+                )
+                _sync_ltx_mode_specific_controls()
             else:
                 ltx_specific_frame.grid_remove()
 
@@ -1345,7 +1484,9 @@ class CreateJobWindow:
         _saved_res = int((existing_job or {}).get("resolution", str(self.DEFAULT_RESOLUTION)))
         _saved_res_str = str(_saved_res) if _saved_res in self.RESOLUTION_CHOICES else str(self.RESOLUTION_CHOICES[self.RESOLUTION_CHOICES.index(1024)])
         train_resolution_var = self.tk.StringVar(value=_saved_res_str)
+        _ltx_audio_resolution_choices = (64,)
         _ltx_resolution_choices = (1280, 1920)
+        _ltx_audio_resolution_choice_values = [str(r) for r in _ltx_audio_resolution_choices]
         _ltx_resolution_choice_values = [str(r) for r in _ltx_resolution_choices]
         _default_resolution_choice_values = [str(r) for r in self.RESOLUTION_CHOICES]
         
@@ -1360,6 +1501,8 @@ class CreateJobWindow:
         _resolution_combo.grid(row=0, column=1, sticky="w")
         
         # Apply to all repeats controls
+        # Keep this initialized before any trace callbacks can fire.
+        dataset_entries: list[dict] = []
         global_repeats_var = self.tk.StringVar(value="1")
         global_repeats_frame = self.ttk.Frame(res_row)
         global_repeats_frame.grid(row=0, column=2, sticky="e", padx=(0, 8))
@@ -1399,12 +1542,23 @@ class CreateJobWindow:
         def _sync_resolution_controls() -> None:
             model_name = model_var.get().strip()
             is_ltx = _model_to_family.get(model_name, "") == "LTX"
-            allowed_values = _ltx_resolution_choice_values if is_ltx else _default_resolution_choice_values
+            is_ltx_audio_mode = is_ltx and _normalize_ltx_mode_ui(ltx_mode_var.get()) == "audio"
+            if is_ltx_audio_mode:
+                allowed_values = _ltx_audio_resolution_choice_values
+            elif is_ltx:
+                allowed_values = _ltx_resolution_choice_values
+            else:
+                allowed_values = _default_resolution_choice_values
             _resolution_combo.configure(values=allowed_values)
 
             current_value = train_resolution_var.get().strip()
             if current_value not in allowed_values:
-                train_resolution_var.set("1920" if is_ltx else _saved_res_str)
+                if is_ltx_audio_mode:
+                    train_resolution_var.set("64")
+                elif is_ltx:
+                    train_resolution_var.set("1920")
+                else:
+                    train_resolution_var.set(_saved_res_str)
 
         _family_default_profiles: dict[str, dict[str, str]] = {
             "SDXL": {
@@ -1526,8 +1680,10 @@ class CreateJobWindow:
                         _apply_preset_values({str(k): str(v) for k, v in preferred_values.items() if isinstance(k, str)})
                         preset_name_var.set(preferred_name)
                         return
-                # Preferred preset may have been deleted/renamed; fall back to family defaults.
-                preferred_preset_by_family.pop(family_name, None)
+                # For LTX, a preferred preset can be valid but filtered out by mode (audio vs image).
+                # Keep the preference and just fall back to mode-aware family defaults.
+                if family_name != "LTX":
+                    preferred_preset_by_family.pop(family_name, None)
 
             profile = _family_default_profiles.get(family_name)
             if not profile:
@@ -1549,6 +1705,9 @@ class CreateJobWindow:
             train_batch_var.set(profile["batch_size"])
             if "ltx_lora_target_preset" in profile:
                 ltx_lora_target_preset_var.set(profile["ltx_lora_target_preset"])
+            if family_name == "LTX" and _normalize_ltx_mode_ui(ltx_mode_var.get()) == "audio":
+                ltx_lora_target_preset_var.set("audio")
+                train_resolution_var.set("64")
             if "ltx_first_frame_conditioning_p" in profile:
                 ltx_first_frame_conditioning_p_var.set(profile["ltx_first_frame_conditioning_p"])
             if "ltx_gemma_load_in_4bit" in profile:
@@ -1599,9 +1758,9 @@ class CreateJobWindow:
         ds_inner.bind("<Configure>", _sync_ds_scroll)
         ds_canvas.bind("<Configure>", _sync_ds_canvas_width)
 
-        # dataset_entries: list of {"name", "num_repeats_var", "frame"}
-        dataset_entries: list[dict] = []
+        # dataset_entries entries are {"name", "num_repeats_var", "frame"}
         dataset_image_count_cache: dict[str, int] = {}
+        dataset_audio_count_cache: dict[str, int] = {}
         dataset_thumbnail_cache: dict[tuple[str, int, str, int], Any] = {}
         estimated_epochs_var = self.tk.StringVar(value="Est. epochs: n/a")
 
@@ -1660,6 +1819,20 @@ class CreateJobWindow:
             dataset_image_count_cache[name] = count
             return count
 
+        def _dataset_audio_count(name: str) -> int:
+            cached = dataset_audio_count_cache.get(name)
+            if cached is not None:
+                return cached
+            count = len(_dataset_audio_files(name))
+            dataset_audio_count_cache[name] = count
+            return count
+
+        def _dataset_sample_count(name: str) -> int:
+            image_count = _dataset_image_count(name)
+            if image_count > 0:
+                return image_count
+            return _dataset_audio_count(name)
+
         def _refresh_estimated_epochs() -> None:
             try:
                 steps_value = int(train_steps_var.get().strip())
@@ -1673,7 +1846,7 @@ class CreateJobWindow:
                 estimated_epochs_var.set("Est. epochs: n/a")
                 return
 
-            total_images = 0
+            total_items = 0
             effective_samples = 0
             for entry in dataset_entries:
                 try:
@@ -1684,9 +1857,9 @@ class CreateJobWindow:
                 if repeats <= 0:
                     estimated_epochs_var.set("Est. epochs: n/a")
                     return
-                image_count = _dataset_image_count(entry["name"])
-                total_images += image_count
-                effective_samples += image_count * repeats
+                sample_count = _dataset_sample_count(entry["name"])
+                total_items += sample_count
+                effective_samples += sample_count * repeats
 
             if effective_samples <= 0:
                 estimated_epochs_var.set("Est. epochs: n/a (no images)")
@@ -1696,10 +1869,14 @@ class CreateJobWindow:
             steps_per_epoch = max(1, (effective_samples + denom - 1) // denom)
             epochs_value = steps_value / steps_per_epoch
             estimated_epochs_var.set(
-                f"Est. epochs: {epochs_value:.2f} (img: {total_images}, repeated: {effective_samples}, eff batch: {denom}, steps/epoch: {steps_per_epoch})"
+                f"Est. epochs: {epochs_value:.2f} (items: {total_items}, repeated: {effective_samples}, eff batch: {denom}, steps/epoch: {steps_per_epoch})"
             )
 
         def _rebuild_ds_rows() -> None:
+            selected_dataset_names_for_type_check[:] = [entry["name"] for entry in dataset_entries]
+            _refresh_model_choices_for_selected_datasets()
+            _sync_model_specific_controls()
+            _refresh_preset_combo()
             if len(dataset_entries) > 1:
                 multi_job_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
             else:
@@ -1712,6 +1889,7 @@ class CreateJobWindow:
                 row_frame = self.ttk.Frame(ds_inner, padding=(4, 3, 4, 3), style="Card.TFrame")
                 row_frame.grid(row=idx, column=0, sticky="ew", pady=2)
                 row_frame.columnconfigure(1, weight=1)
+                row_frame.columnconfigure(2, weight=1)
                 entry["frame"] = row_frame
 
                 thumb = _dataset_thumbnail(entry["name"], 28)
@@ -1721,11 +1899,24 @@ class CreateJobWindow:
                 self.ttk.Label(row_frame, text=entry["name"], style="CardTitle.TLabel").grid(
                     row=0, column=1, sticky="w", padx=(0, 12)
                 )
+                image_count = _dataset_image_count(entry["name"])
+                audio_count = _dataset_audio_count(entry["name"])
+                if audio_count > 0 and image_count == 0:
+                    media_label = f"({audio_count} Audio Clip{'s' if audio_count != 1 else ''})"
+                elif image_count > 0 and audio_count == 0:
+                    media_label = f"({image_count} Image{'s' if image_count != 1 else ''})"
+                elif image_count > 0 and audio_count > 0:
+                    media_label = f"({image_count} Images, {audio_count} Audio Clips)"
+                else:
+                    media_label = "(0 Items)"
+                self.ttk.Label(row_frame, text=media_label, style="CardMeta.TLabel", anchor="center").grid(
+                    row=0, column=2, sticky="ew", padx=(0, 12)
+                )
                 self.ttk.Label(row_frame, text="Repeats:", style="CardMeta.TLabel").grid(
-                    row=0, column=2, sticky="e", padx=(0, 6)
+                    row=0, column=3, sticky="e", padx=(0, 6)
                 )
                 _repeats_controls = self.ttk.Frame(row_frame)
-                _repeats_controls.grid(row=0, column=3, sticky="e", padx=(0, 8))
+                _repeats_controls.grid(row=0, column=4, sticky="e", padx=(0, 8))
                 self.ttk.Spinbox(
                     _repeats_controls,
                     textvariable=entry["num_repeats_var"],
@@ -1761,7 +1952,7 @@ class CreateJobWindow:
                     _refresh_estimated_epochs()
 
                 self.ttk.Button(row_frame, text="✕", style="CreateJobAction.TButton", command=_make_remove, width=2).grid(
-                    row=0, column=4, sticky="e"
+                    row=0, column=5, sticky="e"
                 )
 
             _refresh_estimated_epochs()
@@ -1834,7 +2025,7 @@ class CreateJobWindow:
                 self.messagebox.showerror("Missing value", "LoRA name is required.", parent=dialog)
                 return
             selected_model_name = model_var.get().strip()
-            if not selected_model_name or selected_model_name not in _avail_models:
+            if not selected_model_name or selected_model_name not in _selectable_models:
                 self.messagebox.showerror("Missing value", "Select a model before creating the job.", parent=dialog)
                 return
             if not self.is_valid_folder_name(job_name):
@@ -1954,7 +2145,12 @@ class CreateJobWindow:
                 return
 
             timestep_sampling_value = timestep_sampling_var.get().strip().lower() or "sigma"
-            ltx_lora_target_preset_value = ltx_lora_target_preset_var.get().strip().lower() or "t2v"
+            ltx_mode_value = _normalize_ltx_mode_ui(ltx_mode_var.get())
+            ltx_lora_target_preset_value = ltx_lora_target_preset_var.get().strip().lower()
+            if ltx_mode_value == "audio":
+                ltx_lora_target_preset_value = ltx_lora_target_preset_value or "audio"
+            else:
+                ltx_lora_target_preset_value = ltx_lora_target_preset_value or "t2v"
             try:
                 ltx_first_frame_conditioning_p_value = float(ltx_first_frame_conditioning_p_var.get().strip())
                 if ltx_first_frame_conditioning_p_value < 0 or ltx_first_frame_conditioning_p_value > 1:

@@ -58,6 +58,7 @@ from .lora_merge_utils import (
 )
 from .launcher_shared import (
     VALID_IMAGE_EXTENSIONS,
+    VALID_AUDIO_EXTENSIONS,
     LATENT_SUFFIX,
     DATASET_ORDER_KEY,
     DRAG_START_THRESHOLD_PX,
@@ -80,6 +81,7 @@ from .launcher_shared import (
     latest_checkpoint_for_dataset,
     scan_training_folders,
     dataset_image_files,
+    dataset_audio_files,
     is_step1_ready,
     is_step2_ready,
     is_step3_ready,
@@ -231,11 +233,11 @@ def _launch_ui_impl() -> int:
     window_position_applied = False
     settings_reset_requested = False
 
-    def default_backends_root() -> Path:
-        return workspace_dir / "Backends"
+    def default_trainers_root() -> Path:
+        return workspace_dir / "Trainers"
 
     def default_backend_dir(kind: str) -> Path:
-        root = default_backends_root()
+        root = default_trainers_root()
         if kind == "musubi-main":
             return root / "musubi-main"
         if kind == "musubi-ltx":
@@ -244,15 +246,22 @@ def _launch_ui_impl() -> int:
             return root / "sd-scripts"
         return root / kind
 
-    def configured_backends_root() -> Path:
-        raw = settings_state.get(app_settings.BACKENDS_ROOT_KEY, "").strip()
-        return Path(raw).expanduser() if raw else default_backends_root()
+    def configured_trainers_root() -> Path:
+        raw = settings_state.get(app_settings.TRAINERS_ROOT_KEY, "").strip()
+        if raw:
+            return Path(raw).expanduser()
+
+        legacy_raw = settings_state.get(app_settings.BACKENDS_ROOT_KEY, "").strip()
+        if legacy_raw:
+            return Path(legacy_raw).expanduser()
+
+        return default_trainers_root()
 
     def configured_backend_dir(setting_key: str, default_kind: str) -> Path:
         raw = settings_state.get(setting_key, "").strip()
         if raw:
             return Path(raw).expanduser()
-        return configured_backends_root() / default_kind
+        return configured_trainers_root() / default_kind
 
     def has_any_backend_setting() -> bool:
         keys = [app_settings.MUSUBI_DIR_KEY, app_settings.MUSUBI_MAIN_DIR_KEY, app_settings.MUSUBI_LTX_DIR_KEY, app_settings.SD_SCRIPTS_DIR_KEY]
@@ -747,6 +756,7 @@ def _launch_ui_impl() -> int:
     card_widgets: list[tk.Widget] = []
     thumbnail_cache: dict[tuple[str, str, int, int], ImageTk.PhotoImage] = {}
     first_image_cache: dict[str, Path | None] = {}
+    audio_count_cache: dict[str, int] = {}
     checkpoint_cache: dict[str, tuple[Path | None, int]] = {}
     run_state_by_name: dict[str, str] = {}
     card_frame_by_name: dict[str, ttk.Frame] = {}
@@ -984,7 +994,7 @@ def _launch_ui_impl() -> int:
         ]
 
     def configured_backend_dirs() -> dict[str, Path]:
-        root = configured_backends_root()
+        root = configured_trainers_root()
         main_raw = settings_state.get(app_settings.MUSUBI_MAIN_DIR_KEY, "").strip()
         ltx_raw = settings_state.get(app_settings.MUSUBI_LTX_DIR_KEY, "").strip()
         sd_raw = settings_state.get(app_settings.SD_SCRIPTS_DIR_KEY, "").strip()
@@ -1018,7 +1028,7 @@ def _launch_ui_impl() -> int:
         settings_state[app_settings.MUSUBI_DIR_KEY] = str(musubi_dir)
         settings_state[app_settings.MUSUBI_MAIN_DIR_KEY] = str(musubi_dir)
         settings_state[app_settings.MUSUBI_PYTHON_KEY] = ""
-        settings_state.setdefault(app_settings.BACKENDS_ROOT_KEY, str(default_backends_root()))
+        settings_state.setdefault(app_settings.TRAINERS_ROOT_KEY, str(default_trainers_root()))
         app_settings.save_settings(settings_state)
         runtime_config = runtime_config_from_settings(settings_state)
         return runtime_config is not None
@@ -1075,7 +1085,7 @@ def _launch_ui_impl() -> int:
             cmd += ["--branch", branch]
         cmd += [repo_url, str(target_dir)]
         if logger is not None:
-            logger(f"[Backends] Running: {' '.join(cmd)}")
+            logger(f"[Trainers] Running: {' '.join(cmd)}")
         return_code, combined_output = _run_git_streaming(cmd, logger=logger)
 
         if return_code != 0:
@@ -1093,7 +1103,7 @@ def _launch_ui_impl() -> int:
             return False, f"Backend folder is not a git checkout:\n{repo_dir}"
         cmd = ["git", "-C", str(repo_dir), "pull", "--ff-only"]
         if logger is not None:
-            logger(f"[Backends] Running: {' '.join(cmd)}")
+            logger(f"[Trainers] Running: {' '.join(cmd)}")
         return_code, combined_output = _run_git_streaming(cmd, logger=logger)
 
         if return_code != 0:
@@ -1148,7 +1158,10 @@ def _launch_ui_impl() -> int:
 
         model_name_key = (model_name or "").strip().lower()
         if model_name_key == "ltx-2.3":
-            if int(resolution) == 1280:
+            resolution_int = int(resolution)
+            if resolution_int <= 64:
+                toml_width, toml_height = 64, 64
+            elif resolution_int == 1280:
                 toml_width, toml_height = 1280, 720
             else:
                 toml_width, toml_height = 1920, 1080
@@ -1165,34 +1178,61 @@ def _launch_ui_impl() -> int:
             "",
         ]
 
+        is_ltx_audio_mode = model_name_key == "ltx-2.3" and int(resolution) <= 64
+
         for ds_idx, ds in enumerate(datasets):
             ds_name = ds["name"]
             num_repeats = int(ds.get("num_repeats", 1))
 
-            image_files = dataset_image_files(datasets_root_dir(), ds_name)
-            if not image_files:
-                raise RuntimeError(f"Dataset images not found for: {ds_name}")
-            images_dir = image_files[0].parent
+            if is_ltx_audio_mode:
+                audio_files = dataset_audio_files(datasets_root_dir(), ds_name)
+                if not audio_files:
+                    raise RuntimeError(f"Dataset audio clips not found for: {ds_name}")
+                media_dir = audio_files[0].parent
 
-            if create_missing_captions:
-                for image_path in image_files:
-                    caption_path = image_path.with_suffix(".txt")
-                    if caption_path.exists():
-                        continue
-                    caption_path.write_text(caption_text, encoding="utf-8")
-                    created_captions += 1
+                if create_missing_captions:
+                    for audio_path in audio_files:
+                        caption_path = audio_path.with_suffix(".txt")
+                        if caption_path.exists():
+                            continue
+                        caption_path.write_text(caption_text, encoding="utf-8")
+                        created_captions += 1
+            else:
+                image_files = dataset_image_files(datasets_root_dir(), ds_name)
+                if not image_files:
+                    raise RuntimeError(f"Dataset images not found for: {ds_name}")
+                media_dir = image_files[0].parent
+
+                if create_missing_captions:
+                    for image_path in image_files:
+                        caption_path = image_path.with_suffix(".txt")
+                        if caption_path.exists():
+                            continue
+                        caption_path.write_text(caption_text, encoding="utf-8")
+                        created_captions += 1
 
             # First dataset uses "cache" for backward compatibility; additional use "cache_{name}"
             cache_dir = job_dir / "cache" if ds_idx == 0 else job_dir / f"cache_{ds_name}"
             cache_dir.mkdir(parents=True, exist_ok=True)
 
-            toml_lines += [
-                "[[datasets]]",
-                f'image_directory = "{images_dir.resolve().as_posix()}"',
-                f'cache_directory = "{cache_dir.resolve().as_posix()}"',
-                f"num_repeats = {num_repeats}",
-                "",
-            ]
+            if is_ltx_audio_mode:
+                toml_lines += [
+                    "[[datasets]]",
+                    f'audio_directory = "{media_dir.resolve().as_posix()}"',
+                    f'cache_directory = "{cache_dir.resolve().as_posix()}"',
+                    f"num_repeats = {num_repeats}",
+                    'audio_bucket_strategy = "truncate"',
+                    "audio_bucket_interval = 15.0",
+                    "",
+                ]
+            else:
+                toml_lines += [
+                    "[[datasets]]",
+                    f'image_directory = "{media_dir.resolve().as_posix()}"',
+                    f'cache_directory = "{cache_dir.resolve().as_posix()}"',
+                    f"num_repeats = {num_repeats}",
+                    "",
+                ]
 
         dataset_toml_path = job_dir / "dataset.toml"
         dataset_toml_path.write_text("\n".join(toml_lines), encoding="utf-8")
@@ -1222,8 +1262,8 @@ def _launch_ui_impl() -> int:
             "center_window": center_window,
             "clone_backend_repo": clone_backend_repo,
             "configured_backend_dirs": configured_backend_dirs,
-            "configured_backends_root": configured_backends_root,
-            "default_backends_root": default_backends_root,
+            "configured_trainers_root": configured_trainers_root,
+            "default_trainers_root": default_trainers_root,
             "default_models_dir": default_models_dir,
             "download_cli_script_path": Path(__file__).resolve().parent / "download_cli.py",
             "download_workspace_root": download_workspace_root,
@@ -1339,10 +1379,11 @@ def _launch_ui_impl() -> int:
 
         selected_files = filedialog.askopenfilenames(
             parent=root,
-            title="Select images and optional captions",
+            title="Select media files and optional captions",
             filetypes=[
-                ("Images and captions", "*.png *.jpg *.jpeg *.txt"),
+                ("Media and captions", "*.png *.jpg *.jpeg *.wav *.flac *.mp3 *.m4a *.ogg *.opus *.aac *.wma *.txt"),
                 ("Images", "*.png *.jpg *.jpeg"),
+                ("Audio", "*.wav *.flac *.mp3 *.m4a *.ogg *.opus *.aac *.wma"),
                 ("Text files", "*.txt"),
                 ("All files", "*.*"),
             ],
@@ -1355,7 +1396,7 @@ def _launch_ui_impl() -> int:
                 continue
 
             suffix = source.suffix.lower()
-            if suffix not in VALID_IMAGE_EXTENSIONS and suffix != ".txt":
+            if suffix not in VALID_IMAGE_EXTENSIONS and suffix not in VALID_AUDIO_EXTENSIONS and suffix != ".txt":
                 continue
 
             destination = images_dir / source.name
@@ -1486,7 +1527,7 @@ def _launch_ui_impl() -> int:
     def add_images_to_dataset(dataset_name: str) -> None:
         dataset_dir = dataset_dir_path(dataset_name)
         images_dir = dataset_dir
-        allowed_import_suffixes = VALID_IMAGE_EXTENSIONS | {".txt"}
+        allowed_import_suffixes = VALID_IMAGE_EXTENSIONS | VALID_AUDIO_EXTENSIONS | {".txt"}
         if not images_dir.exists():
             try:
                 images_dir.mkdir(parents=True, exist_ok=True)
@@ -1496,10 +1537,11 @@ def _launch_ui_impl() -> int:
 
         selected_files = filedialog.askopenfilenames(
             parent=root,
-            title=f"Add images/captions to {dataset_name}",
+            title=f"Add media/captions to {dataset_name}",
             filetypes=[
-                ("Images and captions", "*.png *.jpg *.jpeg *.txt"),
+                ("Media and captions", "*.png *.jpg *.jpeg *.wav *.flac *.mp3 *.m4a *.ogg *.opus *.aac *.wma *.txt"),
                 ("Images", "*.png *.jpg *.jpeg"),
+                ("Audio", "*.wav *.flac *.mp3 *.m4a *.ogg *.opus *.aac *.wma"),
                 ("Text files", "*.txt"),
                 ("All files", "*.*"),
             ],
@@ -2239,7 +2281,7 @@ def _launch_ui_impl() -> int:
         menu = tk.Menu(root, tearoff=0)
         menu.add_command(label="Edit Dataset", command=lambda: open_edit_dataset_dialog(dataset_name))
         menu.add_command(label="Open Dataset", command=lambda: open_dataset_in_file_manager(dataset_name))
-        menu.add_command(label="Add Images", command=lambda: add_images_to_dataset(dataset_name))
+        menu.add_command(label="Add Media", command=lambda: add_images_to_dataset(dataset_name))
         menu.add_separator()
         menu.add_command(label="Archive Dataset", command=lambda: archive_dataset(dataset_name))
         try:
@@ -3249,7 +3291,13 @@ def _launch_ui_impl() -> int:
                 queue_thumb_state = "done"
             else:
                 queue_thumb_state = "pending"
-            queue_thumb = make_thumbnail(first_image_path(job.get("dataset_name", "").strip()), queue_thumb_state, 40)
+            dataset_name = job.get("dataset_name", "").strip()
+            queue_thumb = make_thumbnail(
+                first_image_path(dataset_name),
+                queue_thumb_state,
+                40,
+                has_audio=(dataset_audio_count(dataset_name) > 0),
+            )
             item_id = str(index)
             queue_thumb_by_item[item_id] = queue_thumb
             queue_list.insert(
@@ -3916,7 +3964,20 @@ def _launch_ui_impl() -> int:
         first_image_cache[dataset_name] = chosen
         return chosen
 
-    def make_thumbnail(image_path: Path | None, run_state: str, thumb_px: int) -> ImageTk.PhotoImage:
+    def dataset_audio_count(dataset_name: str) -> int:
+        cached = audio_count_cache.get(dataset_name)
+        if cached is not None:
+            return cached
+        count = len(dataset_audio_files(datasets_root_dir(), dataset_name))
+        audio_count_cache[dataset_name] = count
+        return count
+
+    def make_thumbnail(
+        image_path: Path | None,
+        run_state: str,
+        thumb_px: int,
+        has_audio: bool = False,
+    ) -> ImageTk.PhotoImage:
         thumb_size = (thumb_px, thumb_px)
         cache_path = "__none__"
         cache_mtime_ns = 0
@@ -3927,13 +3988,34 @@ def _launch_ui_impl() -> int:
             except OSError:
                 cache_mtime_ns = 0
 
-        cache_key = (cache_path, run_state, thumb_px, cache_mtime_ns)
+        cache_audio_tag = "1" if has_audio else "0"
+        cache_key = (cache_path, f"{run_state}:{cache_audio_tag}", thumb_px, cache_mtime_ns)
         cached_thumb = thumbnail_cache.get(cache_key)
         if cached_thumb is not None:
             return cached_thumb
 
         if image_path is None:
             image = Image.new("RGB", thumb_size, color="#3a3a3a")
+            if has_audio:
+                # Show a simple waveform placeholder for audio-only datasets.
+                draw = ImageDraw.Draw(image)
+                mid_y = thumb_px // 2
+                margin = max(4, thumb_px // 14)
+                bar_width = max(1, thumb_px // 34)
+                spacing = max(2, thumb_px // 18)
+                heights = [0.20, 0.38, 0.55, 0.32, 0.74, 0.46, 0.62, 0.28]
+                x = margin
+                idx = 0
+                while x < thumb_px - margin:
+                    amp = int((thumb_px * heights[idx % len(heights)]) * 0.5)
+                    draw.rectangle(
+                        (x, mid_y - amp, x + bar_width, mid_y + amp),
+                        fill=(118, 204, 255),
+                    )
+                    x += spacing
+                    idx += 1
+                if thumb_px >= 72:
+                    draw.text((margin, thumb_px - margin - 14), "AUDIO", fill=(198, 233, 255))
         else:
             try:
                 image = Image.open(image_path).convert("RGB")
@@ -4124,6 +4206,7 @@ def _launch_ui_impl() -> int:
 
         if force:
             first_image_cache.clear()
+            audio_count_cache.clear()
             thumbnail_cache.clear()
             checkpoint_cache.clear()
 
@@ -4141,6 +4224,7 @@ def _launch_ui_impl() -> int:
         stale_names = [name for name in list(first_image_cache.keys()) if name not in names]
         for stale_name in stale_names:
             first_image_cache.pop(stale_name, None)
+            audio_count_cache.pop(stale_name, None)
             checkpoint_cache.pop(stale_name, None)
 
         if not names:
@@ -4179,7 +4263,8 @@ def _launch_ui_impl() -> int:
             card_frame_by_name[name] = card
 
             image_path = first_image_path(name)
-            thumb = make_thumbnail(image_path, train_state, thumb_px)
+            audio_count = dataset_audio_count(name)
+            thumb = make_thumbnail(image_path, train_state, thumb_px, has_audio=(audio_count > 0))
             card_thumb_by_name[name] = thumb
 
             title_style = "DoneCardTitle.TLabel" if train_state == "done" else "CardTitle.TLabel"
@@ -4191,7 +4276,12 @@ def _launch_ui_impl() -> int:
             title_label = ttk.Label(card, text=name, style=title_style, anchor="center")
             title_label.grid(row=1, column=0, sticky="ew", pady=(6, 0))
             image_count = len(dataset_image_files(datasets_root_dir(), name))
-            status_text = f"{image_count} IMG"
+            if image_count > 0 and audio_count > 0:
+                status_text = f"{image_count} IMG / {audio_count} CLIP"
+            elif audio_count > 0:
+                status_text = f"{audio_count} CLIP"
+            else:
+                status_text = f"{image_count} IMG"
             status_label = ttk.Label(card, text=status_text, style=meta_style, anchor="center")
             status_label.grid(row=2, column=0, sticky="ew", pady=(2, 8))
 
@@ -4427,9 +4517,22 @@ def _launch_ui_impl() -> int:
                     ]
 
                     if not runnable_indices:
+                        non_held_jobs = [
+                            job for job in job_queue
+                            if not flag_to_bool(job.get("hold", "0"))
+                        ]
+                        all_non_held_done = bool(non_held_jobs) and all(
+                            detect_job_status(job) == "done" for job in non_held_jobs
+                        )
+
                         run_in_progress = False
                         run_cancel_event = None
+                        if all_non_held_done:
+                            queue_play_mode = False
+                            log_status("Queue complete. All runnable jobs are done.")
                         root.after(0, update_start_button_state)
+                        if all_non_held_done:
+                            break
                         time.sleep(0.3)
                         continue
 

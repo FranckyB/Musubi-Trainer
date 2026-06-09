@@ -54,6 +54,9 @@ from .train_utils import (
 LATENT_SUFFIX = "ltx23"
 LTX_VERSION = "2.3"
 PREFERRED_GEMMA_ROOT = Path("D:/Musubi-Trainer/Models/gemma-3-12b")
+LTX_AUDIO_ONLY_TARGET_RESOLUTION = 64
+LTX_AUDIO_ONLY_TARGET_FPS = 25.0
+LTX_AUDIO_ONLY_SEQUENCE_RESOLUTION = 128
 
 # ────────────────────────────────────────────────────────────────────────────
 # Internal helpers
@@ -136,9 +139,34 @@ def _network_settings(network_type: str, lora_module: str) -> tuple[str, bool]:
     return ("networks.lokr" if use_lokr else lora_module, use_lokr)
 
 
-def _build_ltx_train_launch_command(python_exe: Path | str, config_path: Path, ltx2_checkpoint: Path) -> list[str]:
-    cpu_threads = _recommended_accelerate_cpu_threads_per_process()
+def _audio_only_cache_latent_args(ltx_mode_value: str) -> list[str]:
+    if ltx_mode_value != "audio":
+        return []
     return [
+        "--audio_only_target_resolution", str(LTX_AUDIO_ONLY_TARGET_RESOLUTION),
+        "--audio_only_target_fps", str(LTX_AUDIO_ONLY_TARGET_FPS),
+        "--audio_only_sequence_resolution", str(LTX_AUDIO_ONLY_SEQUENCE_RESOLUTION),
+    ]
+
+
+def _audio_only_train_launch_args(ltx_mode_value: str) -> list[str]:
+    if ltx_mode_value != "audio":
+        return []
+    return [
+        "--ltx2_mode", "audio",
+        "--audio_only_sequence_resolution", str(LTX_AUDIO_ONLY_SEQUENCE_RESOLUTION),
+        "--ltx2_audio_only_model",
+    ]
+
+
+def _build_ltx_train_launch_command(
+    python_exe: Path | str,
+    config_path: Path,
+    ltx2_checkpoint: Path,
+    ltx_mode_value: str,
+) -> list[str]:
+    cpu_threads = _recommended_accelerate_cpu_threads_per_process()
+    command = [
         str(python_exe),
         "-m",
         "accelerate.commands.launch",
@@ -152,6 +180,8 @@ def _build_ltx_train_launch_command(python_exe: Path | str, config_path: Path, l
         "--ltx2_checkpoint",
         str(ltx2_checkpoint),
     ]
+    command.extend(_audio_only_train_launch_args(ltx_mode_value))
+    return command
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -257,6 +287,7 @@ def run_steps_for_model(
             "--vae_dtype", "bf16",
             "--ltx2_mode", ltx_mode_value,
         ]
+        cache_latents_args.extend(_audio_only_cache_latent_args(ltx_mode_value))
         logger(f"  command: {format_command_for_log(cache_latents_args)}")
         try:
             run_command(
@@ -362,6 +393,13 @@ def run_steps_for_model(
             f"ltx_mode = {toml_quote(ltx_mode_value)}",
             'ltx_version_check_mode = "error"',
         ]
+        if ltx_mode_value == "audio":
+            model_lines.extend(
+                [
+                    "ltx2_audio_only_model = true",
+                    f"audio_only_sequence_resolution = {LTX_AUDIO_ONLY_SEQUENCE_RESOLUTION}",
+                ]
+            )
         if gemma_flag == "--gemma_root":
             model_lines.append(f"gemma_root = {toml_quote(str(gemma_path))}")
             if ltx_gemma_load_in_4bit:
@@ -379,7 +417,7 @@ def run_steps_for_model(
             f"network_module = {toml_quote(selected_network_module)}",
             f"network_dim = {network_dim}",
             f"network_alpha = {network_alpha}",
-            f"lora_target_preset = {toml_quote(str(ltx_lora_target_preset or 't2v'))}",
+            f"lora_target_preset = {toml_quote(str((ltx_lora_target_preset or 'audio') if ltx_mode_value == 'audio' else (ltx_lora_target_preset or 't2v')))}",
             f"ltx2_first_frame_conditioning_p = {float(ltx_first_frame_conditioning_p)}",
         ]
         if is_lokr and lokr_factor != -1:
@@ -469,7 +507,7 @@ def run_steps_for_model(
         if generate_training_args_only:
             logger("  training args generated (no training launched)")
         else:
-            launch_args = _build_ltx_train_launch_command(musubi_python, train_config_path, dit_path)
+            launch_args = _build_ltx_train_launch_command(musubi_python, train_config_path, dit_path, ltx_mode_value)
             logger(f"  command: {format_command_for_log(launch_args)}")
             try:
                 run_command(
