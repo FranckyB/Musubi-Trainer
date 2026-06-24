@@ -55,6 +55,11 @@ from .train_utils import (  # noqa: F401  (re-exported for backward compat)
 LATENT_SUFFIX = "f2k9b"
 
 
+def _recommended_flux2_dataloader_workers() -> int:
+    cpu_count = os.cpu_count() or 8
+    return max(2, min(8, cpu_count // 2))
+
+
 def _dataset_output_dir(training_dir: Path, dataset_name: str) -> Path:
     return training_dir / dataset_name / "output"
 
@@ -196,6 +201,7 @@ def run_steps_for_model(
     do_cache_latents: bool,
     do_cache_text: bool,
     do_train: bool,
+    max_data_loader_n_workers: int | None,
     resume_state_dir: Path | None,
     resume_step_offset: int,
     warmstart_checkpoint: Path | None,
@@ -527,13 +533,19 @@ def run_steps_for_model(
         if optimizer_args_values:
             optimization_lines.append(f"optimizer_args = {toml_string_list(optimizer_args_values)}")
 
+        resolved_workers = max_data_loader_n_workers
+        if resolved_workers is None:
+            resolved_workers = _recommended_flux2_dataloader_workers()
+        else:
+            resolved_workers = max(1, int(resolved_workers))
+
         runtime_lines = [
             'mixed_precision = "bf16"',
             "sdpa = true",
             f"gradient_checkpointing = {'true' if gradient_checkpointing_enabled else 'false'}",
             f"gradient_checkpointing_cpu_offload = {'true' if gradient_checkpointing_cpu_offload_enabled else 'false'}",
             "persistent_data_loader_workers = true",
-            "max_data_loader_n_workers = 2",
+            f"max_data_loader_n_workers = {resolved_workers}",
             f"fp8_base = {'true' if enable_fp8_dit else 'false'}",
             f"fp8_scaled = {'true' if enable_fp8_dit else 'false'}",
             f"compile = {'true' if compile_enabled else 'false'}",
@@ -746,6 +758,7 @@ def train_models(
                 do_cache_latents=effective_do_cache_latents,
                 do_cache_text=effective_do_cache_text,
                 do_train=effective_do_train,
+                max_data_loader_n_workers=None,
                 resume_state_dir=effective_resume_state,
                 resume_step_offset=resume_step_offset,
                 warmstart_checkpoint=effective_warmstart_checkpoint,
@@ -823,6 +836,7 @@ def run_job(
     do_cache_latents: bool,
     do_cache_text: bool,
     do_train: bool,
+    max_data_loader_n_workers: int | None = None,
     generate_training_args_only: bool = False,
     save_every_n_steps: int = DEFAULT_SAVE_EVERY_N_STEPS,
     cancel_requested: Callable[[], bool] | None = None,
@@ -948,6 +962,7 @@ def run_job(
             do_cache_latents=do_cache_latents,
             do_cache_text=do_cache_text,
             do_train=(do_train or generate_training_args_only),
+            max_data_loader_n_workers=max_data_loader_n_workers,
             resume_state_dir=effective_resume_state,
             resume_step_offset=resume_step_offset,
             warmstart_checkpoint=effective_warmstart_checkpoint,

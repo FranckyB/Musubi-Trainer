@@ -8,6 +8,7 @@ Uses:
 
 from __future__ import annotations
 
+import os
 import shlex
 import tomllib
 from pathlib import Path
@@ -67,6 +68,11 @@ def _network_settings(network_type: str, lora_module: str) -> tuple[str, bool]:
     selected = (network_type or "lora").strip().lower()
     use_lokr = selected == "lokr"
     return ("networks.lokr" if use_lokr else lora_module, use_lokr)
+
+
+def _recommended_sdxl_dataloader_workers() -> int:
+    cpu_count = os.cpu_count() or 8
+    return max(2, min(8, cpu_count // 2))
 
 
 def _sd_scripts_dataset_config(dataset_config: Path, logger: Callable[[str], None]) -> Path:
@@ -173,6 +179,7 @@ def run_steps_for_model(
     do_cache_latents: bool = True,
     do_cache_text: bool = True,
     do_train: bool = True,
+    max_data_loader_n_workers: int | None = None,
     resume_state_dir: Path | None = None,
     resume_step_offset: int = 0,
     warmstart_checkpoint: Path | None = None,
@@ -365,6 +372,12 @@ def run_steps_for_model(
         if text_encoder_lr.strip():
             optimization_lines.append(f"text_encoder_lr = {_toml_scalar(text_encoder_lr.strip())}")
 
+        resolved_workers = max_data_loader_n_workers
+        if resolved_workers is None:
+            resolved_workers = _recommended_sdxl_dataloader_workers()
+        else:
+            resolved_workers = max(1, int(resolved_workers))
+
         runtime_lines = [
             'mixed_precision = "bf16"',
             "sdpa = true",
@@ -376,6 +389,7 @@ def run_steps_for_model(
             f"torch_compile = {'true' if enable_compile_optimizations else 'false'}",
             f"fp8_base_unet = {'true' if enable_fp8_dit else 'false'}",
             "persistent_data_loader_workers = true",
+            f"max_data_loader_n_workers = {resolved_workers}",
         ]
         checkpoint_lines = [
             f"save_every_n_steps = {save_every_n_steps}",
@@ -491,6 +505,7 @@ def run_job(
     do_cache_latents: bool,
     do_cache_text: bool,
     do_train: bool,
+    max_data_loader_n_workers: int | None = None,
     generate_training_args_only: bool = False,
     save_every_n_steps: int = DEFAULT_SAVE_EVERY_N_STEPS,
     cancel_requested: Callable[[], bool] | None = None,
@@ -593,6 +608,7 @@ def run_job(
             do_cache_latents=do_cache_latents,
             do_cache_text=do_cache_text,
             do_train=(do_train or generate_training_args_only),
+            max_data_loader_n_workers=max_data_loader_n_workers,
             generate_training_args_only=generate_training_args_only,
             resume_state_dir=effective_resume_state,
             resume_step_offset=resume_step_offset,

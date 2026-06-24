@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import json
 import shutil
@@ -261,6 +262,11 @@ class CreateJobWindow:
             except Exception:
                 return default
             return str(value if value >= 0 else 0)
+
+        def _recommended_data_loader_workers_text() -> str:
+            cpu_count = os.cpu_count() or 8
+            workers = max(2, min(8, cpu_count // 2))
+            return str(workers)
 
         _preferred_presets_raw = self.settings_state.get(self.PREFERRED_PRESETS_BY_FAMILY_KEY, "")
         try:
@@ -530,6 +536,11 @@ class CreateJobWindow:
         train_batch_var = self.tk.StringVar(
             value=_normalize_min_one_int_text((existing_job or {}).get("batch_size", "1"))
         )
+        train_data_loader_workers_var = self.tk.StringVar(
+            value=_normalize_min_one_int_text(
+                (existing_job or {}).get("max_data_loader_n_workers", _recommended_data_loader_workers_text())
+            )
+        )
         blocks_to_swap_var = self.tk.StringVar(
             value=_normalize_non_negative_int_text((existing_job or {}).get("blocks_to_swap", "0"))
         )
@@ -588,6 +599,7 @@ class CreateJobWindow:
                 "network_alpha": train_network_alpha_var.get().strip(),
                 "resolution": train_resolution_var.get().strip(),
                 "batch_size": train_batch_var.get().strip(),
+                "max_data_loader_n_workers": train_data_loader_workers_var.get().strip(),
                 "lr_scheduler": lr_scheduler_var.get().strip(),
                 "lr_warmup_steps": lr_warmup_steps_var.get().strip(),
                 "gradient_accumulation_steps": gradient_accumulation_steps_var.get().strip(),
@@ -645,6 +657,8 @@ class CreateJobWindow:
                 train_resolution_var.set(values["resolution"])
             if "batch_size" in values:
                 train_batch_var.set(_normalize_min_one_int_text(values["batch_size"]))
+            if "max_data_loader_n_workers" in values:
+                train_data_loader_workers_var.set(_normalize_min_one_int_text(values["max_data_loader_n_workers"]))
             if "lr_scheduler" in values:
                 lr_scheduler_var.set(values["lr_scheduler"])
             if "lr_warmup_steps" in values:
@@ -688,23 +702,13 @@ class CreateJobWindow:
                     preset_global_repeats = int(str(values["global_repeats"]).strip())
                 except Exception:
                     preset_global_repeats = 1
-                if preset_global_repeats > 1:
-                    if global_repeats_var is not None:
-                        global_repeats_var.set(str(preset_global_repeats))
-                    else:
-                        _pending_global_repeats_from_preset["value"] = str(preset_global_repeats)
-                        _pending_global_repeats_from_preset["apply"] = True
+                if preset_global_repeats < 1:
+                    preset_global_repeats = 1
+                if global_repeats_var is not None:
+                    global_repeats_var.set(str(preset_global_repeats))
                 else:
-                    # Reset the global control to 1, but do not overwrite per-dataset repeats.
-                    if global_repeats_var is not None:
-                        _suppress_global_repeats_apply["enabled"] = True
-                        try:
-                            global_repeats_var.set("1")
-                        finally:
-                            _suppress_global_repeats_apply["enabled"] = False
-                    else:
-                        _pending_global_repeats_from_preset["value"] = "1"
-                        _pending_global_repeats_from_preset["apply"] = False
+                    _pending_global_repeats_from_preset["value"] = str(preset_global_repeats)
+                    _pending_global_repeats_from_preset["apply"] = True
 
         def _preset_names_for_model(model_name: str) -> list[str]:
             selected_family = _model_to_family.get(model_name, "")
@@ -1111,6 +1115,40 @@ class CreateJobWindow:
         )
         _blocks_to_swap_up_button.grid(row=0, column=2, sticky="w", padx=(2, 0))
 
+        _data_loader_workers_label = self.ttk.Label(common_advanced, text="Data loader workers:")
+        _data_loader_workers_label.grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        _data_loader_workers_controls = self.ttk.Frame(common_advanced)
+        _data_loader_workers_controls.grid(row=3, column=1, sticky="w", pady=(6, 0))
+        _data_loader_workers_controls.columnconfigure(0, weight=0)
+        _data_loader_workers_spin = self.ttk.Spinbox(
+            _data_loader_workers_controls,
+            textvariable=train_data_loader_workers_var,
+            from_=1,
+            to=9999,
+            increment=1,
+            validate="key",
+            validatecommand=_positive_int_spin_validate_cmd,
+            width=35,
+            style="Flat.TEntry",
+        )
+        _data_loader_workers_spin.grid(row=0, column=0, sticky="w")
+        _data_loader_workers_down_button = self.ttk.Button(
+            _data_loader_workers_controls,
+            text="-",
+            style="CreateJobAction.TButton",
+            width=2,
+            command=lambda: _step_positive_int_var(train_data_loader_workers_var, -1),
+        )
+        _data_loader_workers_down_button.grid(row=0, column=1, sticky="w", padx=(4, 0))
+        _data_loader_workers_up_button = self.ttk.Button(
+            _data_loader_workers_controls,
+            text="+",
+            style="CreateJobAction.TButton",
+            width=2,
+            command=lambda: _step_positive_int_var(train_data_loader_workers_var, 1),
+        )
+        _data_loader_workers_up_button.grid(row=0, column=2, sticky="w", padx=(2, 0))
+
         _timestep_sampling_label = self.ttk.Label(common_advanced, text="Timestep sampling:")
         _timestep_sampling_label.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
         _timestep_sampling_combo = self.ttk.Combobox(
@@ -1157,6 +1195,13 @@ class CreateJobWindow:
         )
         self.attach_hover_tooltip(_blocks_to_swap_down_button, "Decrease blocks to swap (minimum 0).")
         self.attach_hover_tooltip(_blocks_to_swap_up_button, "Increase blocks to swap.")
+        _attach_field_tooltip(
+            _data_loader_workers_label,
+            _data_loader_workers_spin,
+            "Number of dataloader worker processes. Higher values can improve GPU feed rate on fast CPUs/disks.",
+        )
+        self.attach_hover_tooltip(_data_loader_workers_down_button, "Decrease data loader workers (minimum 1).")
+        self.attach_hover_tooltip(_data_loader_workers_up_button, "Increase data loader workers.")
         _attach_field_tooltip(
             _timestep_sampling_label,
             _timestep_sampling_combo,
@@ -1398,6 +1443,9 @@ class CreateJobWindow:
             (_batch_size_spin, "normal"),
             (_batch_size_down_button, "normal"),
             (_batch_size_up_button, "normal"),
+            (_data_loader_workers_spin, "normal"),
+            (_data_loader_workers_down_button, "normal"),
+            (_data_loader_workers_up_button, "normal"),
             (_blocks_to_swap_spin, "normal"),
             (_blocks_to_swap_down_button, "normal"),
             (_blocks_to_swap_up_button, "normal"),
@@ -1644,6 +1692,7 @@ class CreateJobWindow:
                 "timestep_sampling": "sigma",
                 "resolution": "1024",
                 "batch_size": "1",
+                "max_data_loader_n_workers": _recommended_data_loader_workers_text(),
             },
             "FLUX.2": {
                 "optimizer_type": "prodigy",
@@ -1660,6 +1709,7 @@ class CreateJobWindow:
                 "timestep_sampling": "flux2_shift",
                 "resolution": str(self.DEFAULT_RESOLUTION),
                 "batch_size": "1",
+                "max_data_loader_n_workers": _recommended_data_loader_workers_text(),
             },
             "Krea2": {
                 "optimizer_type": "adamw8bit",
@@ -1678,6 +1728,7 @@ class CreateJobWindow:
                 "discrete_flow_shift": "2.5",
                 "resolution": "1024",
                 "batch_size": "1",
+                "max_data_loader_n_workers": _recommended_data_loader_workers_text(),
             },
             "LTX": {
                 "optimizer_type": "adamw8bit",
@@ -1694,6 +1745,7 @@ class CreateJobWindow:
                 "timestep_sampling": "shifted_logit_normal",
                 "resolution": "1920",
                 "batch_size": "1",
+                "max_data_loader_n_workers": _recommended_data_loader_workers_text(),
                 "ltx_lora_target_preset": "full",
                 "ltx_first_frame_conditioning_p": "0.5",
                 "ltx_gemma_load_in_4bit": "1",
@@ -1713,6 +1765,7 @@ class CreateJobWindow:
                 "timestep_sampling": "shift",
                 "resolution": str(self.DEFAULT_RESOLUTION),
                 "batch_size": "1",
+                "max_data_loader_n_workers": _recommended_data_loader_workers_text(),
             },
             "Z-Image": {
                 "optimizer_type": "prodigy",
@@ -1729,6 +1782,7 @@ class CreateJobWindow:
                 "timestep_sampling": "shift",
                 "resolution": str(self.DEFAULT_RESOLUTION),
                 "batch_size": "1",
+                "max_data_loader_n_workers": _recommended_data_loader_workers_text(),
             },
             "Qwen-Image": {
                 "optimizer_type": "prodigy",
@@ -1745,6 +1799,7 @@ class CreateJobWindow:
                 "timestep_sampling": "qwen_shift",
                 "resolution": str(self.DEFAULT_RESOLUTION),
                 "batch_size": "1",
+                "max_data_loader_n_workers": _recommended_data_loader_workers_text(),
             },
         }
 
@@ -1791,6 +1846,9 @@ class CreateJobWindow:
             krea2_discrete_flow_shift_var.set(profile.get("discrete_flow_shift", "2.5"))
             train_resolution_var.set(profile["resolution"])
             train_batch_var.set(profile["batch_size"])
+            train_data_loader_workers_var.set(
+                profile.get("max_data_loader_n_workers", _recommended_data_loader_workers_text())
+            )
             if "ltx_lora_target_preset" in profile:
                 ltx_lora_target_preset_var.set(profile["ltx_lora_target_preset"])
             if family_name == "LTX" and _normalize_ltx_mode_ui(ltx_mode_var.get()) == "audio":
@@ -2166,6 +2224,14 @@ class CreateJobWindow:
                 return
 
             try:
+                max_data_loader_n_workers_value = int(train_data_loader_workers_var.get().strip())
+                if max_data_loader_n_workers_value < 1:
+                    raise ValueError
+            except ValueError:
+                self.messagebox.showerror("Invalid value", "Data loader workers must be a positive integer.", parent=dialog)
+                return
+
+            try:
                 _ = int(train_steps_var.get().strip())
             except ValueError:
                 self.messagebox.showerror("Invalid value", "Steps must be numeric.", parent=dialog)
@@ -2449,6 +2515,7 @@ class CreateJobWindow:
                     "output_dir": str(output_root),
                     "resolution": str(resolution_value),
                     "batch_size": str(batch_size_value),
+                    "max_data_loader_n_workers": str(max_data_loader_n_workers_value),
                     "save_every_n_steps": str(save_every_n_steps_value),
                     "network_dim": train_network_dim_var.get().strip(),
                     "network_alpha": train_network_alpha_var.get().strip(),

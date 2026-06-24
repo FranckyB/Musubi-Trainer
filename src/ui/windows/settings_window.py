@@ -551,7 +551,7 @@ class SettingsWindow:
                 return
             comp_path = str(pending_model_paths.get(model_name, {}).get(component, "") or "").strip()
             if _is_existing_file_path(comp_path):
-                lbl.configure(foreground=self.fg_text)
+                lbl.configure(foreground="#e6e6e6")
             else:
                 lbl.configure(foreground="#f0b429")
 

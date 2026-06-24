@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 
 class LoraMergeWindow:
@@ -29,13 +28,73 @@ class LoraMergeWindow:
         frame = self.ttk.Frame(dialog, padding=12)
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(2, weight=1)
+        frame.rowconfigure(3, weight=1)
 
         self.ttk.Label(frame, text=f"LoRAs in output for {dataset_name}:").grid(row=0, column=0, sticky="w")
         self.ttk.Label(frame, text="Select the LoRAs you want to merge.").grid(row=1, column=0, sticky="w", pady=(4, 0))
 
+        def _is_comfy_variant(path: Path) -> bool:
+            return path.name.casefold().endswith(".comfy.safetensors")
+
+        def _is_standard_variant(path: Path) -> bool:
+            name_lower = path.name.casefold()
+            return name_lower.endswith(".safetensors") and not name_lower.endswith(".comfy.safetensors")
+
+        has_comfy_variants = any(_is_comfy_variant(path) for path in available_loras)
+        has_standard_variants = any(_is_standard_variant(path) for path in available_loras)
+        ltx_toggle_enabled = has_comfy_variants and has_standard_variants
+        variant_mode_var = self.tk.StringVar(value="comfy")
+        visible_loras: list[Path] = []
+
+        toggle_row = self.ttk.Frame(frame)
+        toggle_row.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        if ltx_toggle_enabled:
+            self.ttk.Label(toggle_row, text="Show:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+            comfy_toggle_border = self.tk.Frame(toggle_row, bg="#4a4a4a", bd=0, highlightthickness=0)
+            comfy_toggle_border.grid(row=0, column=1, sticky="w")
+            comfy_toggle = self.tk.Button(
+                comfy_toggle_border,
+                text="Comfy",
+                command=lambda: variant_mode_var.set("comfy"),
+                bg="#2b2b2b",
+                fg="#e6e6e6",
+                activebackground="#3a3a3a",
+                activeforeground="#ffffff",
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+                padx=10,
+                pady=2,
+            )
+            comfy_toggle.pack(padx=1, pady=1)
+            standard_toggle_border = self.tk.Frame(toggle_row, bg="#4a4a4a", bd=0, highlightthickness=0)
+            standard_toggle_border.grid(row=0, column=2, sticky="w", padx=(6, 0))
+            standard_toggle = self.tk.Button(
+                standard_toggle_border,
+                text="Standard",
+                command=lambda: variant_mode_var.set("standard"),
+                bg="#2b2b2b",
+                fg="#e6e6e6",
+                activebackground="#3a3a3a",
+                activeforeground="#ffffff",
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+                padx=10,
+                pady=2,
+            )
+            standard_toggle.pack(padx=1, pady=1)
+
+            def _style_toggle(border: object, button: object, selected: bool) -> None:
+                if selected:
+                    border.configure(bg="#4aa3ff")
+                    button.configure(bg="#31485f", fg="#ffffff")
+                else:
+                    border.configure(bg="#4a4a4a")
+                    button.configure(bg="#2b2b2b", fg="#e6e6e6")
+
         selected_box_frame = self.ttk.Frame(frame)
-        selected_box_frame.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
+        selected_box_frame.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
         selected_box_frame.columnconfigure(0, weight=1)
         selected_box_frame.rowconfigure(0, weight=1)
 
@@ -64,16 +123,35 @@ class LoraMergeWindow:
         selected_scroll.grid(row=0, column=1, sticky="ns")
         selected_list.configure(yscrollcommand=selected_scroll.set)
 
-        for lora_path in available_loras:
-            selected_list.insert("end", lora_path.name)
+        def _refresh_visible_loras(*_args: object) -> None:
+            nonlocal visible_loras
+            if not ltx_toggle_enabled:
+                visible_loras = list(available_loras)
+            elif variant_mode_var.get() == "standard":
+                visible_loras = [p for p in available_loras if _is_standard_variant(p)]
+            else:
+                visible_loras = [p for p in available_loras if _is_comfy_variant(p)]
+
+            selected_list.delete(0, "end")
+            for lora_path in visible_loras:
+                selected_list.insert("end", lora_path.name)
+
+            if ltx_toggle_enabled:
+                mode_is_comfy = variant_mode_var.get() == "comfy"
+                _style_toggle(comfy_toggle_border, comfy_toggle, mode_is_comfy)
+                _style_toggle(standard_toggle_border, standard_toggle, not mode_is_comfy)
+
+        if ltx_toggle_enabled:
+            variant_mode_var.trace_add("write", _refresh_visible_loras)
+        _refresh_visible_loras()
 
         self.ttk.Label(
             frame,
             text="Post-Hoc EMA smooths checkpoints from the same run into one more stable LoRA.",
-        ).grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        ).grid(row=4, column=0, sticky="ew", pady=(10, 0))
 
         options_frame = self.ttk.Frame(frame)
-        options_frame.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        options_frame.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         options_frame.columnconfigure(0, weight=1)
         options_frame.columnconfigure(1, weight=1)
 
@@ -100,7 +178,7 @@ class LoraMergeWindow:
         self.ttk.Checkbutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
 
         button_row = self.ttk.Frame(frame)
-        button_row.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        button_row.grid(row=6, column=0, sticky="ew", pady=(12, 0))
         button_row.columnconfigure(0, weight=1)
 
         choice: tuple[list[str], list[tuple[str, str, list[str], str]]] | None = None
@@ -108,7 +186,7 @@ class LoraMergeWindow:
         def choose_and_close() -> None:
             nonlocal choice
             picked_indices = selected_list.curselection()
-            selected_file_paths = [str(available_loras[i]) for i in picked_indices]
+            selected_file_paths = [str(visible_loras[i]) for i in picked_indices]
             if len(selected_file_paths) < 2:
                 self.messagebox.showerror(
                     "Merge unavailable",
@@ -198,7 +276,27 @@ class LoraMergeWindow:
             )
             return
 
-        available = sorted([p for p in output_dir.iterdir() if p.is_file() and p.suffix.lower() == ".safetensors"])
+        def _merge_candidate_sort_key(path: Path) -> tuple[str, int, str]:
+            name_lower = path.name.casefold()
+            comfy_suffix = ".comfy.safetensors"
+            std_suffix = ".safetensors"
+
+            if name_lower.endswith(comfy_suffix):
+                base = name_lower[: -len(comfy_suffix)]
+                variant_rank = 0
+            elif name_lower.endswith(std_suffix):
+                base = name_lower[: -len(std_suffix)]
+                variant_rank = 1
+            else:
+                base = name_lower
+                variant_rank = 2
+
+            return (base, variant_rank, name_lower)
+
+        available = sorted(
+            [p for p in output_dir.iterdir() if p.is_file() and p.suffix.lower() == ".safetensors"],
+            key=_merge_candidate_sort_key,
+        )
         if not available:
             self.messagebox.showerror(
                 "Merge unavailable",

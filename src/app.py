@@ -2679,6 +2679,15 @@ def _launch_ui_impl() -> int:
             "enable_gradient_checkpointing": flag_to_bool(job.get("enable_grad_ckpt", "1")),
         }
 
+        _raw_data_loader_workers = str(job.get("max_data_loader_n_workers", "") or "").strip()
+        if _raw_data_loader_workers:
+            try:
+                parsed_data_loader_workers = int(_raw_data_loader_workers)
+            except ValueError:
+                parsed_data_loader_workers = 0
+            if parsed_data_loader_workers > 0:
+                run_job_kwargs_all["max_data_loader_n_workers"] = parsed_data_loader_workers
+
         signature = inspect.signature(job_run_fn)
         accepted_param_names = {
             name
@@ -4665,6 +4674,14 @@ def _launch_ui_impl() -> int:
                                 "cancel_requested": (lambda: run_cancel_event is not None and run_cancel_event.is_set()),
                                 "on_error": capture_job_error,
                             }
+                            _raw_data_loader_workers = str(job.get("max_data_loader_n_workers", "") or "").strip()
+                            if _raw_data_loader_workers:
+                                try:
+                                    parsed_data_loader_workers = int(_raw_data_loader_workers)
+                                except ValueError:
+                                    parsed_data_loader_workers = 0
+                                if parsed_data_loader_workers > 0:
+                                    run_job_kwargs["max_data_loader_n_workers"] = parsed_data_loader_workers
                             if job_run_fn is _run_job_ltx:
                                 run_job_kwargs["ltx_mode"] = str(job.get("ltx_mode", "video"))
                                 run_job_kwargs["ltx_gemma_load_in_4bit"] = flag_to_bool(job.get("ltx_gemma_load_in_4bit", "1"))

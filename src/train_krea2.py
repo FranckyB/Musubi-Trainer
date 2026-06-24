@@ -177,6 +177,7 @@ def run_steps_for_model(
     do_cache_latents: bool = True,
     do_cache_text: bool = True,
     do_train: bool = True,
+    max_data_loader_n_workers: int | None = None,
     resume_state_dir: Path | None = None,
     resume_step_offset: int = 0,
     warmstart_checkpoint: Path | None = None,
@@ -305,7 +306,11 @@ def run_steps_for_model(
         optimizer_key = (optimizer_type or "adamw8bit").strip().lower()
         optimizer_arg = "prodigyopt.Prodigy" if optimizer_key == "prodigy" else (optimizer_type or "adamw8bit").strip()
         learning_rate_for_run = "1" if optimizer_key == "prodigy" else learning_rate
-        max_data_loader_n_workers = _recommended_krea2_dataloader_workers()
+        resolved_workers = max_data_loader_n_workers
+        if resolved_workers is None:
+            resolved_workers = _recommended_krea2_dataloader_workers()
+        else:
+            resolved_workers = max(1, int(resolved_workers))
 
         compile_enabled = bool(enable_compile_optimizations and not enable_fp8_dit)
         if enable_compile_optimizations and enable_fp8_dit:
@@ -360,7 +365,7 @@ def run_steps_for_model(
             "gradient_checkpointing = true",
             f"gradient_checkpointing_cpu_offload = {'true' if enable_gradient_checkpointing_cpu_offload else 'false'}",
             "persistent_data_loader_workers = true",
-            f"max_data_loader_n_workers = {max_data_loader_n_workers}",
+            f"max_data_loader_n_workers = {resolved_workers}",
             f"blocks_to_swap = {max(0, int(blocks_to_swap))}",
             f"fp8_base = {'true' if enable_fp8_dit else 'false'}",
             f"fp8_scaled = {'true' if enable_fp8_dit else 'false'}",
@@ -482,6 +487,7 @@ def run_job(
     do_cache_latents: bool,
     do_cache_text: bool,
     do_train: bool,
+    max_data_loader_n_workers: int | None = None,
     timestep_sampling: str = "krea2_shift",
     weighting_scheme: str = "none",
     discrete_flow_shift: str = "",
@@ -585,6 +591,7 @@ def run_job(
             do_cache_latents=do_cache_latents,
             do_cache_text=do_cache_text,
             do_train=(do_train or generate_training_args_only),
+            max_data_loader_n_workers=max_data_loader_n_workers,
             generate_training_args_only=generate_training_args_only,
             resume_state_dir=effective_resume_state,
             resume_step_offset=resume_step_offset,
