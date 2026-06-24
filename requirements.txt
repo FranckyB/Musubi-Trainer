@@ -6,6 +6,10 @@ tkinterdnd2==0.4.3
 huggingface-hub==0.34.3
 hf_xet>=1.5.0
 openai-whisper
+deepfilternet==0.5.6
+audio-separator==0.30.2
+packaging==23.2
+wheel==0.44.0
 
 # Musubi-Tuner core (keep in sync with Musubi-Tuner pyproject where versions are pinned)
 accelerate==1.6.0
@@ -23,7 +27,7 @@ safetensors>=0.4.5
 sentencepiece==0.2.1
 toml==0.10.2
 tqdm==4.67.1
-transformers==4.56.1
+transformers==4.57.6
 timm>=1.0.0
 voluptuous==0.15.2
 

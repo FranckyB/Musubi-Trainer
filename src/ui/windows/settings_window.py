@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from typing import Any
 
 from ...runtime_config import RuntimeConfig
@@ -115,7 +116,7 @@ class SettingsWindow:
         advanced_section.columnconfigure(2, weight=0)
         advanced_section.columnconfigure(3, weight=1)
 
-        # â”€â”€ Models tab â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Models tab ────────────────────────────────────────────────────
         model_loc_frame = self.ttk.Frame(models_tab)
         model_loc_frame.grid(row=0, column=0, sticky="ew")
         model_location_var = self.tk.StringVar(
@@ -134,7 +135,7 @@ class SettingsWindow:
         self.ttk.Entry(model_loc_frame, textvariable=hf_token_var, show="*", width=36, style="Flat.TEntry").grid(row=0, column=3, sticky="ew")
         model_loc_frame.columnconfigure(3, weight=1)
 
-        # â”€â”€ ComfyUI path + scan â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── ComfyUI path + scan ───────────────────────────────────────────
         _raw_extra = self.settings_state.get(self.app_settings.EXTRA_SEARCH_PATHS_KEY, "")
         import json as _json_extra
         try:
@@ -184,7 +185,7 @@ class SettingsWindow:
             else:
                 self.messagebox.showinfo("Scan complete", "No new files found.", parent=dialog)
 
-        self.ttk.Button(extra_paths_frame, text="Browseâ€¦", command=_browse_extra_path).grid(row=0, column=2, padx=(6, 0))
+        self.ttk.Button(extra_paths_frame, text="Browse…", command=_browse_extra_path).grid(row=0, column=2, padx=(6, 0))
         self.ttk.Button(extra_paths_frame, text="Scan for models", command=_scan_all_sources).grid(row=0, column=3, padx=(6, 0))
 
         # Registry of all component StringVars so _scan_extra_path can update them
@@ -221,7 +222,7 @@ class SettingsWindow:
         selected_sd_scripts_path = current_sd_scripts_dir
         selected_musubi_python = str(current_musubi_python_path) if current_musubi_python_path is not None else ""
 
-        # pending_model_paths: model_name â†’ {component: path_str}
+        # pending_model_paths: model_name → {component: path_str}
         import json as _json_settings
         _raw_model_paths = self.settings_state.get(self.app_settings.MODEL_PATHS_KEY, "")
         try:
@@ -315,7 +316,7 @@ class SettingsWindow:
         self.ttk.Label(trainers_section, textvariable=musubi_main_status_var).grid(row=2, column=1, sticky="w")
         self.ttk.Label(
             trainers_section,
-            text="Used for: FLUX2, QWEN, ZIMAGE, WAN",
+            text="Used for: FLUX2, KREA2, QWEN, ZIMAGE, WAN",
             foreground=self.fg_muted,
         ).grid(row=2, column=2, columnspan=2, sticky="w")
 
@@ -443,7 +444,7 @@ class SettingsWindow:
             text="Logs are stored per job under each Training/<job>/logs folder and can be viewed via TensorBoard.",
         ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
-        # â”€â”€ Model family sections â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Model family sections ─────────────────────────────────────────
         _status_vars: dict[str, Any] = {}
 
         _COMPONENT_LABELS: dict[str, str] = {
@@ -465,7 +466,7 @@ class SettingsWindow:
                 return "Not configured"
             if found < len(components):
                 return f"Partial ({found}/{len(components)})"
-            return "âœ“ Ready"
+            return "✓ Ready"
 
         def _refresh_status(model_name: str) -> None:
             sv = _status_vars.get(model_name)
@@ -474,7 +475,7 @@ class SettingsWindow:
 
         def _apply_status_color(lbl: Any, sv: Any, *_a: object) -> None:
             val = sv.get()
-            if val.startswith("âœ“"):
+            if val.startswith("✓"):
                 lbl.configure(foreground="#6fcf6f")
             elif val.startswith("Partial"):
                 lbl.configure(foreground="#f0b429")
@@ -490,7 +491,7 @@ class SettingsWindow:
 
             fam_header_btn = self.ttk.Button(
                 section_frame,
-                text=f"{'â–¼' if expanded else 'â–¶'}  {family_name}",
+                text=f"{'▼' if expanded else '▶'}  {family_name}",
                 style="FamilyHeader.TButton",
                 command=lambda: _toggle_family(fam_header_btn, fam_body, fam_expanded_var, family_name),
             )
@@ -529,7 +530,7 @@ class SettingsWindow:
                 model_block.grid(row=r, column=0, sticky="ew", pady=(1, 0))
                 model_block.columnconfigure(0, weight=1)
 
-                # â”€ Model header row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                # ─ Model header row ───────────────────────────────────────
                 hdr = self.ttk.Frame(model_block)
                 hdr.grid(row=0, column=0, sticky="ew")
                 hdr.columnconfigure(0, weight=1)
@@ -541,7 +542,7 @@ class SettingsWindow:
 
                 expand_btn = self.ttk.Button(
                     hdr,
-                    text=f"â–¶  {display_name}",
+                    text=f"▶  {display_name}",
                     style="FamilyHeader.TButton",
                 )
                 expand_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
@@ -556,7 +557,7 @@ class SettingsWindow:
                     command=lambda mn=mn: _auto_download_model(mn),
                 ).grid(row=0, column=2, padx=(8, 0))
 
-                # â”€ Detail rows (component paths) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                # ─ Detail rows (component paths) ──────────────────────────
                 components = list(self.DOWNLOAD_MODELS.get(mn, {}).keys())
                 _comp_path_vars: dict[str, Any] = {}
 
@@ -622,11 +623,11 @@ class SettingsWindow:
                     if var.get():
                         det.grid_remove()
                         var.set(False)
-                        btn.configure(text=f"â–¶  {dn}")
+                        btn.configure(text=f"▶  {dn}")
                     else:
                         det.grid(row=1, column=0, sticky="ew")
                         var.set(True)
-                        btn.configure(text=f"â–¼  {dn}")
+                        btn.configure(text=f"▼  {dn}")
 
                 expand_btn.configure(command=_toggle_detail)
                 _bind_mousewheel(hdr)
@@ -643,11 +644,11 @@ class SettingsWindow:
             if var.get():
                 body.grid_remove()
                 var.set(False)
-                btn.configure(text=f"â–¶  {family_name}")
+                btn.configure(text=f"▶  {family_name}")
             else:
                 body.grid(row=1, column=0, sticky="ew")
                 var.set(True)
-                btn.configure(text=f"â–¼  {family_name}")
+                btn.configure(text=f"▼  {family_name}")
 
         _family_row = 0
         for _fam_name, _fam_models in self.DOWNLOAD_MODEL_FAMILIES.items():
@@ -656,7 +657,7 @@ class SettingsWindow:
 
         _bind_mousewheel(models_inner)
 
-        # â”€â”€ Auto-download handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Auto-download handler ─────────────────────────────────────────
         def _auto_download_model(model_name: str) -> None:
             location = model_location_var.get()
             ws_root = self.download_workspace_root()
@@ -688,7 +689,63 @@ class SettingsWindow:
             if not confirmed:
                 return
 
-            # Resolve which Python to use â€” prefer the configured Musubi-Tuner venv
+            component_units: dict[str, int] = {}
+            total_units = 0
+            for comp in missing:
+                comp_info = self.DOWNLOAD_MODELS.get(model_name, {}).get(comp, {})
+                units = int(comp_info.get("shard_count", 1)) if comp_info.get("shards") else 1
+                units = units if units > 0 else 1
+                component_units[comp] = units
+                total_units += units
+            if total_units <= 0:
+                total_units = max(1, len(missing))
+
+            progress_state: dict[str, float] = {"completed_units": 0.0}
+            progress_label_var = self.tk.StringVar(value=f"Preparing download for {model_name}...")
+            progress_pct_var = self.tk.StringVar(value="0%")
+
+            progress_dialog = self.tk.Toplevel(dialog)
+            progress_dialog.title("Downloading models")
+            progress_dialog.transient(dialog)
+            progress_dialog.resizable(False, False)
+            progress_dialog.configure(bg=self.bg_panel)
+            self.set_dark_title_bar(progress_dialog)
+            progress_dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+            progress_frame = self.ttk.Frame(progress_dialog, padding=12)
+            progress_frame.grid(row=0, column=0, sticky="nsew")
+            progress_frame.columnconfigure(0, weight=1)
+            self.ttk.Label(progress_frame, textvariable=progress_label_var, anchor="w").grid(row=0, column=0, sticky="ew")
+            progress_bar = self.ttk.Progressbar(
+                progress_frame,
+                mode="determinate",
+                maximum=float(total_units),
+                value=0.0,
+                length=420,
+            )
+            progress_bar.grid(row=1, column=0, sticky="ew", pady=(8, 2))
+            self.ttk.Label(progress_frame, textvariable=progress_pct_var, anchor="e").grid(row=2, column=0, sticky="e")
+            progress_dialog.update_idletasks()
+            self.center_window(progress_dialog)
+
+            def _set_progress_ui(label_text: str, value_units: float) -> None:
+                clamped = max(0.0, min(float(total_units), value_units))
+                progress_label_var.set(label_text)
+                progress_bar.configure(value=clamped)
+                pct = int(round((clamped / float(total_units)) * 100.0)) if total_units else 0
+                progress_pct_var.set(f"{pct}%")
+
+            def _set_component_progress(comp: str, pct: float) -> None:
+                units = float(component_units.get(comp, 1))
+                bounded_pct = max(0.0, min(100.0, pct))
+                value_units = progress_state["completed_units"] + ((bounded_pct / 100.0) * units)
+                _set_progress_ui(f"Downloading {model_name}: {comp} ({int(round(bounded_pct))}%)", value_units)
+
+            def _complete_component_progress(comp: str) -> None:
+                progress_state["completed_units"] += float(component_units.get(comp, 1))
+                _set_progress_ui(f"Completed {model_name}: {comp}", progress_state["completed_units"])
+
+            # Resolve which Python to use — prefer the configured Musubi-Tuner venv
             # so that huggingface_hub is available and the process has a real stdout.
             python_exe = selected_musubi_python
             if not python_exe:
@@ -703,7 +760,7 @@ class SettingsWindow:
             error_holder: list[str] = []
             result_holder: dict[str, object] = {}
 
-            self.log(f"â”â”â” Downloading {model_name} ({', '.join(missing)}) â”â”â”")
+            self.log(f"━━━ Downloading {model_name} ({', '.join(missing)}) ━━━")
 
             def _do_download() -> None:
                 for comp in missing:
@@ -717,7 +774,18 @@ class SettingsWindow:
                     if hf_token:
                         cmd += ["--token", hf_token]
 
-                    self.log(f"  â†“ {comp}â€¦")
+                    self.log(f"  ↓ {comp}…")
+                    dialog.after(0, lambda c=comp: _set_progress_ui(f"Starting {model_name}: {c}...", progress_state["completed_units"]))
+                    _progress_stop = self.threading.Event()
+
+                    def _progress_heartbeat(component: str = comp) -> None:
+                        started = time.time()
+                        while not _progress_stop.wait(12.0):
+                            elapsed = int(time.time() - started)
+                            self.log(f"    ... {component} download in progress ({elapsed}s elapsed)")
+
+                    heartbeat_thread = self.threading.Thread(target=_progress_heartbeat, daemon=True)
+                    heartbeat_thread.start()
                     try:
                         proc = self.subprocess.Popen(
                             cmd,
@@ -747,14 +815,24 @@ class SettingsWindow:
                                     if line.startswith("RESULT:"):
                                         comp_result = line[7:]
                                     elif line.strip():
-                                        self.log(f"\r    {line.strip()}")
+                                        trimmed = line.strip()
+                                        self.log(f"    {trimmed}")
+                                        match = self.re.search(r"(\d{1,3})%", trimmed)
+                                        if match:
+                                            pct = float(match.group(1))
+                                            dialog.after(0, lambda c=comp, p=pct: _set_component_progress(c, p))
                                 else:
                                     line = _buf[:nl].rstrip("\r")
                                     _buf = _buf[nl + 1:]
                                     if line.startswith("RESULT:"):
                                         comp_result = line[7:]
                                     elif line.strip():
-                                        self.log(f"    {line.strip()}")
+                                        trimmed = line.strip()
+                                        self.log(f"    {trimmed}")
+                                        match = self.re.search(r"(\d{1,3})%", trimmed)
+                                        if match:
+                                            pct = float(match.group(1))
+                                            dialog.after(0, lambda c=comp, p=pct: _set_component_progress(c, p))
                         if _buf.strip():
                             self.log(f"    {_buf.strip()}")
                         proc.wait()
@@ -763,6 +841,8 @@ class SettingsWindow:
                                 f"Download of '{comp}' failed (exit {proc.returncode})"
                             )
                             break
+                        self.log(f"  ✓ {comp} complete")
+                        dialog.after(0, lambda c=comp: _complete_component_progress(c))
                         if comp_result:
                             result_holder[comp] = comp_result
                             # Persist each component immediately after it downloads.
@@ -780,16 +860,20 @@ class SettingsWindow:
                     except Exception as exc:
                         error_holder.append(str(exc))
                         break
+                    finally:
+                        _progress_stop.set()
 
                 dialog.after(0, _on_dl_done)
 
             def _on_dl_done() -> None:
+                if progress_dialog.winfo_exists():
+                    progress_dialog.destroy()
                 if error_holder:
                     self.log(f"[ERROR] {error_holder[0]}")
                     self.messagebox.showerror("Download failed", error_holder[0], parent=dialog)
                     return
                 _refresh_status(model_name)
-                self.log(f"â”â”â” Complete: {model_name} â”â”â”")
+                self.log(f"━━━ Complete: {model_name} ━━━")
                 self.messagebox.showinfo(
                     "Download complete",
                     f"'{model_name}' is ready.",
@@ -947,7 +1031,7 @@ class SettingsWindow:
                     _settings_log(f"[Trainers] {label}: update done")
                     self.messagebox.showinfo(
                         "Update complete",
-                        f"{label} updated successfully.\n\n{output}",
+                        f"{label} updated successfully.",
                         parent=dialog,
                     )
                     return
@@ -956,7 +1040,8 @@ class SettingsWindow:
 
                 reset_now = self.messagebox.askyesno(
                     "Update failed",
-                    f"git pull failed for {label}:\n\n{output}\n\n"
+                    f"git pull failed for {label}.\n\n"
+                    "See the app console for details.\n\n"
                     "Do you want to reset this backend (delete folder and re-download)?",
                     parent=dialog,
                 )
@@ -1060,7 +1145,7 @@ class SettingsWindow:
 
         def save_and_close() -> None:
             nonlocal result
-            # Force any focused entry widget to commit (triggers FocusOut â†’ _save_path)
+            # Force any focused entry widget to commit (triggers FocusOut → _save_path)
             dialog.focus_set()
             main_dir = self.Path(selected_musubi_main_path).expanduser()
             ltx_dir = self.Path(selected_musubi_ltx_path).expanduser()

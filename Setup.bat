@@ -107,8 +107,16 @@ if errorlevel 1 exit /b 1
 
 echo.
 echo [2/5] Installing Torch stack for %CUDA_TAG%...
-"%PY%" -m pip install --upgrade torch torchvision torchaudio --index-url %TORCH_INDEX_URL%
-if errorlevel 1 exit /b 1
+set "SKIP_TORCH_INSTALL=0"
+"%PY%" -c "import torch, torchvision, torchaudio, sys; tag='+' + '%CUDA_TAG%'; sys.exit(0 if ((tag in getattr(torch, '__version__', '')) and (tag in getattr(torchvision, '__version__', '')) and (tag in getattr(torchaudio, '__version__', ''))) else 1)"
+if not errorlevel 1 (
+	echo   Torch stack already matches %CUDA_TAG%. Skipping reinstall.
+	set "SKIP_TORCH_INSTALL=1"
+)
+if "%SKIP_TORCH_INSTALL%"=="0" (
+	"%PY%" -m pip install --upgrade torch torchvision torchaudio --index-url %TORCH_INDEX_URL%
+	if errorlevel 1 exit /b 1
+)
 
 echo.
 echo [3/6] Installing Triton ^(Windows build^) for Torch Compile...

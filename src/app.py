@@ -48,6 +48,7 @@ from .train_ltx import run_job as _run_job_ltx
 from .train_wan import run_job as _run_job_wan
 from .train_zimage import run_job as _run_job_zimage
 from .train_qwen import run_job as _run_job_qwen
+from .train_krea2 import run_job as _run_job_krea2
 from .lora_merge_utils import (
     compact_merge_selection_token,
     merge_preset_file_token,
@@ -95,6 +96,7 @@ _LTX_MODELS = {"ltx-2.3"}
 _WAN_MODELS = {"wan2.1-t2v-14b", "wan2.1-i2v-720p-14b", "wan2.1-i2v-480p-14b", "wan2.2-t2v-14b", "wan2.2-i2v-720p-14b", "wan2.2-i2v-480p-14b"}
 _ZIMAGE_MODELS = {"zimage-de-turbo"}
 _QWEN_MODELS = {"qwen-image", "qwen-image-edit", "qwen-image-edit-2509", "qwen-image-edit-2511", "qwen-image-layered"}
+_KREA2_MODELS = {"krea2"}
 
 MUSUBI_MAIN_REPO_URL = "https://github.com/kohya-ss/musubi-tuner.git"
 MUSUBI_LTX_REPO_URL = "https://github.com/AkaneTendo25/musubi-tuner.git"
@@ -116,6 +118,8 @@ def _run_job_for_model(model_name: str):
         return _run_job_zimage
     if model_name in _QWEN_MODELS:
         return _run_job_qwen
+    if model_name in _KREA2_MODELS:
+        return _run_job_krea2
     return None
 
 
@@ -2664,6 +2668,8 @@ def _launch_ui_impl() -> int:
             "gradient_accumulation_steps": get_positive_int_setting(job, "gradient_accumulation_steps", 1, minimum=1),
             "blocks_to_swap": get_non_negative_int_setting(job, "blocks_to_swap", 0),
             "timestep_sampling": str(job.get("timestep_sampling", "sigma") or "sigma"),
+            "weighting_scheme": str(job.get("weighting_scheme", "none") or "none"),
+            "discrete_flow_shift": str(job.get("discrete_flow_shift", "") or ""),
             "ltx_mode": str(job.get("ltx_mode", "video") or "video"),
             "ltx_lora_target_preset": str(job.get("ltx_lora_target_preset", "t2v") or "t2v"),
             "ltx_first_frame_conditioning_p": ltx_first_frame_conditioning_p_value,
@@ -3229,7 +3235,7 @@ def _launch_ui_impl() -> int:
             job_queue[idx]["hold"] = bool_to_flag(target_hold)
             if target_hold and job_queue[idx].get("status", "") in {"queued", "failed", "running", "resume"}:
                 job_queue[idx]["status"] = "paused"
-            elif (not target_hold) and job_queue[idx].get("status", "") == "paused":
+            elif (not target_hold) and job_queue[idx].get("status", "") in {"paused", "failed", "cancelled"}:
                 job_queue[idx]["status"] = "queued"
             save_job_to_disk(job_queue[idx])
             changed = True
@@ -3356,7 +3362,7 @@ def _launch_ui_impl() -> int:
         job_queue[idx]["hold"] = bool_to_flag(next_hold)
         if next_hold and job_queue[idx].get("status", "") in {"queued", "failed", "running", "resume"}:
             job_queue[idx]["status"] = "paused"
-        elif (not next_hold) and job_queue[idx].get("status", "") == "paused":
+        elif (not next_hold) and job_queue[idx].get("status", "") in {"paused", "failed", "cancelled"}:
             job_queue[idx]["status"] = "queued"
         save_job_to_disk(job_queue[idx])
         refresh_job_queue_list()
@@ -4513,7 +4519,7 @@ def _launch_ui_impl() -> int:
                         idx
                         for idx, job in enumerate(job_queue)
                         if (not flag_to_bool(job.get("hold", "0")))
-                        and job.get("status", "queued") in {"queued", "failed", "paused", "resume"}
+                        and job.get("status", "queued") in {"queued", "resume"}
                     ]
 
                     if not runnable_indices:
@@ -4572,13 +4578,11 @@ def _launch_ui_impl() -> int:
                     dataset_name = job.get("dataset_name", "")
                     job_error_details = ""
 
-                    def mark_running() -> None:
-                        if queue_index < len(job_queue):
-                            job_queue[queue_index]["status"] = "running"
-                            save_job_to_disk(job_queue[queue_index])
-                            refresh_job_queue_list()
-
-                    root.after(0, mark_running)
+                    # Set running status immediately in the worker thread so this job cannot be reselected
+                    # by the next queue scan before UI callbacks are processed.
+                    job_queue[queue_index]["status"] = "running"
+                    save_job_to_disk(job_queue[queue_index])
+                    root.after(0, refresh_job_queue_list)
 
                     model_name = job.get("model", "klein-base-9b") or "klein-base-9b"
                     job_run_fn = _run_job_for_model(model_name)
@@ -4676,6 +4680,11 @@ def _launch_ui_impl() -> int:
                                     )
                                 except ValueError:
                                     run_job_kwargs["ltx_first_frame_conditioning_p"] = 0.1
+                            elif job_run_fn is _run_job_krea2:
+                                run_job_kwargs["blocks_to_swap"] = get_non_negative_int_setting(job, "blocks_to_swap", 0)
+                                run_job_kwargs["timestep_sampling"] = str(job.get("timestep_sampling", "krea2_shift") or "krea2_shift")
+                                run_job_kwargs["weighting_scheme"] = str(job.get("weighting_scheme", "none") or "none")
+                                run_job_kwargs["discrete_flow_shift"] = str(job.get("discrete_flow_shift", "") or "")
                             elif job_run_fn is _run_job_sdxl:
                                 run_job_kwargs["lr_scheduler"] = str(job.get("lr_scheduler", "constant") or "constant")
                                 run_job_kwargs["lr_warmup_steps"] = get_non_negative_int_setting(job, "lr_warmup_steps", 0)
@@ -4702,20 +4711,19 @@ def _launch_ui_impl() -> int:
 
                                     root.after(0, show_model_error_popup)
 
-                    def mark_done() -> None:
-                        if queue_index < len(job_queue):
-                            if exit_code == JOB_EXIT_SUCCESS:
-                                next_status = "done"
-                            elif exit_code == JOB_EXIT_CANCELLED:
-                                next_status = "cancelled"
-                            else:
-                                next_status = "failed"
-                            job_queue[queue_index]["status"] = next_status
-                            save_job_to_disk(job_queue[queue_index])
-                            refresh_job_queue_list()
-                            update_start_button_state()
-
-                    root.after(0, mark_done)
+                    if exit_code == JOB_EXIT_SUCCESS:
+                        next_status = "done"
+                    elif exit_code == JOB_EXIT_CANCELLED:
+                        next_status = "cancelled"
+                    else:
+                        next_status = "failed"
+                    job_queue[queue_index]["status"] = next_status
+                    if next_status == "failed":
+                        # Auto-hold failed jobs so they do not loop until user explicitly re-enables them.
+                        job_queue[queue_index]["hold"] = "1"
+                    save_job_to_disk(job_queue[queue_index])
+                    root.after(0, refresh_job_queue_list)
+                    root.after(0, update_start_button_state)
 
                     if exit_code == JOB_EXIT_SUCCESS:
                         log_status(f"[Train] Completed: {job_name}")
@@ -4731,6 +4739,7 @@ def _launch_ui_impl() -> int:
                             if failure_headline:
                                 failure_status = f"{failure_status} - {failure_headline}"
                         log_status(failure_status)
+                        log_status(f"[Queue] Auto-paused failed job: {job_name}")
 
                     if (
                         exit_code not in {JOB_EXIT_SUCCESS, JOB_EXIT_CANCELLED}

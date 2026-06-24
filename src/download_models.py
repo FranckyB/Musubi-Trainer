@@ -395,6 +395,36 @@ MODELS: dict[str, dict[str, dict]] = {
         },
     },
 
+    # ── Krea 2 ────────────────────────────────────────────────────────
+    # Training uses RAW DiT. Turbo DiT is optional for inference/sampling.
+    # VAE and TE follow the official Krea2 docs.
+    "krea2": {
+        "dit": {
+            "repo_id": "krea/Krea-2-Raw",
+            "filename": "raw.safetensors",
+            "shards": False,
+            "folder_name": "krea2-raw",
+        },
+        "dit_turbo": {
+            "repo_id": "krea/Krea-2-Turbo",
+            "filename": "turbo.safetensors",
+            "shards": False,
+            "folder_name": "krea2-turbo",
+        },
+        "vae": {
+            "repo_id": "Comfy-Org/Qwen-Image-Edit_ComfyUI",
+            "filename": "split_files/vae/qwen_image_vae.safetensors",
+            "shards": False,
+            "folder_name": "qwen-image-vae",
+        },
+        "text_encoder": {
+            "repo_id": "Comfy-Org/Qwen3-VL",
+            "filename": "text_encoders/qwen3vl_4b_bf16.safetensors",
+            "shards": False,
+            "folder_name": "qwen3-vl-4b",
+        },
+    },
+
     # ── LTX-2.3 ────────────────────────────────────────────────────────
     # Single combined checkpoint (no separate VAE file).
     # Text encoder: using the FP8 single-file Gemma variant (ltx_2.md).
@@ -428,6 +458,7 @@ DOWNLOAD_LOCATIONS: tuple[str, ...] = (
 MODEL_FAMILIES: dict[str, list[str]] = {
     "SDXL": ["sdxl", "pony", "illustrious"],
     "FLUX.2": ["flux2-dev", "klein-base-9b", "klein-9b", "klein-base-4b", "klein-4b"],
+    "Krea2": ["krea2"],
     "LTX": ["ltx-2.3"],
     "Wan": ["wan2.1-t2v-14b", "wan2.1-i2v-720p-14b", "wan2.1-i2v-480p-14b", "wan2.2-t2v-14b"],
     "Z-Image": ["zimage-de-turbo"],
@@ -475,6 +506,10 @@ COMPONENT_FRIENDLY_NAMES: dict[str, str] = {
     "qwen-image-layered":  "Qwen-Image Layered DiT",
     "qwen-image-vae":      "Qwen-Image VAE",
     "qwen25-vl-7b":        "Qwen2.5 VL 7B Text Encoder",
+    # Krea2
+    "krea2-raw":           "Krea 2 RAW DiT",
+    "krea2-turbo":         "Krea 2 Turbo DiT",
+    "qwen3-vl-4b":         "Qwen3-VL 4B Text Encoder",
 }
 
 MODEL_DISPLAY_NAMES: dict[str, str] = {
@@ -497,6 +532,7 @@ MODEL_DISPLAY_NAMES: dict[str, str] = {
     "qwen-image-edit-2509": "Qwen-Image Edit 25.09",
     "qwen-image-edit-2511": "Qwen-Image Edit 25.11",
     "qwen-image-layered": "Qwen-Image Layered",
+    "krea2": "Krea 2",
 }
 
 # Optional per-model suffix used when Create Job auto-builds names like
@@ -522,6 +558,7 @@ JOB_NAME_EQUIVALENCE_BY_MODEL: dict[str, str] = {
     "qwen-image-edit-2509": "QWENe",
     "qwen-image-edit-2511": "QWENe",
     "qwen-image-layered": "QWEN",
+    "krea2": "KREA2",
 }
 
 # Canonical model version strings used as --model_version CLI argument

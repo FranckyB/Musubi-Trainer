@@ -534,6 +534,8 @@ class CreateJobWindow:
             value=_normalize_non_negative_int_text((existing_job or {}).get("blocks_to_swap", "0"))
         )
         timestep_sampling_var = self.tk.StringVar(value=(existing_job or {}).get("timestep_sampling", "sigma"))
+        krea2_weighting_scheme_var = self.tk.StringVar(value=(existing_job or {}).get("weighting_scheme", "none"))
+        krea2_discrete_flow_shift_var = self.tk.StringVar(value=(existing_job or {}).get("discrete_flow_shift", "2.5"))
         ltx_lora_target_preset_var = self.tk.StringVar(value=(existing_job or {}).get("ltx_lora_target_preset", "full"))
         ltx_first_frame_conditioning_p_var = self.tk.StringVar(value=(existing_job or {}).get("ltx_first_frame_conditioning_p", "0.5"))
         ltx_gemma_load_in_4bit_var = self.tk.BooleanVar(
@@ -591,6 +593,8 @@ class CreateJobWindow:
                 "gradient_accumulation_steps": gradient_accumulation_steps_var.get().strip(),
                 "blocks_to_swap": blocks_to_swap_var.get().strip(),
                 "timestep_sampling": timestep_sampling_var.get().strip(),
+                "weighting_scheme": krea2_weighting_scheme_var.get().strip(),
+                "discrete_flow_shift": krea2_discrete_flow_shift_var.get().strip(),
                 "ltx_mode": _normalize_ltx_mode_ui(ltx_mode_var.get()),
                 "ltx_lora_target_preset": ltx_lora_target_preset_var.get().strip(),
                 "ltx_first_frame_conditioning_p": ltx_first_frame_conditioning_p_var.get().strip(),
@@ -651,6 +655,10 @@ class CreateJobWindow:
                 blocks_to_swap_var.set(_normalize_non_negative_int_text(values["blocks_to_swap"]))
             if "timestep_sampling" in values:
                 timestep_sampling_var.set(values["timestep_sampling"])
+            if "weighting_scheme" in values:
+                krea2_weighting_scheme_var.set(values["weighting_scheme"])
+            if "discrete_flow_shift" in values:
+                krea2_discrete_flow_shift_var.set(values["discrete_flow_shift"])
             if "ltx_mode" in values:
                 ltx_mode_var.set(_normalize_ltx_mode_ui(values["ltx_mode"]))
             if "ltx_lora_target_preset" in values:
@@ -1108,7 +1116,7 @@ class CreateJobWindow:
         _timestep_sampling_combo = self.ttk.Combobox(
             common_advanced,
             textvariable=timestep_sampling_var,
-            values=("sigma", "uniform", "sigmoid", "shift", "flux_shift", "flux2_shift", "qwen_shift", "logsnr", "shifted_logit_normal"),
+            values=("sigma", "uniform", "sigmoid", "shift", "flux_shift", "flux2_shift", "krea2_shift", "qwen_shift", "logsnr", "shifted_logit_normal"),
             state="readonly",
         )
         _timestep_sampling_combo.grid(row=2, column=1, sticky="ew", pady=(6, 0))
@@ -1169,6 +1177,41 @@ class CreateJobWindow:
         ltx_specific_frame.grid(row=0, column=0, columnspan=4, sticky="ew")
         ltx_specific_frame.columnconfigure(1, weight=1)
         ltx_specific_frame.columnconfigure(3, weight=1)
+
+        krea2_specific_frame = self.ttk.Frame(model_specific)
+        krea2_specific_frame.grid(row=1, column=0, columnspan=4, sticky="ew")
+        krea2_specific_frame.columnconfigure(1, weight=1)
+        krea2_specific_frame.columnconfigure(3, weight=1)
+
+        _krea2_weighting_scheme_label = self.ttk.Label(krea2_specific_frame, text="Weighting scheme:")
+        _krea2_weighting_scheme_label.grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        _krea2_weighting_scheme_combo = self.ttk.Combobox(
+            krea2_specific_frame,
+            textvariable=krea2_weighting_scheme_var,
+            values=("none", "sigma_sqrt", "logit_normal", "mode", "cosmap"),
+            state="normal",
+        )
+        _krea2_weighting_scheme_combo.grid(row=0, column=1, sticky="ew", pady=(6, 0))
+
+        _krea2_discrete_flow_shift_label = self.ttk.Label(krea2_specific_frame, text="Discrete flow shift:")
+        _krea2_discrete_flow_shift_label.grid(row=0, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        _krea2_discrete_flow_shift_entry = self.ttk.Entry(
+            krea2_specific_frame,
+            textvariable=krea2_discrete_flow_shift_var,
+            style="Flat.TEntry",
+        )
+        _krea2_discrete_flow_shift_entry.grid(row=0, column=3, sticky="ew", pady=(6, 0))
+
+        _attach_field_tooltip(
+            _krea2_weighting_scheme_label,
+            _krea2_weighting_scheme_combo,
+            "Krea2 flow-matching weighting. 'none' matches the documented baseline.",
+        )
+        _attach_field_tooltip(
+            _krea2_discrete_flow_shift_label,
+            _krea2_discrete_flow_shift_entry,
+            "Krea2 discrete flow shift used with timestep_sampling=shift (example: 2.5 at 1024).",
+        )
 
         self.ttk.Label(ltx_specific_frame, text="LTX mode:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
         _ltx_mode_display_var = self.tk.StringVar(
@@ -1249,7 +1292,7 @@ class CreateJobWindow:
         )
 
         sd_scripts_specific_frame = self.ttk.Frame(model_specific)
-        sd_scripts_specific_frame.grid(row=1, column=0, columnspan=4, sticky="ew")
+        sd_scripts_specific_frame.grid(row=2, column=0, columnspan=4, sticky="ew")
         sd_scripts_specific_frame.columnconfigure(1, weight=1)
         sd_scripts_specific_frame.columnconfigure(3, weight=1)
 
@@ -1337,9 +1380,12 @@ class CreateJobWindow:
                 "Can be significantly slower and may increase host RAM / PCIe traffic."
             ),
         )
-        _sd_scripts_hidden_widgets: list[WidgetType] = [
+        _sd_scripts_hidden_widgets: list[WidgetType] = []
+        _blocks_to_swap_widgets: list[WidgetType] = [
             _blocks_to_swap_label,
             _blocks_to_swap_controls,
+        ]
+        _timestep_sampling_widgets: list[WidgetType] = [
             _timestep_sampling_label,
             _timestep_sampling_combo,
         ]
@@ -1390,6 +1436,9 @@ class CreateJobWindow:
         def _sync_backend_specific_controls() -> None:
             model_name = model_var.get().strip()
             is_sd_scripts = self.backend_kind_for_model(model_name) == "sd-scripts"
+            family_name = _model_to_family.get(model_name, "")
+            supports_blocks_to_swap = family_name in {"LTX", "Krea2"}
+            supports_timestep_sampling = family_name in {"LTX", "Krea2"}
 
             for widget, enabled_state in _advanced_state_specs:
                 widget.configure(state=enabled_state)
@@ -1401,6 +1450,18 @@ class CreateJobWindow:
                     widget.grid_remove()
                 else:
                     widget.grid()
+
+            for widget in _blocks_to_swap_widgets:
+                if supports_blocks_to_swap:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+
+            for widget in _timestep_sampling_widgets:
+                if supports_timestep_sampling:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
 
             _layout_visible_flags(is_sd_scripts)
 
@@ -1416,6 +1477,7 @@ class CreateJobWindow:
         def _sync_model_specific_controls() -> None:
             model_name = model_var.get().strip()
             is_ltx = _model_to_family.get(model_name, "") == "LTX"
+            is_krea2 = _model_to_family.get(model_name, "") == "Krea2"
             is_sd_scripts = self.backend_kind_for_model(model_name) == "sd-scripts"
             requires_audio_mode = _selected_datasets_require_audio_mode()
             if is_ltx:
@@ -1434,13 +1496,19 @@ class CreateJobWindow:
             else:
                 ltx_specific_frame.grid_remove()
 
+            if is_krea2:
+                model_specific.grid()
+                krea2_specific_frame.grid()
+            else:
+                krea2_specific_frame.grid_remove()
+
             if is_sd_scripts:
                 model_specific.grid()
                 sd_scripts_specific_frame.grid()
             else:
                 sd_scripts_specific_frame.grid_remove()
 
-            if not is_ltx and not is_sd_scripts:
+            if not is_ltx and not is_krea2 and not is_sd_scripts:
                 model_specific.grid_remove()
             _sync_backend_specific_controls()
             _sync_network_controls()
@@ -1593,6 +1661,24 @@ class CreateJobWindow:
                 "resolution": str(self.DEFAULT_RESOLUTION),
                 "batch_size": "1",
             },
+            "Krea2": {
+                "optimizer_type": "adamw8bit",
+                "optimizer_args": "",
+                "learning_rate": "1e-4",
+                "train_steps": str(self.DEFAULT_TRAIN_STEPS),
+                "save_every_n_steps": _default_save_every_from_settings,
+                "network_dim": "32",
+                "network_alpha": "32",
+                "lr_scheduler": "constant",
+                "lr_warmup_steps": "0",
+                "gradient_accumulation_steps": "1",
+                "blocks_to_swap": "0",
+                "timestep_sampling": "krea2_shift",
+                "weighting_scheme": "none",
+                "discrete_flow_shift": "2.5",
+                "resolution": "1024",
+                "batch_size": "1",
+            },
             "LTX": {
                 "optimizer_type": "adamw8bit",
                 "optimizer_args": "",
@@ -1701,6 +1787,8 @@ class CreateJobWindow:
             gradient_accumulation_steps_var.set(profile["gradient_accumulation_steps"])
             blocks_to_swap_var.set(profile["blocks_to_swap"])
             timestep_sampling_var.set(profile["timestep_sampling"])
+            krea2_weighting_scheme_var.set(profile.get("weighting_scheme", "none"))
+            krea2_discrete_flow_shift_var.set(profile.get("discrete_flow_shift", "2.5"))
             train_resolution_var.set(profile["resolution"])
             train_batch_var.set(profile["batch_size"])
             if "ltx_lora_target_preset" in profile:
@@ -2145,6 +2233,15 @@ class CreateJobWindow:
                 return
 
             timestep_sampling_value = timestep_sampling_var.get().strip().lower() or "sigma"
+            krea2_weighting_scheme_value = krea2_weighting_scheme_var.get().strip().lower() or "none"
+            krea2_discrete_flow_shift_value = krea2_discrete_flow_shift_var.get().strip()
+            if krea2_discrete_flow_shift_value:
+                try:
+                    if float(krea2_discrete_flow_shift_value) <= 0:
+                        raise ValueError
+                except ValueError:
+                    self.messagebox.showerror("Invalid value", "Discrete flow shift must be a number greater than 0.", parent=dialog)
+                    return
             ltx_mode_value = _normalize_ltx_mode_ui(ltx_mode_var.get())
             ltx_lora_target_preset_value = ltx_lora_target_preset_var.get().strip().lower()
             if ltx_mode_value == "audio":
@@ -2364,6 +2461,8 @@ class CreateJobWindow:
                     "gradient_accumulation_steps": str(grad_accum_value),
                     "blocks_to_swap": str(blocks_to_swap_value),
                     "timestep_sampling": timestep_sampling_value,
+                    "weighting_scheme": krea2_weighting_scheme_value,
+                    "discrete_flow_shift": krea2_discrete_flow_shift_value,
                     "ltx_lora_target_preset": ltx_lora_target_preset_value,
                     "ltx_first_frame_conditioning_p": str(ltx_first_frame_conditioning_p_value),
                     "ltx_gemma_load_in_4bit": self.bool_to_flag(ltx_gemma_load_in_4bit_var.get()),

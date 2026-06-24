@@ -4,6 +4,9 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
+import time
 import wave
 from pathlib import Path
 import threading
@@ -910,6 +913,8 @@ class DatasetEditorWindow:
         replace_existing_var = self.tk.BooleanVar(master=dialog, value=False)
         transcribe_status_var = self.tk.StringVar(master=dialog, value="")
         transcribe_all_button: Any = None
+        extract_audio_button: Any = None
+        normalize_audio_button: Any = None
         split_defaults: dict[str, float] = {
             "split_min": 4.0,
             "split_max": 8.0,
@@ -947,8 +952,20 @@ class DatasetEditorWindow:
         )
         transcribe_all_button.grid(row=0, column=5, sticky="w")
 
+        extract_audio_button = self.ttk.Button(
+            controls,
+            text="Extract Audio From Videos",
+        )
+        extract_audio_button.grid(row=0, column=6, sticky="w", padx=(8, 0))
+
+        normalize_audio_button = self.ttk.Button(
+            controls,
+            text="Normalize Gain (All Audio)",
+        )
+        normalize_audio_button.grid(row=0, column=7, sticky="w", padx=(8, 0))
+
         self.ttk.Label(controls, textvariable=transcribe_status_var, style="TLabel").grid(
-            row=0, column=6, sticky="w", padx=(10, 0)
+            row=0, column=8, sticky="w", padx=(10, 0)
         )
 
         grid_host = self.tk.Frame(
@@ -984,14 +1001,16 @@ class DatasetEditorWindow:
         pending_save_by_widget: dict[Any, str] = {}
         caption_widget_by_path: dict[Path, Any] = {}
         audio_duration_cache: dict[Path, float | None] = {}
+        enhancement_notice_state = {"remove_music_download_logged": False}
 
         def _set_transcribe_busy(is_busy: bool, status_text: str = "") -> None:
             button_state = "disabled" if is_busy else "normal"
-            if transcribe_all_button is not None:
-                try:
-                    transcribe_all_button.configure(state=button_state)
-                except Exception:
-                    pass
+            for action_button in (transcribe_all_button, extract_audio_button, normalize_audio_button):
+                if action_button is not None:
+                    try:
+                        action_button.configure(state=button_state)
+                    except Exception:
+                        pass
             transcribe_status_var.set(status_text)
 
         def _resolve_ffmpeg_executable() -> str:
@@ -1811,6 +1830,441 @@ class DatasetEditorWindow:
             )
             return (split_files, skipped_files, errors, split_sources)
 
+        def _run_extract_audio_from_videos(video_file_paths: list[Path]) -> tuple[int, int]:
+            if not video_file_paths:
+                return (0, 0)
+
+            ffmpeg_executable = _resolve_ffmpeg_executable()
+            dataset_dir = self.dataset_dir_path(dataset_name)
+            extracted = 0
+            errors = 0
+
+            self.log(
+                f"[Dataset Editor] Audio extraction start for '{dataset_name}' ({len(video_file_paths)} video clip(s))"
+            )
+
+            for source_path in video_file_paths:
+                normalized_video_path = Path(source_path)
+                if not normalized_video_path.is_absolute():
+                    candidate = dataset_dir / normalized_video_path.name
+                    if candidate.exists():
+                        normalized_video_path = candidate
+                normalized_video_path = normalized_video_path.resolve()
+
+                if not normalized_video_path.exists():
+                    errors += 1
+                    self.log(
+                        f"[Dataset Editor] Audio extraction failed for '{normalized_video_path.name}': file not found"
+                    )
+                    continue
+
+                out_path = normalized_video_path.with_name(f"{normalized_video_path.stem}_audio.wav")
+                suffix_index = 1
+                while out_path.exists():
+                    out_path = normalized_video_path.with_name(
+                        f"{normalized_video_path.stem}_audio_{suffix_index:03d}.wav"
+                    )
+                    suffix_index += 1
+
+                ffmpeg_cmd = [
+                    ffmpeg_executable,
+                    "-y",
+                    "-nostdin",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(normalized_video_path),
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "44100",
+                    "-acodec",
+                    "pcm_s16le",
+                    str(out_path),
+                ]
+                ffmpeg_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=False)
+                if ffmpeg_result.returncode != 0:
+                    errors += 1
+                    stderr_text = (ffmpeg_result.stderr or "").strip()
+                    self.log(
+                        f"[Dataset Editor] Audio extraction failed for '{normalized_video_path.name}': {stderr_text or 'ffmpeg failed'}"
+                    )
+                    continue
+
+                source_caption = normalized_video_path.with_suffix(".txt")
+                target_caption = out_path.with_suffix(".txt")
+                if source_caption.exists() and source_caption.is_file() and not target_caption.exists():
+                    try:
+                        target_caption.write_text(source_caption.read_text(encoding="utf-8"), encoding="utf-8")
+                    except OSError:
+                        pass
+
+                extracted += 1
+                self.log(
+                    f"[Dataset Editor] Extracted audio: '{normalized_video_path.name}' -> '{out_path.name}'"
+                )
+
+            self.log(
+                f"[Dataset Editor] Audio extraction complete for '{dataset_name}': extracted={extracted}, errors={errors}"
+            )
+            return (extracted, errors)
+
+        def _start_extract_audio_from_videos(video_file_paths: list[Path]) -> None:
+            if not video_file_paths:
+                transcribe_status_var.set("No video clips found.")
+                return
+
+            _set_transcribe_busy(True, "Extracting audio from videos...")
+
+            def worker() -> None:
+                try:
+                    extracted, errors = _run_extract_audio_from_videos(video_file_paths)
+
+                    def _finish_extract() -> None:
+                        _set_transcribe_busy(False, f"Extracted {extracted} clip(s), {errors} errors")
+                        if extracted > 0:
+                            dialog.destroy()
+                            self.root.after(0, lambda: self.open(dataset_name))
+
+                    dialog.after(0, _finish_extract)
+                except Exception as exc:
+                    error_text = str(exc)
+                    self.log(f"[Dataset Editor] Audio extraction failed for '{dataset_name}': {error_text}")
+                    dialog.after(0, lambda: _set_transcribe_busy(False, "Audio extraction failed."))
+                    dialog.after(0, lambda: self.messagebox.showerror("Extract Audio", error_text, parent=dialog))
+
+            threading.Thread(target=worker, name="dataset-editor-extract-audio", daemon=True).start()
+
+        def _run_normalize_audio_gain(audio_file_paths: list[Path]) -> tuple[int, int]:
+            if not audio_file_paths:
+                return (0, 0)
+
+            ffmpeg_executable = _resolve_ffmpeg_executable()
+            dataset_dir = self.dataset_dir_path(dataset_name)
+            normalized = 0
+            errors = 0
+
+            self.log(
+                f"[Dataset Editor] Gain normalization start for '{dataset_name}' ({len(audio_file_paths)} clip(s))"
+            )
+
+            for source_path in audio_file_paths:
+                normalized_audio_path = Path(source_path)
+                if not normalized_audio_path.is_absolute():
+                    candidate = dataset_dir / normalized_audio_path.name
+                    if candidate.exists():
+                        normalized_audio_path = candidate
+                normalized_audio_path = normalized_audio_path.resolve()
+
+                if not normalized_audio_path.exists():
+                    errors += 1
+                    self.log(
+                        f"[Dataset Editor] Gain normalization failed for '{normalized_audio_path.name}': file not found"
+                    )
+                    continue
+
+                temp_out = normalized_audio_path.with_name(f"{normalized_audio_path.stem}__norm_tmp.wav")
+                ffmpeg_cmd = [
+                    ffmpeg_executable,
+                    "-y",
+                    "-nostdin",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(normalized_audio_path),
+                    "-af",
+                    "loudnorm=I=-16:TP=-1.5:LRA=11",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "44100",
+                    "-acodec",
+                    "pcm_s16le",
+                    str(temp_out),
+                ]
+                ffmpeg_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=False)
+                if ffmpeg_result.returncode != 0:
+                    errors += 1
+                    stderr_text = (ffmpeg_result.stderr or "").strip()
+                    self.log(
+                        f"[Dataset Editor] Gain normalization failed for '{normalized_audio_path.name}': {stderr_text or 'ffmpeg failed'}"
+                    )
+                    continue
+
+                final_out = normalized_audio_path.with_name(f"{normalized_audio_path.stem}_norm.wav")
+                suffix_index = 1
+                while final_out.exists() and final_out != normalized_audio_path:
+                    final_out = normalized_audio_path.with_name(
+                        f"{normalized_audio_path.stem}_norm_{suffix_index:03d}.wav"
+                    )
+                    suffix_index += 1
+
+                try:
+                    shutil.move(str(temp_out), str(final_out))
+                    source_caption = normalized_audio_path.with_suffix(".txt")
+                    target_caption = final_out.with_suffix(".txt")
+                    if source_caption.exists() and source_caption.is_file() and not target_caption.exists():
+                        target_caption.write_text(source_caption.read_text(encoding="utf-8"), encoding="utf-8")
+                    normalized += 1
+                    self.log(
+                        f"[Dataset Editor] Normalized gain: '{normalized_audio_path.name}' -> '{final_out.name}'"
+                    )
+                except OSError as exc:
+                    errors += 1
+                    self.log(
+                        f"[Dataset Editor] Gain normalization move failed for '{normalized_audio_path.name}': {exc}"
+                    )
+
+            self.log(
+                f"[Dataset Editor] Gain normalization complete for '{dataset_name}': normalized={normalized}, errors={errors}"
+            )
+            return (normalized, errors)
+
+        def _start_normalize_audio_gain(audio_file_paths: list[Path]) -> None:
+            if not audio_file_paths:
+                transcribe_status_var.set("No audio clips found.")
+                return
+
+            _set_transcribe_busy(True, "Normalizing audio gain...")
+
+            def worker() -> None:
+                try:
+                    normalized_count, errors = _run_normalize_audio_gain(audio_file_paths)
+
+                    def _finish_normalize() -> None:
+                        _set_transcribe_busy(False, f"Normalized {normalized_count} clip(s), {errors} errors")
+                        if normalized_count > 0:
+                            dialog.destroy()
+                            self.root.after(0, lambda: self.open(dataset_name))
+
+                    dialog.after(0, _finish_normalize)
+                except Exception as exc:
+                    error_text = str(exc)
+                    self.log(f"[Dataset Editor] Gain normalization failed for '{dataset_name}': {error_text}")
+                    dialog.after(0, lambda: _set_transcribe_busy(False, "Gain normalization failed."))
+                    dialog.after(0, lambda: self.messagebox.showerror("Normalize Gain", error_text, parent=dialog))
+
+            threading.Thread(target=worker, name="dataset-editor-normalize-gain", daemon=True).start()
+
+        def _run_audio_enhancement_preset(audio_file_paths: list[Path], preset_key: str) -> tuple[int, int]:
+            if not audio_file_paths:
+                return (0, 0)
+
+            scripts_dir = Path(sys.executable).resolve().parent
+            preset_map: dict[str, dict[str, str]] = {
+                "deepfilternet": {
+                    "label": "Denoise",
+                    "suffix": "dfn",
+                    "exe": str(scripts_dir / "deepFilter.exe"),
+                },
+                "melband_roformer": {
+                    "label": "Remove Music",
+                    "suffix": "mbr",
+                    "exe": str(scripts_dir / "audio-separator.exe"),
+                    "model": "melband_roformer_inst_v1.ckpt",
+                },
+            }
+            preset = preset_map.get(preset_key)
+            if preset is None:
+                raise RuntimeError(f"Unknown enhancement preset: {preset_key}")
+
+            if preset_key == "melband_roformer" and not enhancement_notice_state["remove_music_download_logged"]:
+                message = (
+                    "[Dataset Editor] Remove Music first run: downloading model if missing in cache. "
+                    "This may take a few minutes."
+                )
+                self.log(message)
+                print(message, flush=True)
+                enhancement_notice_state["remove_music_download_logged"] = True
+
+            dataset_dir = self.dataset_dir_path(dataset_name)
+            processed = 0
+            errors = 0
+
+            self.log(
+                f"[Dataset Editor] {preset['label']} start for '{dataset_name}' ({len(audio_file_paths)} clip(s))"
+            )
+
+            for source_path in audio_file_paths:
+                normalized_audio_path = Path(source_path)
+                if not normalized_audio_path.is_absolute():
+                    candidate = dataset_dir / normalized_audio_path.name
+                    if candidate.exists():
+                        normalized_audio_path = candidate
+                normalized_audio_path = normalized_audio_path.resolve()
+
+                if not normalized_audio_path.exists():
+                    errors += 1
+                    self.log(
+                        f"[Dataset Editor] {preset['label']} failed for '{normalized_audio_path.name}': file not found"
+                    )
+                    continue
+
+                output_dir = normalized_audio_path.parent
+                cli_executable = preset.get("exe", "")
+                if not cli_executable or (not Path(cli_executable).exists()):
+                    errors += 1
+                    self.log(
+                        f"[Dataset Editor] {preset['label']} failed: CLI not found at '{cli_executable}'"
+                    )
+                    continue
+
+                run_started_at = time.time()
+                before_outputs = {
+                    path.resolve()
+                    for path in output_dir.glob("*.wav")
+                    if path.is_file()
+                }
+
+                if preset_key == "deepfilternet":
+                    # DeepFilterNet currently breaks with torchaudio>=2.11 due removed torchaudio.backend API.
+                    cli_cmd = [
+                        cli_executable,
+                        str(normalized_audio_path),
+                        "-o",
+                        str(output_dir),
+                    ]
+                else:
+                    cli_cmd = [
+                        cli_executable,
+                        str(normalized_audio_path),
+                        "-m",
+                        str(preset.get("model", "melband_roformer_inst_v1.ckpt")),
+                        "--output_dir",
+                        str(output_dir),
+                        "--output_format",
+                        "WAV",
+                        "--single_stem",
+                        "Vocals",
+                    ]
+
+                cli_result = subprocess.run(cli_cmd, capture_output=True, text=True, check=False)
+                if cli_result.returncode != 0:
+                    errors += 1
+                    stderr_text = (cli_result.stderr or "").strip()
+                    stdout_text = (cli_result.stdout or "").strip()
+                    if preset_key == "deepfilternet" and "torchaudio.backend" in (stderr_text + "\n" + stdout_text):
+                        self.log(
+                            "[Dataset Editor] DeepFilterNet failed: installed package is incompatible with current torchaudio API "
+                            "(missing 'torchaudio.backend')."
+                        )
+                    else:
+                        self.log(
+                            f"[Dataset Editor] {preset['label']} failed for '{normalized_audio_path.name}': "
+                            f"{stderr_text or stdout_text or 'tool failed'}"
+                        )
+                    continue
+
+                after_outputs = {
+                    path.resolve()
+                    for path in output_dir.glob("*.wav")
+                    if path.is_file()
+                }
+                changed_outputs: list[Path] = []
+                for output_path in after_outputs:
+                    try:
+                        if output_path not in before_outputs or output_path.stat().st_mtime >= (run_started_at - 0.5):
+                            changed_outputs.append(output_path)
+                    except OSError:
+                        continue
+
+                if preset_key == "melband_roformer":
+                    vocals_outputs = [path for path in changed_outputs if "vocals" in path.name.lower()]
+                    if vocals_outputs:
+                        changed_outputs = vocals_outputs
+
+                if not changed_outputs:
+                    errors += 1
+                    self.log(
+                        f"[Dataset Editor] {preset['label']} failed for '{normalized_audio_path.name}': no output file was created or updated"
+                    )
+                    continue
+
+                changed_outputs.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+                produced_output = changed_outputs[0]
+                final_out = normalized_audio_path.with_name(f"{normalized_audio_path.stem}_{preset['suffix']}.wav")
+                suffix_index = 1
+                while final_out.exists() and final_out != produced_output:
+                    final_out = normalized_audio_path.with_name(
+                        f"{normalized_audio_path.stem}_{preset['suffix']}_{suffix_index:03d}.wav"
+                    )
+                    suffix_index += 1
+
+                try:
+                    if produced_output.resolve() != final_out.resolve():
+                        if final_out.exists():
+                            final_out.unlink()
+                        shutil.move(str(produced_output), str(final_out))
+                    source_caption = normalized_audio_path.with_suffix(".txt")
+                    target_caption = final_out.with_suffix(".txt")
+                    if source_caption.exists() and source_caption.is_file() and not target_caption.exists():
+                        target_caption.write_text(source_caption.read_text(encoding="utf-8"), encoding="utf-8")
+                    processed += 1
+                    self.log(
+                        f"[Dataset Editor] {preset['label']}: '{normalized_audio_path.name}' -> '{final_out.name}'"
+                    )
+                except OSError as exc:
+                    errors += 1
+                    self.log(
+                        f"[Dataset Editor] {preset['label']} move failed for '{normalized_audio_path.name}': {exc}"
+                    )
+
+            self.log(
+                f"[Dataset Editor] {preset['label']} complete for '{dataset_name}': processed={processed}, errors={errors}"
+            )
+            return (processed, errors)
+
+        def _start_audio_enhancement_preset(audio_file_paths: list[Path], preset_key: str) -> None:
+            if not audio_file_paths:
+                transcribe_status_var.set("No audio clips found.")
+                return
+
+            label_map = {
+                "deepfilternet": "Denoise",
+                "melband_roformer": "Remove Music",
+            }
+            label = label_map.get(preset_key, "Enhancement")
+            _set_transcribe_busy(True, f"Applying {label}...")
+
+            def worker() -> None:
+                try:
+                    processed_count, errors = _run_audio_enhancement_preset(audio_file_paths, preset_key)
+
+                    def _finish_enhance() -> None:
+                        _set_transcribe_busy(False, f"{label}: {processed_count} clip(s), {errors} errors")
+                        if processed_count == 0 and errors > 0:
+                            if preset_key == "deepfilternet":
+                                self.messagebox.showerror(
+                                    label,
+                                    (
+                                        "Denoise failed to run in this environment.\n\n"
+                                        "Current blocker: DeepFilterNet 0.5.6 expects older torchaudio APIs "
+                                        "(missing module 'torchaudio.backend').\n\n"
+                                        "Use Remove Music for now, or move DeepFilterNet into a separate "
+                                        "audio-tools environment pinned to older torch/torchaudio."
+                                    ),
+                                    parent=dialog,
+                                )
+                            else:
+                                self.messagebox.showerror(
+                                    label,
+                                    f"{label} did not produce any output files. Check the terminal log for details.",
+                                    parent=dialog,
+                                )
+                        if processed_count > 0:
+                            dialog.destroy()
+                            self.root.after(0, lambda: self.open(dataset_name))
+
+                    dialog.after(0, _finish_enhance)
+                except Exception as exc:
+                    error_text = str(exc)
+                    self.log(f"[Dataset Editor] {label} failed for '{dataset_name}': {error_text}")
+                    dialog.after(0, lambda: _set_transcribe_busy(False, f"{label} failed."))
+                    dialog.after(0, lambda: self.messagebox.showerror(label, error_text, parent=dialog))
+
+            threading.Thread(target=worker, name="dataset-editor-audio-enhance", daemon=True).start()
+
         def _start_auto_split_audio(
             audio_file_paths: list[Path],
             split_params: tuple[float, float, float, float] | None = None,
@@ -2059,6 +2513,794 @@ class DatasetEditorWindow:
 
             open_media_external(path)
 
+        def _format_seconds_label(total_seconds: float) -> str:
+            value = max(0.0, float(total_seconds))
+            minutes = int(value // 60)
+            seconds = value - (minutes * 60)
+            return f"{minutes:02d}:{seconds:05.2f}"
+
+        def _preview_audio_segment(audio_path: Path, start_s: float, end_s: float) -> bool:
+            normalized_audio_path = _normalize_media_path(audio_path)
+            if ffplay_path is None:
+                self.messagebox.showerror(
+                    "Trim Audio",
+                    "ffplay was not found in PATH. Install ffmpeg (including ffplay) to preview segments.",
+                    parent=dialog,
+                )
+                return False
+
+            segment_len = max(0.1, end_s - start_s)
+            stop_other_media()
+            cmd = [
+                ffplay_path,
+                "-autoexit",
+                "-loglevel",
+                "quiet",
+                "-nodisp",
+                "-ss",
+                f"{start_s:.3f}",
+                "-t",
+                f"{segment_len:.3f}",
+                str(normalized_audio_path),
+            ]
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                active_players[normalized_audio_path] = process
+                return True
+            except Exception as exc:
+                self.messagebox.showerror("Trim Audio", f"Could not preview segment:\n{exc}", parent=dialog)
+                return False
+
+        def _open_trim_audio_dialog(audio_path: Path) -> None:
+            normalized_audio_path = _normalize_media_path(audio_path)
+            if not normalized_audio_path.exists():
+                self.messagebox.showerror(
+                    "Trim Audio",
+                    f"Audio file not found:\n{normalized_audio_path}",
+                    parent=dialog,
+                )
+                return
+
+            duration_s = _audio_duration_seconds(normalized_audio_path)
+            if duration_s is None or duration_s <= 0:
+                self.messagebox.showerror(
+                    "Trim Audio",
+                    "Could not determine clip duration. Ensure ffprobe is available and the file is valid.",
+                    parent=dialog,
+                )
+                return
+
+            ffmpeg_executable = _resolve_ffmpeg_executable()
+            session_temp_root = _workspace_root_for_downloads() / "Temp" / "trim_sessions"
+            session_temp_root.mkdir(parents=True, exist_ok=True)
+            session_temp_dir = Path(tempfile.mkdtemp(prefix="musubi_trim_", dir=str(session_temp_root)))
+            working_audio_path = session_temp_dir / f"{normalized_audio_path.stem}__edit_tmp.wav"
+            temp_caption_path = working_audio_path.with_suffix(".txt")
+
+            make_temp_cmd = [
+                ffmpeg_executable,
+                "-y",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-i",
+                str(normalized_audio_path),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "44100",
+                "-acodec",
+                "pcm_s16le",
+                str(working_audio_path),
+            ]
+            make_temp_result = subprocess.run(make_temp_cmd, capture_output=True, text=True, check=False)
+            if make_temp_result.returncode != 0 or (not working_audio_path.exists()):
+                stderr_text = (make_temp_result.stderr or "").strip()
+                try:
+                    shutil.rmtree(session_temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                self.messagebox.showerror(
+                    "Trim Audio",
+                    stderr_text or "Could not create a temporary working clip.",
+                    parent=dialog,
+                )
+                return
+
+            duration_s = _audio_duration_seconds(working_audio_path)
+            if duration_s is None or duration_s <= 0:
+                self.messagebox.showerror(
+                    "Trim Audio",
+                    "Could not determine temporary clip duration.",
+                    parent=dialog,
+                )
+                try:
+                    shutil.rmtree(session_temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                return
+
+            trim_prompt = self.tk.Toplevel(dialog)
+            trim_prompt.withdraw()
+            trim_prompt.title(f"Trim Audio: {normalized_audio_path.name}")
+            trim_prompt.transient(dialog)
+            trim_prompt.grab_set()
+            trim_prompt.configure(bg=self.bg_panel)
+            trim_prompt.resizable(False, False)
+            self.set_dark_title_bar(trim_prompt)
+
+            root_frame = self.ttk.Frame(trim_prompt, padding=10)
+            root_frame.grid(row=0, column=0, sticky="nsew")
+            root_frame.columnconfigure(0, weight=1)
+
+            start_var = self.tk.DoubleVar(master=trim_prompt, value=0.0)
+            end_var = self.tk.DoubleVar(master=trim_prompt, value=float(duration_s))
+            start_input_var = self.tk.StringVar(master=trim_prompt, value=_format_seconds_label(0.0))
+            end_input_var = self.tk.StringVar(master=trim_prompt, value=_format_seconds_label(duration_s))
+            total_label_var = self.tk.StringVar(master=trim_prompt, value=_format_seconds_label(duration_s))
+            playhead_label_var = self.tk.StringVar(master=trim_prompt, value=_format_seconds_label(0.0))
+            duration_label_var = self.tk.StringVar(master=trim_prompt, value=f"Duration: {_format_seconds_label(duration_s)}")
+            max_end_s = float(duration_s)
+
+            waveform_bins_count = 320
+            waveform_values: list[float] = []
+            drag_state: dict[str, Any] = {"mode": None, "resume_after_seek": False}
+            playhead_var = self.tk.DoubleVar(master=trim_prompt, value=0.0)
+            playback_started_at = 0.0
+            playback_start_offset_s = 0.0
+            playback_end_offset_s = float(duration_s)
+            play_pause_label_var = self.tk.StringVar(master=trim_prompt, value="Play")
+            playback_poll_after_id: str | None = None
+
+            def _extract_waveform_bins(target_path: Path, bins: int) -> list[float]:
+                ffmpeg_executable = _resolve_ffmpeg_executable()
+                ffmpeg_cmd = [
+                    ffmpeg_executable,
+                    "-nostdin",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(target_path),
+                    "-f",
+                    "s16le",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "8000",
+                    "-",
+                ]
+                completed = subprocess.run(ffmpeg_cmd, capture_output=True, check=False)
+                if completed.returncode != 0:
+                    return []
+                pcm_bytes = completed.stdout or b""
+                if len(pcm_bytes) < 2:
+                    return []
+
+                sample_count = len(pcm_bytes) // 2
+                if sample_count <= 0:
+                    return []
+
+                samples_view = memoryview(pcm_bytes[: sample_count * 2]).cast("h")
+                chunk_size = max(1, sample_count // bins)
+                values: list[float] = []
+                index = 0
+                while index < sample_count and len(values) < bins:
+                    chunk = samples_view[index : min(sample_count, index + chunk_size)]
+                    peak = 0
+                    for sample in chunk:
+                        amp = sample if sample >= 0 else -sample
+                        if amp > peak:
+                            peak = amp
+                    values.append(min(1.0, float(peak) / 32768.0))
+                    index += chunk_size
+
+                if not values:
+                    return []
+
+                while len(values) < bins:
+                    values.append(values[-1])
+                return values[:bins]
+
+            self.ttk.Label(root_frame, textvariable=duration_label_var, style="TLabel").grid(
+                row=0,
+                column=0,
+                columnspan=3,
+                sticky="w",
+                pady=(0, 8),
+            )
+
+            waveform_canvas_width = 900
+            waveform_canvas_height = 140
+            waveform_shell = self.tk.Frame(
+                root_frame,
+                bg="#0f1623",
+                highlightthickness=1,
+                highlightbackground="#2a3a50",
+                bd=0,
+            )
+            waveform_shell.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+            waveform_canvas = self.tk.Canvas(
+                waveform_shell,
+                width=waveform_canvas_width,
+                height=waveform_canvas_height,
+                bg="#0f1623",
+                highlightthickness=0,
+                bd=0,
+            )
+            waveform_canvas.pack(fill="x", expand=True)
+
+            values_trim_row = self.ttk.Frame(root_frame)
+            values_trim_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+            values_trim_row.columnconfigure(8, weight=1)
+            self.ttk.Label(values_trim_row, text="In:", style="TLabel").grid(row=0, column=0, sticky="w")
+            in_entry = self.ttk.Entry(values_trim_row, textvariable=start_input_var, width=10)
+            in_entry.grid(row=0, column=1, sticky="w", padx=(6, 14))
+            self.ttk.Label(values_trim_row, text="Out:", style="TLabel").grid(row=0, column=2, sticky="w")
+            out_entry = self.ttk.Entry(values_trim_row, textvariable=end_input_var, width=10)
+            out_entry.grid(row=0, column=3, sticky="w", padx=(6, 14))
+            self.ttk.Label(values_trim_row, text="Total:", style="TLabel").grid(row=0, column=4, sticky="w")
+            self.ttk.Label(values_trim_row, textvariable=total_label_var, style="TLabel", width=10).grid(
+                row=0,
+                column=5,
+                sticky="w",
+                padx=(6, 0),
+            )
+            self.ttk.Label(values_trim_row, text="Playhead:", style="TLabel").grid(row=0, column=6, sticky="w", padx=(14, 0))
+            self.ttk.Label(values_trim_row, textvariable=playhead_label_var, style="TLabel", width=10).grid(
+                row=0,
+                column=7,
+                sticky="w",
+                padx=(6, 0),
+            )
+
+            def _parse_time_input(value: str) -> float | None:
+                raw = value.strip()
+                if not raw:
+                    return None
+                try:
+                    if ":" not in raw:
+                        parsed = float(raw)
+                        return parsed if parsed >= 0.0 else None
+
+                    parts = [segment.strip() for segment in raw.split(":")]
+                    if len(parts) not in (2, 3):
+                        return None
+                    if any((not segment) for segment in parts):
+                        return None
+
+                    if len(parts) == 2:
+                        minutes = int(parts[0])
+                        seconds = float(parts[1])
+                        if minutes < 0 or seconds < 0:
+                            return None
+                        return (minutes * 60.0) + seconds
+
+                    hours = int(parts[0])
+                    minutes = int(parts[1])
+                    seconds = float(parts[2])
+                    if hours < 0 or minutes < 0 or seconds < 0:
+                        return None
+                    return (hours * 3600.0) + (minutes * 60.0) + seconds
+                except ValueError:
+                    return None
+
+            def _draw_waveform_overlay(start_s: float, end_s: float, playhead_s: float) -> None:
+                waveform_canvas.delete("all")
+                width = waveform_canvas_width
+                height = waveform_canvas_height
+                mid_y = height // 2
+                handle_w = 12.0
+                handle_h = 10.0
+
+                if not waveform_values:
+                    waveform_canvas.create_text(
+                        width // 2,
+                        mid_y,
+                        text="Waveform preview unavailable",
+                        fill="#8aa6c8",
+                        font=("Segoe UI", 9),
+                    )
+                else:
+                    bar_count = len(waveform_values)
+                    bar_w = max(1.0, float(width) / float(bar_count))
+                    for idx, amp in enumerate(waveform_values):
+                        x0 = idx * bar_w
+                        x1 = x0 + max(1.0, bar_w - 0.6)
+                        half_h = max(1.0, amp * (height * 0.45))
+                        waveform_canvas.create_rectangle(
+                            x0,
+                            mid_y - half_h,
+                            x1,
+                            mid_y + half_h,
+                            fill="#4ea8de",
+                            outline="",
+                        )
+
+                start_x = (start_s / max_end_s) * width if max_end_s > 0 else 0.0
+                end_x = (end_s / max_end_s) * width if max_end_s > 0 else float(width)
+                playhead_x = (playhead_s / max_end_s) * width if max_end_s > 0 else 0.0
+                start_x = max(0.0, min(float(width), start_x))
+                end_x = max(0.0, min(float(width), end_x))
+                playhead_x = max(0.0, min(float(width), playhead_x))
+
+                if start_x > 0:
+                    waveform_canvas.create_rectangle(0, 0, start_x, height, fill="#0b1018", outline="", stipple="gray50")
+                if end_x < width:
+                    waveform_canvas.create_rectangle(end_x, 0, width, height, fill="#0b1018", outline="", stipple="gray50")
+
+                waveform_canvas.create_line(start_x, 0, start_x, height, fill="#ffd166", width=2)
+                waveform_canvas.create_line(end_x, 0, end_x, height, fill="#ef476f", width=2)
+                waveform_canvas.create_line(playhead_x, 0, playhead_x, height, fill="#f5f9ff", width=1)
+
+                waveform_canvas.create_rectangle(
+                    start_x - (handle_w / 2.0),
+                    0,
+                    start_x + (handle_w / 2.0),
+                    handle_h,
+                    fill="#1e2430",
+                    outline="#ffd166",
+                    width=2,
+                )
+                waveform_canvas.create_rectangle(
+                    end_x - (handle_w / 2.0),
+                    0,
+                    end_x + (handle_w / 2.0),
+                    handle_h,
+                    fill="#1e2430",
+                    outline="#ef476f",
+                    width=2,
+                )
+
+            def _update_playhead_visual() -> None:
+                start_s = float(start_var.get())
+                end_s = float(end_var.get())
+                playhead_s = max(0.0, min(float(playhead_var.get()), max_end_s))
+                playhead_var.set(playhead_s)
+                _draw_waveform_overlay(start_s, end_s, playhead_s)
+
+            def _set_playhead_seconds(value: float) -> None:
+                playhead_var.set(max(0.0, min(float(value), max_end_s)))
+                playhead_label_var.set(_format_seconds_label(float(playhead_var.get())))
+                _update_playhead_visual()
+
+            def _clamp_points(changed: str) -> tuple[float, float]:
+                start_s = max(0.0, min(float(start_var.get()), max_end_s))
+                end_s = max(0.0, min(float(end_var.get()), max_end_s))
+                minimum_gap = 0.1
+
+                if changed == "start" and start_s > (end_s - minimum_gap):
+                    end_s = min(max_end_s, start_s + minimum_gap)
+                if changed == "end" and end_s < (start_s + minimum_gap):
+                    start_s = max(0.0, end_s - minimum_gap)
+                if end_s < (start_s + minimum_gap):
+                    end_s = min(max_end_s, start_s + minimum_gap)
+
+                start_var.set(start_s)
+                end_var.set(end_s)
+                current_head = max(start_s, min(float(playhead_var.get()), end_s))
+                playhead_var.set(current_head)
+                playhead_label_var.set(_format_seconds_label(current_head))
+                start_input_var.set(_format_seconds_label(start_s))
+                end_input_var.set(_format_seconds_label(end_s))
+                total_label_var.set(_format_seconds_label(end_s - start_s))
+                _draw_waveform_overlay(start_s, end_s, current_head)
+                return (start_s, end_s)
+
+            def _set_point_from_canvas_x(changed: str, canvas_x: float) -> None:
+                width = float(waveform_canvas_width)
+                clamped_x = max(0.0, min(width, float(canvas_x)))
+                new_time = (clamped_x / width) * max_end_s if width > 0 else 0.0
+                if changed == "start":
+                    start_var.set(new_time)
+                    _clamp_points("start")
+                else:
+                    end_var.set(new_time)
+                    _clamp_points("end")
+
+            def _is_trim_preview_playing() -> bool:
+                process = active_players.get(working_audio_path)
+                return process is not None and process.poll() is None
+
+            def _refresh_play_pause_label() -> None:
+                play_pause_label_var.set("⏸" if _is_trim_preview_playing() else "▶")
+
+            def _start_playback_from(play_from_s: float) -> None:
+                nonlocal playback_started_at, playback_start_offset_s, playback_end_offset_s
+                clip_end_s = max_end_s
+                play_from = max(0.0, min(float(play_from_s), clip_end_s))
+                if play_from >= clip_end_s:
+                    play_from = max(0.0, clip_end_s - 0.05)
+                ok = _preview_audio_segment(working_audio_path, play_from, clip_end_s)
+                if ok:
+                    playback_start_offset_s = play_from
+                    playback_end_offset_s = clip_end_s
+                    playback_started_at = time.monotonic()
+                    _set_playhead_seconds(play_from)
+                _refresh_play_pause_label()
+
+            def _resume_after_seek_if_needed() -> None:
+                if bool(drag_state.get("resume_after_seek", False)):
+                    _start_playback_from(float(playhead_var.get()))
+                else:
+                    _refresh_play_pause_label()
+
+            def _on_waveform_press(event: Any) -> None:
+                start_s = float(start_var.get())
+                end_s = float(end_var.get())
+                width = float(waveform_canvas_width)
+                handle_w = 12.0
+                handle_h = 10.0
+                start_x = (start_s / max_end_s) * width if max_end_s > 0 else 0.0
+                end_x = (end_s / max_end_s) * width if max_end_s > 0 else width
+                click_x = float(event.x)
+                click_y = float(event.y)
+
+                drag_state["mode"] = None
+                drag_state["resume_after_seek"] = False
+
+                if click_y <= handle_h and abs(click_x - start_x) <= (handle_w / 2.0 + 2.0):
+                    drag_state["mode"] = "start"
+                    _set_point_from_canvas_x("start", click_x)
+                    return
+
+                if click_y <= handle_h and abs(click_x - end_x) <= (handle_w / 2.0 + 2.0):
+                    drag_state["mode"] = "end"
+                    _set_point_from_canvas_x("end", click_x)
+                    return
+
+                drag_state["mode"] = "playhead"
+                resume_after_seek = _is_trim_preview_playing()
+                drag_state["resume_after_seek"] = resume_after_seek
+                if resume_after_seek:
+                    stop_media(working_audio_path)
+
+                clamped_x = max(0.0, min(width, click_x))
+                new_time = (clamped_x / width) * max_end_s if width > 0 else 0.0
+                _set_playhead_seconds(new_time)
+
+            def _on_waveform_drag(event: Any) -> None:
+                active_mode = drag_state.get("mode")
+                if active_mode in {"start", "end"}:
+                    _set_point_from_canvas_x(str(active_mode), float(event.x))
+                    return
+
+                if active_mode == "playhead":
+                    width = float(waveform_canvas_width)
+                    clamped_x = max(0.0, min(width, float(event.x)))
+                    new_time = (clamped_x / width) * max_end_s if width > 0 else 0.0
+                    _set_playhead_seconds(new_time)
+
+            def _on_waveform_release(_event: Any) -> None:
+                if drag_state.get("mode") == "playhead":
+                    _resume_after_seek_if_needed()
+                drag_state["mode"] = None
+                drag_state["resume_after_seek"] = False
+
+            def _apply_time_entry(changed: str) -> None:
+                raw_value = start_input_var.get() if changed == "start" else end_input_var.get()
+                parsed = _parse_time_input(raw_value)
+                if parsed is None:
+                    self.messagebox.showerror(
+                        "Trim Audio",
+                        "Invalid time value. Use seconds (e.g. 12.5), mm:ss, or hh:mm:ss.",
+                        parent=trim_prompt,
+                    )
+                    _clamp_points(changed)
+                    return
+                if changed == "start":
+                    start_var.set(parsed)
+                else:
+                    end_var.set(parsed)
+                _clamp_points(changed)
+
+            waveform_canvas.bind("<Button-1>", _on_waveform_press)
+            waveform_canvas.bind("<B1-Motion>", _on_waveform_drag)
+            waveform_canvas.bind("<ButtonRelease-1>", _on_waveform_release)
+            in_entry.bind("<Return>", lambda _event: _apply_time_entry("start"))
+            in_entry.bind("<KP_Enter>", lambda _event: _apply_time_entry("start"))
+            out_entry.bind("<Return>", lambda _event: _apply_time_entry("end"))
+            out_entry.bind("<KP_Enter>", lambda _event: _apply_time_entry("end"))
+            _clamp_points("start")
+
+            def _poll_playback_state() -> None:
+                nonlocal playback_poll_after_id
+                if not trim_prompt.winfo_exists():
+                    playback_poll_after_id = None
+                    return
+                if _is_trim_preview_playing():
+                    elapsed_s = max(0.0, time.monotonic() - playback_started_at)
+                    current_s = min(playback_end_offset_s, playback_start_offset_s + elapsed_s)
+                    _set_playhead_seconds(current_s)
+                _refresh_play_pause_label()
+                playback_poll_after_id = trim_prompt.after(180, _poll_playback_state)
+
+            def _toggle_play_pause() -> None:
+                if _is_trim_preview_playing():
+                    stop_media(working_audio_path)
+                    _refresh_play_pause_label()
+                    return
+                current_head = float(playhead_var.get())
+                if current_head < 0.0 or current_head >= max_end_s:
+                    current_head = 0.0
+                    _set_playhead_seconds(current_head)
+                _start_playback_from(current_head)
+
+            def _refresh_working_clip_state() -> None:
+                nonlocal waveform_values, max_end_s, playback_end_offset_s
+                updated_duration = _audio_duration_seconds(working_audio_path)
+                if updated_duration is None or updated_duration <= 0:
+                    raise RuntimeError("Could not determine edited clip duration.")
+                max_end_s = float(updated_duration)
+                duration_label_var.set(f"Duration: {_format_seconds_label(max_end_s)}")
+                playback_end_offset_s = max_end_s
+                start_var.set(0.0)
+                end_var.set(max_end_s)
+                playhead_var.set(0.0)
+                try:
+                    waveform_values = _extract_waveform_bins(working_audio_path, waveform_bins_count)
+                except Exception:
+                    waveform_values = []
+                _clamp_points("start")
+                _refresh_play_pause_label()
+
+            def _apply_trim_to_working() -> None:
+                start_s, end_s = _clamp_points("start")
+                segment_len = end_s - start_s
+                if segment_len <= 0.0:
+                    self.messagebox.showerror("Trim Audio", "Trim length must be greater than 0.", parent=trim_prompt)
+                    return
+
+                stop_media(working_audio_path)
+                temp_out = working_audio_path.with_name(f"{working_audio_path.stem}__trim_apply.wav")
+                ffmpeg_cmd = [
+                    ffmpeg_executable,
+                    "-y",
+                    "-nostdin",
+                    "-loglevel",
+                    "error",
+                    "-ss",
+                    f"{start_s:.3f}",
+                    "-to",
+                    f"{end_s:.3f}",
+                    "-i",
+                    str(working_audio_path),
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "44100",
+                    "-acodec",
+                    "pcm_s16le",
+                    str(temp_out),
+                ]
+                ffmpeg_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=False)
+                if ffmpeg_result.returncode != 0:
+                    stderr_text = (ffmpeg_result.stderr or "").strip()
+                    self.messagebox.showerror(
+                        "Trim Audio",
+                        stderr_text or "ffmpeg trim command failed.",
+                        parent=trim_prompt,
+                    )
+                    return
+
+                try:
+                    if working_audio_path.exists():
+                        working_audio_path.unlink()
+                    shutil.move(str(temp_out), str(working_audio_path))
+                    _refresh_working_clip_state()
+                except OSError as exc:
+                    self.messagebox.showerror("Trim Audio", f"Could not finalize trimmed clip:\n{exc}", parent=trim_prompt)
+                    return
+
+            def _adopt_generated_variant(suffix: str) -> bool:
+                variants: list[Path] = []
+                stem_prefix = f"{working_audio_path.stem}_{suffix}"
+                for ext in ("wav", "flac"):
+                    for path in working_audio_path.parent.iterdir():
+                        if not path.is_file():
+                            continue
+                        if path.suffix.lower() != f".{ext}":
+                            continue
+                        if path.name.startswith(stem_prefix):
+                            variants.append(path)
+
+                # Fallback for tools that encode model/tag names rather than our suffix.
+                if not variants and suffix == "mbr":
+                    for ext in ("wav", "flac"):
+                        for path in working_audio_path.parent.iterdir():
+                            if not path.is_file():
+                                continue
+                            if path.suffix.lower() != f".{ext}":
+                                continue
+                            name_lower = path.name.lower()
+                            if path.name.startswith(working_audio_path.stem) and "melband" in name_lower and "roformer" in name_lower:
+                                variants.append(path)
+                if not variants:
+                    self.log(
+                        f"[Dataset Editor] Could not find generated variant for suffix '{suffix}' in '{working_audio_path.parent}'"
+                    )
+                    return False
+                variants.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                chosen = variants[0]
+
+                last_error: OSError | None = None
+                for _attempt in range(8):
+                    try:
+                        stop_media(working_audio_path)
+                        if working_audio_path.exists():
+                            working_audio_path.unlink()
+                        shutil.move(str(chosen), str(working_audio_path))
+                        for stale in variants[1:]:
+                            try:
+                                stale.unlink()
+                            except OSError:
+                                pass
+                        variant_caption = chosen.with_suffix(".txt")
+                        if variant_caption.exists():
+                            try:
+                                variant_caption.unlink()
+                            except OSError:
+                                pass
+                        return True
+                    except OSError as exc:
+                        last_error = exc
+                        time.sleep(0.08)
+
+                if last_error is not None:
+                    self.log(
+                        f"[Dataset Editor] Failed to adopt generated variant '{chosen.name}': {last_error}"
+                    )
+                return False
+
+            def _normalize_current_clip() -> None:
+                processed_count, errors = _run_normalize_audio_gain([working_audio_path])
+                if processed_count <= 0:
+                    self.messagebox.showerror("Normalize", f"Normalize failed ({errors} error(s)).", parent=trim_prompt)
+                    return
+                if not _adopt_generated_variant("norm"):
+                    self.messagebox.showerror("Normalize", "Normalized output was not found.", parent=trim_prompt)
+                    return
+                _refresh_working_clip_state()
+
+            def _enhance_current_clip(preset_key: str) -> None:
+                label = "Denoise" if preset_key == "deepfilternet" else "Remove Music"
+                processed_count, errors = _run_audio_enhancement_preset([working_audio_path], preset_key)
+                if processed_count <= 0:
+                    if preset_key == "deepfilternet":
+                        self.messagebox.showerror(
+                            label,
+                            "Denoise failed in this environment (torchaudio.backend mismatch).",
+                            parent=trim_prompt,
+                        )
+                    else:
+                        self.messagebox.showerror(label, f"{label} failed ({errors} error(s)).", parent=trim_prompt)
+                    return
+                expected_suffix = "dfn" if preset_key == "deepfilternet" else "mbr"
+                if not _adopt_generated_variant(expected_suffix):
+                    self.messagebox.showerror(label, f"{label} output was not found.", parent=trim_prompt)
+                    return
+                _refresh_working_clip_state()
+
+            def _cancel_trim_prompt() -> None:
+                nonlocal playback_poll_after_id
+                stop_media(working_audio_path)
+                if playback_poll_after_id is not None:
+                    try:
+                        trim_prompt.after_cancel(playback_poll_after_id)
+                    except Exception:
+                        pass
+                    playback_poll_after_id = None
+                for stale_path in (working_audio_path, temp_caption_path):
+                    try:
+                        if stale_path.exists():
+                            stale_path.unlink()
+                    except OSError:
+                        pass
+                for stale in working_audio_path.parent.iterdir():
+                    if not stale.is_file():
+                        continue
+                    if stale.suffix.lower() != ".wav":
+                        continue
+                    if stale.name.startswith(f"{working_audio_path.stem}_"):
+                        try:
+                            stale.unlink()
+                        except OSError:
+                            pass
+                try:
+                    shutil.rmtree(session_temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                trim_prompt.destroy()
+
+            def _commit_trim_prompt() -> None:
+                try:
+                    stop_media(working_audio_path)
+                    if normalized_audio_path.exists():
+                        normalized_audio_path.unlink()
+                    shutil.move(str(working_audio_path), str(normalized_audio_path))
+                    if temp_caption_path.exists():
+                        temp_caption_path.unlink()
+                except OSError as exc:
+                    self.messagebox.showerror("Trim Audio", f"Could not commit edited clip:\n{exc}", parent=trim_prompt)
+                    return
+                try:
+                    shutil.rmtree(session_temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                trim_prompt.destroy()
+                dialog.destroy()
+                self.root.after(0, lambda: self.open(dataset_name))
+
+            trim_holder = self.tk.Frame(values_trim_row, bg=self.bg_panel, bd=0)
+            trim_holder.grid(row=0, column=9, sticky="e")
+            trim_holder.pack_propagate(False)
+            trim_button = self.ttk.Button(trim_holder, text="Trim", command=_apply_trim_to_working)
+            trim_button.pack(fill="x", expand=True)
+
+            actions_row = self.ttk.Frame(root_frame)
+            actions_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+            actions_row.columnconfigure(1, weight=1)
+
+            play_group = self.ttk.Frame(actions_row)
+            play_group.grid(row=0, column=0, sticky="w")
+            self.ttk.Button(play_group, textvariable=play_pause_label_var, command=_toggle_play_pause, width=4).pack(side="left")
+
+            tools_row = self.ttk.Frame(actions_row)
+            tools_row.grid(row=0, column=1)
+            self.ttk.Button(tools_row, text="Normalize", command=_normalize_current_clip).grid(row=0, column=0, padx=(0, 6))
+            self.ttk.Button(tools_row, text="Denoise", command=lambda: _enhance_current_clip("deepfilternet")).grid(
+                row=0,
+                column=1,
+                padx=(0, 6),
+            )
+            self.ttk.Button(
+                tools_row,
+                text="Remove Music",
+                command=lambda: _enhance_current_clip("melband_roformer"),
+            ).grid(row=0, column=2, padx=(0, 6))
+
+            right_actions = self.ttk.Frame(actions_row)
+            right_actions.grid(row=0, column=2, sticky="e")
+            self.ttk.Button(right_actions, text="OK", command=_commit_trim_prompt).pack(side="left", padx=(0, 6))
+            self.ttk.Button(right_actions, text="Cancel", command=_cancel_trim_prompt).pack(side="left")
+
+            def _sync_trim_button_width() -> None:
+                if not trim_prompt.winfo_exists():
+                    return
+                try:
+                    right_actions.update_idletasks()
+                    target_width = max(80, int(right_actions.winfo_reqwidth()))
+                    target_height = max(26, int(right_actions.winfo_reqheight()))
+                    trim_holder.configure(width=target_width, height=target_height)
+                except Exception:
+                    pass
+
+            trim_prompt.after_idle(_sync_trim_button_width)
+
+            trim_prompt.protocol("WM_DELETE_WINDOW", _cancel_trim_prompt)
+            _refresh_play_pause_label()
+            _poll_playback_state()
+            self.center_window(trim_prompt)
+            trim_prompt.deiconify()
+
+            def _load_waveform_preview() -> None:
+                nonlocal waveform_values
+                if not trim_prompt.winfo_exists():
+                    return
+                try:
+                    waveform_values = _extract_waveform_bins(working_audio_path, waveform_bins_count)
+                except Exception:
+                    waveform_values = []
+                _clamp_points("start")
+
+            trim_prompt.after(10, _load_waveform_preview)
+            dialog.wait_window(trim_prompt)
+
         def _show_media_context_menu(event: Any, media_path: Path, media_kind: str) -> str:
             menu = self.tk.Menu(dialog, tearoff=0)
             menu.add_command(label="Open", command=lambda p=media_path: open_media_external(p))
@@ -2069,8 +3311,22 @@ class DatasetEditorWindow:
                     command=lambda p=media_path: _start_whisper_transcription([p], bool(replace_existing_var.get())),
                 )
                 menu.add_command(
+                    label="Normalize Gain",
+                    command=lambda p=media_path: _start_normalize_audio_gain([p]),
+                )
+                menu.add_command(
+                    label="Trim...",
+                    command=lambda p=media_path: _open_trim_audio_dialog(p),
+                )
+                menu.add_command(
                     label="Auto-Split...",
                     command=lambda p=media_path: _start_auto_split_audio([p]),
+                )
+            elif media_kind == "video":
+                menu.add_separator()
+                menu.add_command(
+                    label="Extract Audio",
+                    command=lambda p=media_path: _start_extract_audio_from_videos([p]),
                 )
             menu.add_separator()
             menu.add_command(label="Delete", command=lambda p=media_path: _delete_media_item(p, ask_confirmation=True))
@@ -2158,10 +3414,29 @@ class DatasetEditorWindow:
             thumb_refs.append(photo)
             image_label = self.ttk.Label(item_frame, image=photo, anchor="center")
             image_label.grid(row=0, column=0, sticky="n")
-            image_label.bind("<Double-Button-1>", lambda _event, p=media_path, k=media_kind: play_media(p, k))
+            if media_kind == "audio":
+                image_label.bind("<Double-Button-1>", lambda _event, p=media_path: _open_trim_audio_dialog(p))
+            else:
+                image_label.bind("<Double-Button-1>", lambda _event, p=media_path, k=media_kind: play_media(p, k))
             image_label.bind("<MouseWheel>", on_editor_mousewheel)
             image_label.bind("<Button-4>", on_editor_linux_up)
             image_label.bind("<Button-5>", on_editor_linux_down)
+
+            play_badge = self.tk.Button(
+                item_frame,
+                text=">",
+                command=lambda p=media_path, k=media_kind: play_media(p, k),
+                bg="#121a27",
+                fg="#d8ecff",
+                activebackground="#1f2b3f",
+                activeforeground="#ffffff",
+                relief="flat",
+                borderwidth=0,
+                padx=6,
+                pady=1,
+                cursor="hand2",
+            )
+            play_badge.place(in_=image_label, relx=1.0, rely=1.0, x=-8, y=-8, anchor="se")
 
             name_label = self.ttk.Label(
                 item_frame,
@@ -2226,6 +3501,12 @@ class DatasetEditorWindow:
         transcribe_all_button.configure(
             command=lambda: _start_whisper_transcription(audio_paths, bool(replace_existing_var.get()))
         )
+        extract_audio_button.configure(
+            command=lambda: _start_extract_audio_from_videos(video_paths)
+        )
+        normalize_audio_button.configure(
+            command=lambda: _start_normalize_audio_gain(audio_paths)
+        )
 
         def close_editor() -> None:
             for text_widget in list(caption_path_by_widget.keys()):
@@ -2244,7 +3525,7 @@ class DatasetEditorWindow:
         footer_text_color = getattr(self, "fg_muted", self.fg_text)
         self.tk.Label(
             footer,
-            text="Double-click audio tiles to play or stop. Captions auto-save as .txt sidecar files.",
+            text="Double-click audio tiles to open trim/tools. Use > on each tile for quick play/pause. Right-click for more actions.",
             bg=self.bg_panel,
             fg=footer_text_color,
             anchor="w",
