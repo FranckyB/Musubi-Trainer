@@ -1600,7 +1600,50 @@ class DatasetEditorWindow:
                         if sub_text:
                             final_segments.append((all_words[sub_start_idx].start_time, all_words[last_word_idx].end_time, sub_text))
 
-                segments = final_segments
+                # Hard safety pass: if punctuation-based splitting cannot reduce duration
+                # (e.g. long span without commas), enforce max_duration by word timings.
+                strict_segments: list[tuple[float, float, str]] = []
+                for seg_start, seg_end, seg_text in final_segments:
+                    seg_duration = seg_end - seg_start
+                    if seg_duration <= max_duration:
+                        strict_segments.append((seg_start, seg_end, seg_text))
+                        continue
+
+                    seg_word_indices = [
+                        i
+                        for i, w in enumerate(all_words)
+                        if w.start_time >= seg_start - 0.01 and w.end_time <= seg_end + 0.01
+                    ]
+                    if not seg_word_indices:
+                        strict_segments.append((seg_start, seg_end, seg_text))
+                        continue
+
+                    chunk_start_idx = seg_word_indices[0]
+                    last_word_idx = seg_word_indices[-1]
+                    while chunk_start_idx <= last_word_idx:
+                        chunk_end_idx = chunk_start_idx
+                        while chunk_end_idx < last_word_idx:
+                            next_idx = chunk_end_idx + 1
+                            next_duration = all_words[next_idx].end_time - all_words[chunk_start_idx].start_time
+                            if next_duration > max_duration:
+                                break
+                            chunk_end_idx = next_idx
+
+                        chunk_text = " ".join(get_word_text(j) for j in range(chunk_start_idx, chunk_end_idx + 1)).strip()
+                        if chunk_text:
+                            strict_segments.append(
+                                (
+                                    all_words[chunk_start_idx].start_time,
+                                    all_words[chunk_end_idx].end_time,
+                                    chunk_text,
+                                )
+                            )
+
+                        if chunk_end_idx >= last_word_idx:
+                            break
+                        chunk_start_idx = chunk_end_idx + 1
+
+                segments = strict_segments
 
             if discard_under > 0:
                 segments = [s for s in segments if (s[1] - s[0]) >= discard_under]
@@ -3424,7 +3467,7 @@ class DatasetEditorWindow:
 
             play_badge = self.tk.Button(
                 item_frame,
-                text=">",
+                text="▶",
                 command=lambda p=media_path, k=media_kind: play_media(p, k),
                 bg="#121a27",
                 fg="#d8ecff",
@@ -3432,11 +3475,12 @@ class DatasetEditorWindow:
                 activeforeground="#ffffff",
                 relief="flat",
                 borderwidth=0,
-                padx=6,
-                pady=1,
+                font=("Segoe UI Symbol", 12, "bold"),
+                padx=10,
+                pady=4,
                 cursor="hand2",
             )
-            play_badge.place(in_=image_label, relx=1.0, rely=1.0, x=-8, y=-8, anchor="se")
+            play_badge.place(in_=image_label, relx=1.0, rely=1.0, x=-10, y=-10, anchor="se")
 
             name_label = self.ttk.Label(
                 item_frame,

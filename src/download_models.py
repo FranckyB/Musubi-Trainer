@@ -679,13 +679,15 @@ def find_in_extra_paths(
     if not info:
         return None
     target_name = Path(info["filename"]).name
+    target_lower = target_name.casefold()
     for root_dir in extra_paths:
         root = Path(root_dir)
         if not root.is_dir():
             continue
         for dirpath, _dirs, files in os.walk(root):
-            if target_name in files:
-                candidate = Path(dirpath) / target_name
+            match_name = next((name for name in files if name.casefold() == target_lower), None)
+            if match_name:
+                candidate = Path(dirpath) / match_name
                 if candidate.is_file():
                     return candidate
     return None

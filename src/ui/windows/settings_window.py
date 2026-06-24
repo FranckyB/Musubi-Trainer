@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 # pyright: reportUndefinedVariable=false, reportGeneralTypeIssues=false
 
+import os
 from pathlib import Path
 import json
 import re
@@ -167,8 +168,9 @@ class SettingsWindow:
             found_count = 0
             for mn, comps in self.DOWNLOAD_MODELS.items():
                 for comp in comps:
-                    if pending_model_paths.get(mn, {}).get(comp):
-                        continue  # already set
+                    existing = pending_model_paths.get(mn, {}).get(comp, "").strip()
+                    if _is_existing_file_path(existing):
+                        continue  # already set and valid
                     hit = self.find_component(mn, comp, ws_root, extra or None)
                     if hit is not None:
                         pending_model_paths.setdefault(mn, {})[comp] = str(hit)
@@ -202,17 +204,49 @@ class SettingsWindow:
         models_inner.columnconfigure(0, weight=1)
         _mw_id = models_canvas.create_window((0, 0), window=models_inner, anchor="nw")
 
+        def _models_canvas_has_scrollable_content() -> bool:
+            try:
+                region = models_canvas.cget("scrollregion")
+                if not region:
+                    return False
+                parts = [float(v) for v in str(region).split()]
+                if len(parts) != 4:
+                    return False
+                content_h = max(0.0, parts[3] - parts[1])
+                viewport_h = float(max(1, models_canvas.winfo_height()))
+                return content_h > (viewport_h + 1.0)
+            except Exception:
+                return False
+
+        def _clamp_models_scroll() -> None:
+            if not _models_canvas_has_scrollable_content():
+                try:
+                    models_canvas.yview_moveto(0.0)
+                except Exception:
+                    pass
+
+        def _on_models_mousewheel(event: Any) -> str:
+            if not _models_canvas_has_scrollable_content():
+                _clamp_models_scroll()
+                return "break"
+            delta = int(-1 * (event.delta / 120)) if getattr(event, "delta", 0) else 0
+            if delta != 0:
+                models_canvas.yview_scroll(delta, "units")
+            return "break"
+
         def _on_models_inner_configure(event: Any) -> None:
             models_canvas.configure(scrollregion=models_canvas.bbox("all"))
+            _clamp_models_scroll()
 
         def _on_models_canvas_configure(event: Any) -> None:
             models_canvas.itemconfig(_mw_id, width=event.width)
 
         models_inner.bind("<Configure>", _on_models_inner_configure)
         models_canvas.bind("<Configure>", _on_models_canvas_configure)
+        models_canvas.bind("<MouseWheel>", _on_models_mousewheel)
 
         def _bind_mousewheel(widget: Any) -> None:
-            widget.bind("<MouseWheel>", lambda e: models_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+            widget.bind("<MouseWheel>", _on_models_mousewheel)
             for child in widget.winfo_children():
                 _bind_mousewheel(child)
 
@@ -446,6 +480,7 @@ class SettingsWindow:
 
         # ── Model family sections ─────────────────────────────────────────
         _status_vars: dict[str, Any] = {}
+        _component_label_widgets: dict[tuple[str, str], Any] = {}
 
         _COMPONENT_LABELS: dict[str, str] = {
             "dit": "Model",
@@ -455,23 +490,77 @@ class SettingsWindow:
             "clip": "CLIP",
         }
 
+        def _normalize_candidate_path(path_value: str) -> str:
+            raw = str(path_value or "").strip()
+            if not raw:
+                return ""
+            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
+                raw = raw[1:-1].strip()
+            return raw
+
+        def _is_existing_file_path(path_value: str) -> bool:
+            candidate_raw = _normalize_candidate_path(path_value)
+            if not candidate_raw:
+                return False
+            expanded = os.path.expandvars(candidate_raw)
+            p = self.Path(expanded).expanduser()
+            if p.is_file():
+                return True
+            if not p.is_absolute():
+                ws_candidate = self.download_workspace_root() / p
+                if ws_candidate.is_file():
+                    return True
+            return False
+
+        def _component_display_label(model_name: str, component: str) -> str:
+            comp_label = _COMPONENT_LABELS.get(component, component.capitalize())
+            comp_info = self.DOWNLOAD_MODELS.get(model_name, {}).get(component, {})
+            folder_name = comp_info.get("folder_name", "")
+            friendly = self.DOWNLOAD_COMPONENT_FRIENDLY_NAMES.get(folder_name, "")
+            return f"{comp_label} ({friendly})" if friendly else comp_label
+
+        def _model_found_missing_labels(model_name: str) -> tuple[list[str], list[str]]:
+            components = list(self.DOWNLOAD_MODELS.get(model_name, {}).keys())
+            stored = pending_model_paths.get(model_name, {})
+            found_labels: list[str] = []
+            missing_labels: list[str] = []
+            for comp in components:
+                label = _component_display_label(model_name, comp)
+                comp_path = str(stored.get(comp, "") or "").strip()
+                if _is_existing_file_path(comp_path):
+                    found_labels.append(label)
+                else:
+                    missing_labels.append(label)
+            return found_labels, missing_labels
+
         def _model_status_str(model_name: str) -> str:
             components = list(self.DOWNLOAD_MODELS.get(model_name, {}).keys())
             if not components:
                 return "Unknown"
-            from pathlib import Path as _P
-            stored = pending_model_paths.get(model_name, {})
-            found = sum(1 for c in components if stored.get(c) and _P(stored[c]).is_file())
+            found_labels, _missing_labels = _model_found_missing_labels(model_name)
+            found = len(found_labels)
             if found == 0:
                 return "Not configured"
             if found < len(components):
                 return f"Partial ({found}/{len(components)})"
             return "✓ Ready"
 
+        def _apply_component_label_color(model_name: str, component: str) -> None:
+            lbl = _component_label_widgets.get((model_name, component))
+            if lbl is None:
+                return
+            comp_path = str(pending_model_paths.get(model_name, {}).get(component, "") or "").strip()
+            if _is_existing_file_path(comp_path):
+                lbl.configure(foreground=self.fg_text)
+            else:
+                lbl.configure(foreground="#f0b429")
+
         def _refresh_status(model_name: str) -> None:
             sv = _status_vars.get(model_name)
             if sv:
                 sv.set(_model_status_str(model_name))
+            for comp_name in self.DOWNLOAD_MODELS.get(model_name, {}).keys():
+                _apply_component_label_color(model_name, comp_name)
 
         def _apply_status_color(lbl: Any, sv: Any, *_a: object) -> None:
             val = sv.get()
@@ -573,9 +662,11 @@ class SettingsWindow:
                     cpv = self.tk.StringVar(value=stored_path)
                     _comp_path_vars[comp] = cpv
 
-                    self.ttk.Label(detail_frame, text=label_text, anchor="e").grid(
+                    comp_lbl = self.ttk.Label(detail_frame, text=label_text, anchor="e")
+                    comp_lbl.grid(
                         row=cr, column=0, sticky="e", padx=(0, 6), pady=1
                     )
+                    _component_label_widgets[(mn, comp)] = comp_lbl
                     path_entry = self.ttk.Entry(
                         detail_frame, textvariable=cpv, style="Flat.TEntry",
                     )
@@ -613,6 +704,7 @@ class SettingsWindow:
 
                 # Register vars so _scan_extra_path can update them
                 _comp_path_vars_all[mn] = _comp_path_vars
+                _refresh_status(mn)
 
                 def _toggle_detail(
                     btn: Any = expand_btn,
@@ -628,6 +720,7 @@ class SettingsWindow:
                         det.grid(row=1, column=0, sticky="ew")
                         var.set(True)
                         btn.configure(text=f"▼  {dn}")
+                    _clamp_models_scroll()
 
                 expand_btn.configure(command=_toggle_detail)
                 _bind_mousewheel(hdr)
@@ -649,6 +742,7 @@ class SettingsWindow:
                 body.grid(row=1, column=0, sticky="ew")
                 var.set(True)
                 btn.configure(text=f"▼  {family_name}")
+            _clamp_models_scroll()
 
         _family_row = 0
         for _fam_name, _fam_models in self.DOWNLOAD_MODEL_FAMILIES.items():
@@ -664,11 +758,10 @@ class SettingsWindow:
             hf_token = hf_token_var.get().strip() or None
             components = list(self.DOWNLOAD_MODELS.get(model_name, {}).keys())
 
-            from pathlib import Path as _P
             missing = [c for c in components if self.find_component(model_name, c, ws_root) is None]
             # Also check pending_model_paths
             stored = pending_model_paths.get(model_name, {})
-            missing = [c for c in missing if not (stored.get(c) and _P(stored.get(c, "")).is_file())]
+            missing = [c for c in missing if not _is_existing_file_path(str(stored.get(c, "") or ""))]
 
             if not missing:
                 self.messagebox.showinfo(
@@ -703,6 +796,15 @@ class SettingsWindow:
             progress_state: dict[str, float] = {"completed_units": 0.0}
             progress_label_var = self.tk.StringVar(value=f"Preparing download for {model_name}...")
             progress_pct_var = self.tk.StringVar(value="0%")
+            cancel_download_event = self.threading.Event()
+            cancelled_holder: dict[str, bool] = {"value": False}
+            active_proc_holder: dict[str, Any] = {"proc": None}
+            component_runtime: dict[str, Any] = {
+                "name": None,
+                "started_at": 0.0,
+                "last_pct": 0.0,
+                "last_pct_at": 0.0,
+            }
 
             progress_dialog = self.tk.Toplevel(dialog)
             progress_dialog.title("Downloading models")
@@ -710,7 +812,35 @@ class SettingsWindow:
             progress_dialog.resizable(False, False)
             progress_dialog.configure(bg=self.bg_panel)
             self.set_dark_title_bar(progress_dialog)
-            progress_dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+            def _safe_after_ui(callback: Any) -> None:
+                try:
+                    if dialog.winfo_exists():
+                        dialog.after(0, callback)
+                except Exception:
+                    pass
+
+            def _request_cancel_download() -> None:
+                if cancel_download_event.is_set():
+                    return
+                cancel_download_event.set()
+                cancelled_holder["value"] = True
+                progress_label_var.set(f"Cancelling download for {model_name}...")
+                self.log(f"━━━ Cancelling download: {model_name} ━━━")
+                proc = active_proc_holder.get("proc")
+                if proc is not None:
+                    try:
+                        if proc.poll() is None:
+                            proc.terminate()
+                    except Exception:
+                        pass
+                try:
+                    if progress_dialog.winfo_exists():
+                        progress_dialog.destroy()
+                except Exception:
+                    pass
+
+            progress_dialog.protocol("WM_DELETE_WINDOW", _request_cancel_download)
 
             progress_frame = self.ttk.Frame(progress_dialog, padding=12)
             progress_frame.grid(row=0, column=0, sticky="nsew")
@@ -739,11 +869,44 @@ class SettingsWindow:
                 units = float(component_units.get(comp, 1))
                 bounded_pct = max(0.0, min(100.0, pct))
                 value_units = progress_state["completed_units"] + ((bounded_pct / 100.0) * units)
+                component_runtime["last_pct"] = bounded_pct
+                component_runtime["last_pct_at"] = time.time()
                 _set_progress_ui(f"Downloading {model_name}: {comp} ({int(round(bounded_pct))}%)", value_units)
 
             def _complete_component_progress(comp: str) -> None:
                 progress_state["completed_units"] += float(component_units.get(comp, 1))
+                if component_runtime.get("name") == comp:
+                    component_runtime["name"] = None
                 _set_progress_ui(f"Completed {model_name}: {comp}", progress_state["completed_units"])
+
+            def _progress_tick() -> None:
+                if cancel_download_event.is_set():
+                    return
+                try:
+                    if not progress_dialog.winfo_exists():
+                        return
+                except Exception:
+                    return
+
+                active_component = component_runtime.get("name")
+                if active_component:
+                    elapsed = max(0.0, time.time() - float(component_runtime.get("started_at", 0.0) or 0.0))
+                    inferred_pct = min(95.0, elapsed * 1.2)
+                    known_pct = float(component_runtime.get("last_pct", 0.0) or 0.0)
+                    show_pct = max(known_pct, inferred_pct)
+                    units = float(component_units.get(active_component, 1))
+                    value_units = progress_state["completed_units"] + ((show_pct / 100.0) * units)
+                    _set_progress_ui(
+                        f"Downloading {model_name}: {active_component} ({int(round(show_pct))}%)",
+                        value_units,
+                    )
+
+                try:
+                    progress_dialog.after(700, _progress_tick)
+                except Exception:
+                    pass
+
+            progress_dialog.after(700, _progress_tick)
 
             # Resolve which Python to use — prefer the configured Musubi-Tuner venv
             # so that huggingface_hub is available and the process has a real stdout.
@@ -764,6 +927,9 @@ class SettingsWindow:
 
             def _do_download() -> None:
                 for comp in missing:
+                    if cancel_download_event.is_set():
+                        cancelled_holder["value"] = True
+                        break
                     cmd = [
                         python_exe, cli_script,
                         "--model", model_name,
@@ -775,7 +941,11 @@ class SettingsWindow:
                         cmd += ["--token", hf_token]
 
                     self.log(f"  ↓ {comp}…")
-                    dialog.after(0, lambda c=comp: _set_progress_ui(f"Starting {model_name}: {c}...", progress_state["completed_units"]))
+                    _safe_after_ui(lambda c=comp: _set_progress_ui(f"Starting {model_name}: {c}...", progress_state["completed_units"]))
+                    component_runtime["name"] = comp
+                    component_runtime["started_at"] = time.time()
+                    component_runtime["last_pct"] = 0.0
+                    component_runtime["last_pct_at"] = 0.0
                     _progress_stop = self.threading.Event()
 
                     def _progress_heartbeat(component: str = comp) -> None:
@@ -795,11 +965,20 @@ class SettingsWindow:
                             encoding="utf-8",
                             errors="replace",
                         )
+                        active_proc_holder["proc"] = proc
                         comp_result: str | None = None
                         assert proc.stdout is not None
                         # Read with \r awareness so tqdm in-place updates stream through.
                         _buf = ""
                         while True:
+                            if cancel_download_event.is_set():
+                                cancelled_holder["value"] = True
+                                try:
+                                    if proc.poll() is None:
+                                        proc.terminate()
+                                except Exception:
+                                    pass
+                                break
                             chunk = proc.stdout.read(256)
                             if not chunk:
                                 break
@@ -820,7 +999,7 @@ class SettingsWindow:
                                         match = self.re.search(r"(\d{1,3})%", trimmed)
                                         if match:
                                             pct = float(match.group(1))
-                                            dialog.after(0, lambda c=comp, p=pct: _set_component_progress(c, p))
+                                            _safe_after_ui(lambda c=comp, p=pct: _set_component_progress(c, p))
                                 else:
                                     line = _buf[:nl].rstrip("\r")
                                     _buf = _buf[nl + 1:]
@@ -832,17 +1011,20 @@ class SettingsWindow:
                                         match = self.re.search(r"(\d{1,3})%", trimmed)
                                         if match:
                                             pct = float(match.group(1))
-                                            dialog.after(0, lambda c=comp, p=pct: _set_component_progress(c, p))
+                                            _safe_after_ui(lambda c=comp, p=pct: _set_component_progress(c, p))
                         if _buf.strip():
                             self.log(f"    {_buf.strip()}")
                         proc.wait()
+                        if cancel_download_event.is_set() or cancelled_holder["value"]:
+                            cancelled_holder["value"] = True
+                            break
                         if proc.returncode != 0:
                             error_holder.append(
                                 f"Download of '{comp}' failed (exit {proc.returncode})"
                             )
                             break
                         self.log(f"  ✓ {comp} complete")
-                        dialog.after(0, lambda c=comp: _complete_component_progress(c))
+                        _safe_after_ui(lambda c=comp: _complete_component_progress(c))
                         if comp_result:
                             result_holder[comp] = comp_result
                             # Persist each component immediately after it downloads.
@@ -856,18 +1038,27 @@ class SettingsWindow:
                                 sv = _comp_path_vars_all.get(model_name, {}).get(c)
                                 if sv is not None:
                                     sv.set(p)
-                            dialog.after(0, _save_comp)
+                            _safe_after_ui(_save_comp)
                     except Exception as exc:
                         error_holder.append(str(exc))
                         break
                     finally:
+                        active_proc_holder["proc"] = None
                         _progress_stop.set()
 
-                dialog.after(0, _on_dl_done)
+                _safe_after_ui(_on_dl_done)
 
             def _on_dl_done() -> None:
                 if progress_dialog.winfo_exists():
                     progress_dialog.destroy()
+                if cancelled_holder["value"]:
+                    self.log(f"━━━ Cancelled: {model_name} ━━━")
+                    self.messagebox.showinfo(
+                        "Download cancelled",
+                        f"Download for '{model_name}' was cancelled.",
+                        parent=dialog,
+                    )
+                    return
                 if error_holder:
                     self.log(f"[ERROR] {error_holder[0]}")
                     self.messagebox.showerror("Download failed", error_holder[0], parent=dialog)
