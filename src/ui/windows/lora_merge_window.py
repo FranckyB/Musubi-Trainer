@@ -304,12 +304,11 @@ class LoraMergeWindow:
                 parent=self.root,
             )
             return
-        module_script = self.runtime_config.musubi_dir / "src" / "musubi_tuner" / "lora_post_hoc_ema.py"
-        root_script = self.runtime_config.musubi_dir / "lora_post_hoc_ema.py"
-        if not module_script.exists() and not root_script.exists():
+        compat_script = Path(__file__).resolve().parents[2] / "post_hoc_ema_compat.py"
+        if not compat_script.exists():
             self.messagebox.showerror(
                 "Merge unavailable",
-                "Could not find lora_post_hoc_ema.py in Musubi-Tuner.",
+                "Could not find post_hoc_ema_compat.py in Musubi-Trainer src folder.",
                 parent=self.root,
             )
             return
@@ -333,6 +332,13 @@ class LoraMergeWindow:
 
         run_env = self.os.environ.copy()
         musubi_src = str(self.runtime_config.musubi_dir / "src")
+        if not (self.runtime_config.musubi_dir / "src").exists():
+            self.messagebox.showerror(
+                "Merge unavailable",
+                "Could not find Musubi-Tuner src folder.",
+                parent=self.root,
+            )
+            return
         existing_pythonpath = run_env.get("PYTHONPATH", "")
         run_env["PYTHONPATH"] = musubi_src if not existing_pythonpath else f"{musubi_src}{self.os.pathsep}{existing_pythonpath}"
 
@@ -346,26 +352,16 @@ class LoraMergeWindow:
                 preset_name,
                 selected_files,
             )
-            command: list[str]
-            if module_script.exists():
-                command = [
-                    str(musubi_python),
-                    "-m",
-                    "musubi_tuner.lora_post_hoc_ema",
-                    *selected_files,
-                    "--output_file",
-                    str(output_path),
-                    *merge_mode_args,
-                ]
-            else:
-                command = [
-                    str(musubi_python),
-                    str(root_script),
-                    *selected_files,
-                    "--output_file",
-                    str(output_path),
-                    *merge_mode_args,
-                ]
+            command = [
+                str(musubi_python),
+                str(compat_script),
+                "--musubi_src",
+                musubi_src,
+                *selected_files,
+                "--output_file",
+                str(output_path),
+                *merge_mode_args,
+            ]
 
             self.log(
                 f"[Post-Hoc EMA] Merging {len(selected_files)} checkpoint(s) for '{target_name}' "
@@ -414,12 +410,11 @@ class LoraMergeWindow:
             )
             return
 
-        module_script = self.runtime_config.musubi_dir / "src" / "musubi_tuner" / "lora_post_hoc_ema.py"
-        root_script = self.runtime_config.musubi_dir / "lora_post_hoc_ema.py"
-        if not module_script.exists() and not root_script.exists():
+        compat_script = Path(__file__).resolve().parents[2] / "post_hoc_ema_compat.py"
+        if not compat_script.exists():
             self.messagebox.showerror(
                 "Merge unavailable",
-                "Could not find lora_post_hoc_ema.py in Musubi-Tuner.",
+                "Could not find post_hoc_ema_compat.py in Musubi-Trainer src folder.",
                 parent=self.root,
             )
             return
@@ -836,6 +831,13 @@ class LoraMergeWindow:
 
             run_env = self.os.environ.copy()
             musubi_src = str(self.runtime_config.musubi_dir / "src")
+            if not (self.runtime_config.musubi_dir / "src").exists():
+                self.messagebox.showerror(
+                    "Merge unavailable",
+                    "Could not find Musubi-Tuner src folder.",
+                    parent=dialog,
+                )
+                return
             existing_pythonpath = run_env.get("PYTHONPATH", "")
             run_env["PYTHONPATH"] = musubi_src if not existing_pythonpath else f"{musubi_src}{self.os.pathsep}{existing_pythonpath}"
 
@@ -843,28 +845,17 @@ class LoraMergeWindow:
             created_paths: list[Path] = []
             for merge_mode_label, merge_mode_suffix, merge_mode_args, preset_name in selected_jobs:
                 output_path = build_output_path(output_folder, output_name, merge_mode_suffix, preset_name)
-                command: list[str]
-                if module_script.exists():
-                    command = [
-                        str(musubi_python),
-                        "-m",
-                        "musubi_tuner.lora_post_hoc_ema",
-                        *selected_files,
-                        "--output_file",
-                        str(output_path),
-                        "--no_sort",
-                        *merge_mode_args,
-                    ]
-                else:
-                    command = [
-                        str(musubi_python),
-                        str(root_script),
-                        *selected_files,
-                        "--output_file",
-                        str(output_path),
-                        "--no_sort",
-                        *merge_mode_args,
-                    ]
+                command = [
+                    str(musubi_python),
+                    str(compat_script),
+                    "--musubi_src",
+                    musubi_src,
+                    *selected_files,
+                    "--output_file",
+                    str(output_path),
+                    "--no_sort",
+                    *merge_mode_args,
+                ]
 
                 self.log(
                     f"[LoRA Post-Hoc EMA Merge] Merging {len(selected_files)} LoRA(s) "
