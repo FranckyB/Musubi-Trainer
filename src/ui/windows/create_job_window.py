@@ -68,7 +68,13 @@ class CreateJobWindow:
         network_type_locked = existing_job is not None and job_status_value == "resume"
 
         def _clear_focus(event: EventType) -> None:
-            dialog.focus_set()
+            try:
+                if not dialog.winfo_exists():
+                    return
+                dialog.focus_set()
+            except self.tk.TclError:
+                # Ignore late key events dispatched after dialog teardown.
+                return
         
         dialog.bind_class("TEntry", "<Return>", _clear_focus)
         dialog.bind_class("TEntry", "<KP_Enter>", _clear_focus)
