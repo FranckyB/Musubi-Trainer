@@ -111,15 +111,19 @@ class DatasetEditorWindow:
         ).grid(row=0, column=0, sticky="w", pady=(0, 8))
 
         controls = self.ttk.Frame(outer)
-        controls.grid(row=1, column=0, sticky="w", pady=(0, 8))
+        controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        controls.columnconfigure(9, weight=1)
         autotag_all_var = self.tk.BooleanVar(master=dialog, value=False)
-        autotag_status_var = self.tk.StringVar(master=dialog, value="")
+        autotag_status_var = self.tk.StringVar(master=dialog, value="Captions auto-save as .txt sidecar files.")
         trigger_word_var = self.tk.StringVar(master=dialog, value="")
+        replace_find_var = self.tk.StringVar(master=dialog, value="")
+        replace_with_var = self.tk.StringVar(master=dialog, value="")
         caption_mode_choices = ["simple", "detailed", "extra", "mixed", "extra_mixed", "analyze"]
         caption_mode_var = self.tk.StringVar(master=dialog, value="simple")
         autotag_button: Any = None
         caption_button: Any = None
         detailed_button: Any = None
+        replace_apply_button: Any = None
 
         grid_host = self.tk.Frame(
             outer,
@@ -231,13 +235,13 @@ class DatasetEditorWindow:
 
         def _set_autotag_busy(is_busy: bool, status_text: str = "") -> None:
             button_state = "disabled" if is_busy else "normal"
-            for action_button in (caption_button, autotag_button, detailed_button):
+            for action_button in (caption_button, autotag_button, detailed_button, replace_apply_button):
                 if action_button is not None:
                     try:
                         action_button.configure(state=button_state)
                     except Exception:
                         pass
-            autotag_status_var.set(status_text)
+            autotag_status_var.set(status_text or "Captions auto-save as .txt sidecar files.")
 
         def _apply_trigger_word(text: str) -> str:
             trigger = trigger_word_var.get().strip().strip(",")
@@ -513,7 +517,7 @@ class DatasetEditorWindow:
         self.ttk.Entry(
             controls,
             textvariable=trigger_word_var,
-            width=24,
+            width=16,
             style="Flat.TEntry",
         ).grid(row=0, column=1, sticky="w", padx=(0, 10))
 
@@ -549,7 +553,23 @@ class DatasetEditorWindow:
             text="Replace All",
             variable=autotag_all_var,
         ).grid(row=0, column=7, sticky="w", padx=(12, 0))
-        self.ttk.Label(controls, textvariable=autotag_status_var, style="TLabel").grid(row=0, column=8, sticky="w", padx=(12, 0))
+
+        replace_controls = self.ttk.Frame(controls)
+        replace_controls.grid(row=0, column=10, sticky="e", padx=(24, 0))
+        self.ttk.Label(replace_controls, text="Replace:", style="TLabel").grid(row=0, column=0, sticky="e", padx=(0, 4))
+        self.ttk.Entry(
+            replace_controls,
+            textvariable=replace_find_var,
+            width=12,
+            style="Flat.TEntry",
+        ).grid(row=0, column=1, sticky="w", padx=(0, 8))
+        self.ttk.Label(replace_controls, text="With:", style="TLabel").grid(row=0, column=2, sticky="e", padx=(0, 4))
+        self.ttk.Entry(
+            replace_controls,
+            textvariable=replace_with_var,
+            width=12,
+            style="Flat.TEntry",
+        ).grid(row=0, column=3, sticky="w", padx=(0, 8))
 
         def _show_image_autotag_menu(event: Any, image_path: Path) -> str:
             def _delete_image_item(target_image_path: Path) -> None:
@@ -651,6 +671,76 @@ class DatasetEditorWindow:
             widget = event.widget
             if isinstance(widget, self.tk.Text):
                 flush_caption_save(widget)
+
+        def _apply_replace_to_all_captions() -> None:
+            find_text = replace_find_var.get()
+            replace_text = replace_with_var.get()
+            if find_text == "":
+                self.messagebox.showwarning(
+                    "Replace captions",
+                    "Enter text in Replace before applying.",
+                    parent=dialog,
+                )
+                return
+
+            # Commit any pending in-editor edits first so file contents are up to date.
+            for text_widget in list(caption_path_by_widget.keys()):
+                flush_caption_save(text_widget)
+
+            changed_count = 0
+            checked_count = 0
+            errors: list[str] = []
+
+            for image_path in image_paths:
+                caption_path = image_path.with_suffix(".txt")
+                if not caption_path.exists() or not caption_path.is_file():
+                    continue
+
+                checked_count += 1
+                try:
+                    original_text = caption_path.read_text(encoding="utf-8")
+                except OSError as exc:
+                    errors.append(f"{caption_path.name}: {exc}")
+                    continue
+
+                updated_text = original_text.replace(find_text, replace_text)
+                if updated_text == original_text:
+                    continue
+
+                try:
+                    caption_path.write_text(updated_text, encoding="utf-8")
+                except OSError as exc:
+                    errors.append(f"{caption_path.name}: {exc}")
+                    continue
+
+                changed_count += 1
+                widget = caption_widget_by_path.get(caption_path)
+                if widget is not None:
+                    widget.delete("1.0", "end")
+                    widget.insert("1.0", updated_text)
+                    widget.edit_modified(False)
+
+            autotag_status_var.set(
+                f"Replace applied: {changed_count} changed / {checked_count} checked"
+            )
+            self.log(
+                f"[Dataset Editor] Replace captions for '{dataset_name}': "
+                f"find='{find_text}' with='{replace_text}', changed={changed_count}, checked={checked_count}, errors={len(errors)}"
+            )
+
+            if errors:
+                self.messagebox.showerror(
+                    "Replace captions",
+                    "Some captions could not be updated:\n" + "\n".join(errors[:10]),
+                    parent=dialog,
+                )
+
+        replace_apply_button = self.ttk.Button(
+            replace_controls,
+            text="Apply",
+            command=_apply_replace_to_all_captions,
+        )
+        replace_apply_button.grid(row=0, column=4, sticky="w")
 
         def on_editor_inner_configure(_event: Any) -> None:
             editor_canvas.configure(scrollregion=editor_canvas.bbox("all"))
@@ -832,7 +922,7 @@ class DatasetEditorWindow:
         footer_text_color = getattr(self, "fg_muted", self.fg_text)
         self.tk.Label(
             footer,
-            text="Captions auto-save as .txt sidecar files.",
+            textvariable=autotag_status_var,
             bg=self.bg_panel,
             fg=footer_text_color,
             anchor="w",

@@ -1873,20 +1873,16 @@ def _launch_ui_impl() -> int:
                 p for p in archive_folder.iterdir()
                 if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTENSIONS
             ) if archive_folder.is_dir() else []
+            audio_clips = sorted(
+                p for p in archive_folder.iterdir()
+                if p.is_file() and p.suffix.lower() in VALID_AUDIO_EXTENSIONS
+            ) if archive_folder.is_dir() else []
             first_img = images[0] if images else None
+            has_audio = len(audio_clips) > 0
 
             # build thumbnail
             try:
-                if first_img:
-                    img = Image.open(first_img).convert("RGB")
-                    img.thumbnail((THUMB_PX, THUMB_PX), Image.LANCZOS)
-                    bg_img = Image.new("RGB", (THUMB_PX, THUMB_PX), (45, 45, 45))
-                    offset = ((THUMB_PX - img.width) // 2, (THUMB_PX - img.height) // 2)
-                    bg_img.paste(img, offset)
-                    photo = ImageTk.PhotoImage(bg_img, master=root)
-                else:
-                    placeholder = Image.new("RGB", (THUMB_PX, THUMB_PX), (45, 45, 45))
-                    photo = ImageTk.PhotoImage(placeholder, master=root)
+                photo = make_thumbnail(first_img, "pending", THUMB_PX, has_audio=has_audio)
             except Exception:
                 placeholder = Image.new("RGB", (THUMB_PX, THUMB_PX), (45, 45, 45))
                 photo = ImageTk.PhotoImage(placeholder, master=root)
@@ -1907,7 +1903,16 @@ def _launch_ui_impl() -> int:
             )
             name_label.pack(padx=4, pady=(0, 2))
 
-            count_text = f"{len(images)} image{'s' if len(images) != 1 else ''}"
+            image_count = len(images)
+            audio_count = len(audio_clips)
+            if audio_count > 0 and image_count == 0:
+                count_text = f"{audio_count} audio clip{'s' if audio_count != 1 else ''}"
+            elif image_count > 0 and audio_count == 0:
+                count_text = f"{image_count} image{'s' if image_count != 1 else ''}"
+            elif image_count > 0 and audio_count > 0:
+                count_text = f"{image_count} images, {audio_count} audio clips"
+            else:
+                count_text = "0 items"
             tk.Label(
                 card, text=count_text, fg=fg_muted, bg=bg_card,
                 font=("Segoe UI", 7),
