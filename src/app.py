@@ -784,6 +784,8 @@ def _launch_ui_impl() -> int:
     queue_drag_index: int | None = None
     queue_drag_moved = False
     queue_drag_allowed = False
+    queue_range_selecting = False
+    queue_range_anchor: int | None = None
     queue_row_drag_handles: dict[str, tk.Label] = {}
     queue_row_action_buttons: dict[str, tk.Label] = {}
     queue_row_thumb_labels: dict[str, tk.Label] = {}
@@ -1684,6 +1686,7 @@ def _launch_ui_impl() -> int:
         dependencies = {
             "DND_FILES": DND_FILES,
             "Path": Path,
+            "app_settings": app_settings,
             "attach_hover_tooltip": attach_hover_tooltip,
             "bg_panel": bg_panel,
             "border_dark": border_dark,
@@ -1703,6 +1706,8 @@ def _launch_ui_impl() -> int:
             "root": root,
             "runtime_config": runtime_config,
             "set_dark_title_bar": set_dark_title_bar,
+            "settings_state": settings_state,
+            "shutil": shutil,
             "subprocess": subprocess,
             "tk": tk,
             "tkdnd_available": tkdnd_available,
@@ -3469,6 +3474,342 @@ def _launch_ui_impl() -> int:
         merged_output_dir.mkdir(parents=True, exist_ok=True)
         lora_post_hoc_ema_merge_for_output(job_name, output_dir, merged_output_dir)
 
+    def merge_selected_jobs_with_post_hoc_ema() -> None:
+        selected_indices = selected_queue_indices()
+        if not selected_indices:
+            messagebox.showinfo("EMA Merge", "Select at least one job first.", parent=root)
+            return
+
+        merge_profile_choice = _lora_merge_window().ask_post_hoc_ema_profiles("EMA Merge Selected Jobs")
+        if not merge_profile_choice:
+            return
+        merge_profiles, send_to_comfy = merge_profile_choice
+
+        if runtime_config is None:
+            messagebox.showerror("EMA Merge unavailable", "Runtime configuration is not available.", parent=root)
+            return
+        musubi_python = runtime_config.musubi_python
+        if musubi_python is None or not musubi_python.is_file():
+            messagebox.showerror(
+                "EMA Merge unavailable",
+                (
+                    "Musubi-Tuner Python was not found in its venv.\n"
+                    "Expected: .venv/Scripts/python.exe inside your Musubi-Tuner folder."
+                ),
+                parent=root,
+            )
+            return
+
+        compat_script = Path(__file__).resolve().parent / "post_hoc_ema_compat.py"
+        if not compat_script.exists():
+            messagebox.showerror(
+                "EMA Merge unavailable",
+                "Could not find post_hoc_ema_compat.py in Musubi-Trainer src folder.",
+                parent=root,
+            )
+            return
+
+        musubi_src_path = runtime_config.musubi_dir / "src"
+        if not musubi_src_path.exists():
+            messagebox.showerror(
+                "EMA Merge unavailable",
+                "Could not find Musubi-Tuner src folder.",
+                parent=root,
+            )
+            return
+
+        comfy_target_dir: Path | None = None
+        if send_to_comfy:
+            raw_extra = settings_state.get(app_settings.EXTRA_SEARCH_PATHS_KEY, "").strip()
+            try:
+                parsed_extra = json.loads(raw_extra) if raw_extra else []
+            except Exception:
+                parsed_extra = []
+            if isinstance(parsed_extra, list) and parsed_extra:
+                comfy_root = str(parsed_extra[0]).strip()
+                if comfy_root:
+                    comfy_target_dir = Path(comfy_root).expanduser() / "loras" / "training"
+
+        if send_to_comfy and comfy_target_dir is None:
+            messagebox.showerror(
+                "EMA Merge unavailable",
+                "Send to Comfy is enabled, but ComfyUI models path is not configured.",
+                parent=root,
+            )
+            return
+
+        step_pattern = re.compile(r"(?:[-_.]step\d+)\.safetensors$", re.IGNORECASE)
+        selected_jobs_payload: list[dict[str, object]] = []
+        skipped_jobs: list[str] = []
+        for idx in selected_indices:
+            if idx < 0 or idx >= len(job_queue):
+                continue
+            job = job_queue[idx]
+            job_name = str(job.get("job_name", "unnamed")).strip() or "unnamed"
+            output_dir = Path(job.get("output_dir", "")).expanduser()
+            if not output_dir.exists() or not output_dir.is_dir():
+                skipped_jobs.append(f"{job_name} (missing output folder)")
+                continue
+
+            available_steps = sorted(
+                [
+                    path
+                    for path in output_dir.iterdir()
+                    if path.is_file()
+                    and path.suffix.lower() == ".safetensors"
+                    and (not path.name.casefold().endswith(".comfy.safetensors"))
+                    and step_pattern.search(path.name) is not None
+                ],
+                key=lambda path: path.name.casefold(),
+            )
+            if len(available_steps) < 2:
+                skipped_jobs.append(f"{job_name} (needs at least 2 numbered step LoRAs)")
+                continue
+
+            if send_to_comfy and comfy_target_dir is not None:
+                merge_output_dir = comfy_target_dir
+            else:
+                merge_output_dir = output_dir / "merged"
+                merge_output_dir.mkdir(parents=True, exist_ok=True)
+
+            selected_jobs_payload.append(
+                {
+                    "job_name": job_name,
+                    "output_dir": output_dir,
+                    "merge_output_dir": merge_output_dir,
+                    "selected_files": [str(path) for path in available_steps],
+                }
+            )
+
+        if not selected_jobs_payload:
+            details = "\n".join(skipped_jobs[:10]) if skipped_jobs else "No eligible jobs selected."
+            messagebox.showerror("EMA Merge unavailable", details, parent=root)
+            return
+
+        if send_to_comfy and comfy_target_dir is not None:
+            try:
+                comfy_target_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror(
+                    "EMA Merge unavailable",
+                    f"Could not create Comfy target folder:\n{comfy_target_dir}\n\n{exc}",
+                    parent=root,
+                )
+                return
+
+        total_steps = len(selected_jobs_payload) * len(merge_profiles)
+        loading_overlay = tk.Toplevel(root)
+        loading_overlay.overrideredirect(True)
+        loading_overlay.configure(bg=bg_panel, bd=2, relief="solid")
+        loading_overlay.transient(root)
+        loading_overlay.lift(root)
+
+        root.update_idletasks()
+        ox = root.winfo_x() + max(0, (root.winfo_width() - 340) // 2)
+        oy = root.winfo_y() + max(0, (root.winfo_height() - 130) // 2)
+        loading_overlay.geometry(f"340x130+{ox}+{oy}")
+
+        overlay_label = ttk.Label(
+            loading_overlay,
+            text=f"EMA Merge... 0/{total_steps}",
+            font=("Segoe UI", 11, "bold"),
+            background=bg_panel,
+            foreground="#ffffff",
+        )
+        overlay_label.pack(pady=(24, 6))
+
+        overlay_sub = ttk.Label(
+            loading_overlay,
+            text="",
+            background=bg_panel,
+            foreground=fg_muted,
+        )
+        overlay_sub.pack(pady=(0, 8))
+
+        pb_frame = tk.Frame(loading_overlay, height=8, width=260, bg=bg_panel)
+        pb_frame.pack_propagate(False)
+        pb_frame.pack(pady=(0, 14))
+
+        pb_bg = tk.Canvas(
+            pb_frame,
+            width=260,
+            height=8,
+            bg="#1e1e1e",
+            bd=0,
+            highlightthickness=0,
+        )
+        pb_bg.pack(fill="both", expand=True)
+        pb_fill = pb_bg.create_rectangle(0, 0, 0, 8, fill="#0090d8", width=0)
+
+        def _set_progress(value: int, subtitle: str = "") -> None:
+            clamped = max(0, min(value, total_steps))
+            ratio = 0.0 if total_steps <= 0 else (clamped / total_steps)
+            width = int(260 * ratio)
+            pb_bg.coords(pb_fill, 0, 0, width, 8)
+            overlay_label.configure(text=f"EMA Merge... {clamped}/{total_steps}")
+            if subtitle:
+                overlay_sub.configure(text=subtitle)
+            loading_overlay.update_idletasks()
+
+        _set_progress(0)
+        loading_overlay.update()
+
+        run_env = os.environ.copy()
+        existing_pythonpath = run_env.get("PYTHONPATH", "")
+        musubi_src = str(musubi_src_path)
+        run_env["PYTHONPATH"] = musubi_src if not existing_pythonpath else f"{musubi_src}{os.pathsep}{existing_pythonpath}"
+
+        merge_lock = threading.Lock()
+        merge_state: dict[str, object] = {
+            "completed_steps": 0,
+            "subtitle": "",
+            "created_paths": [],
+            "failed_jobs": [],
+            "log_lines": [],
+            "done": False,
+            "error": None,
+        }
+
+        def _worker() -> None:
+            try:
+                for job_payload in selected_jobs_payload:
+                    job_name = str(job_payload["job_name"])
+                    merge_output_dir = Path(str(job_payload["merge_output_dir"]))
+                    selected_files = [str(path) for path in list(job_payload["selected_files"]) if str(path).strip()]
+
+                    for merge_mode_label, merge_mode_suffix, merge_mode_args, preset_name in merge_profiles:
+                        with merge_lock:
+                            merge_state["subtitle"] = f"{job_name}: {merge_mode_label} / {preset_name}"
+
+                        output_path = next_merged_output_path(
+                            job_name,
+                            merge_output_dir,
+                            merge_mode_suffix,
+                            preset_name,
+                            selected_files,
+                        )
+
+                        command = [
+                            str(musubi_python),
+                            str(compat_script),
+                            "--musubi_src",
+                            musubi_src,
+                            *selected_files,
+                            "--output_file",
+                            str(output_path),
+                            *merge_mode_args,
+                        ]
+
+                        result = subprocess.run(
+                            command,
+                            cwd=str(runtime_config.musubi_dir),
+                            env=run_env,
+                            capture_output=True,
+                            text=True,
+                        )
+
+                        stdout_text = result.stdout.strip()
+                        stderr_text = result.stderr.strip()
+
+                        with merge_lock:
+                            log_lines = list(merge_state["log_lines"])
+                            log_lines.append(
+                                f"[Queue EMA] Merging {len(selected_files)} step LoRA(s) for '{job_name}' using {merge_mode_label} / {preset_name}..."
+                            )
+                            if stdout_text:
+                                log_lines.append(stdout_text)
+
+                            if result.returncode != 0:
+                                failed_jobs = list(merge_state["failed_jobs"])
+                                failed_jobs.append(
+                                    f"{job_name} ({merge_mode_label} / {preset_name}): {stderr_text or 'post_hoc_ema failed'}"
+                                )
+                                merge_state["failed_jobs"] = failed_jobs
+                                log_lines.append(
+                                    f"[Queue EMA] Failed ({result.returncode}) for '{job_name}' using {merge_mode_label} / {preset_name}."
+                                )
+                                if stderr_text:
+                                    log_lines.append(stderr_text)
+                            else:
+                                created_paths = list(merge_state["created_paths"])
+                                created_paths.append(output_path)
+                                merge_state["created_paths"] = created_paths
+                                log_lines.append(f"[Queue EMA] Created ({merge_mode_suffix} / {preset_name}): {output_path}")
+                                if stderr_text:
+                                    log_lines.append(stderr_text)
+
+                            merge_state["log_lines"] = log_lines
+                            merge_state["completed_steps"] = int(merge_state["completed_steps"]) + 1
+            except Exception as exc:
+                with merge_lock:
+                    merge_state["error"] = str(exc)
+            finally:
+                with merge_lock:
+                    merge_state["done"] = True
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+        def _poll_merge_progress() -> None:
+            with merge_lock:
+                completed = int(merge_state["completed_steps"])
+                subtitle = str(merge_state["subtitle"])
+                done = bool(merge_state["done"])
+                error_text = merge_state["error"]
+                log_lines = list(merge_state["log_lines"])
+                merge_state["log_lines"] = []
+                created_paths = list(merge_state["created_paths"])
+                failed_jobs = list(merge_state["failed_jobs"])
+
+            for line in log_lines:
+                if line:
+                    log(str(line))
+
+            _set_progress(completed, subtitle)
+
+            if not done:
+                root.after(100, _poll_merge_progress)
+                return
+
+            try:
+                loading_overlay.destroy()
+            except tk.TclError:
+                pass
+
+            rebuild_folder_list(force=True)
+
+            if skipped_jobs:
+                log("[Queue EMA] Skipped jobs:\n" + "\n".join(skipped_jobs))
+
+            if error_text:
+                messagebox.showerror("EMA Merge failed", str(error_text), parent=root)
+                return
+
+            if failed_jobs:
+                messagebox.showerror(
+                    "EMA Merge completed with errors",
+                    "Some merges failed:\n" + "\n".join(str(item) for item in failed_jobs[:10]),
+                    parent=root,
+                )
+                return
+
+            if created_paths:
+                created_text = "\n".join(
+                    path.stem if path.suffix.lower() == ".safetensors" else path.name
+                    for path in created_paths
+                )
+                if send_to_comfy and comfy_target_dir is not None:
+                    messagebox.showinfo(
+                        "EMA Merge complete",
+                        f"Created in Comfy loras/training:\n{created_text}",
+                        parent=root,
+                    )
+                else:
+                    messagebox.showinfo("EMA Merge complete", f"Created:\n{created_text}", parent=root)
+            else:
+                messagebox.showinfo("EMA Merge", "No merges were produced.", parent=root)
+
+        root.after(0, _poll_merge_progress)
+
     def fix_job_element_names(index: int | None = None) -> None:
         idx = selected_queue_index() if index is None else index
         if idx is None or idx < 0 or idx >= len(job_queue):
@@ -3800,10 +4141,27 @@ def _launch_ui_impl() -> int:
 
     def on_queue_press(event: tk.Event) -> str:
         nonlocal queue_drag_index, queue_drag_moved, queue_drag_allowed, queue_selection_anchor
+        nonlocal queue_range_selecting, queue_range_anchor
+
+        def _is_drag_handle_hotspot(item_id: str, x: int, y: int) -> bool:
+            bbox = queue_list.bbox(item_id, "#0")
+            if not bbox:
+                return False
+            bx, by, bw, bh = bbox
+            if bw <= 0 or bh <= 0:
+                return False
+            icon_w = min(20, bw)
+            icon_h = min(22, bh)
+            icon_x = bx + max(0, (bw - icon_w) // 2)
+            icon_y = by + max(0, (bh - icon_h) // 2)
+            return (icon_x <= x <= (icon_x + icon_w)) and (icon_y <= y <= (icon_y + icon_h))
+
         if len(job_queue) == 0:
             queue_drag_index = None
             queue_drag_moved = False
             queue_drag_allowed = False
+            queue_range_selecting = False
+            queue_range_anchor = None
             return "break"
         clicked_item = queue_list.identify_row(event.y)
         state_bits = int(event.state or 0)
@@ -3817,6 +4175,8 @@ def _launch_ui_impl() -> int:
             queue_drag_index = None
             queue_drag_moved = False
             queue_drag_allowed = False
+            queue_range_selecting = False
+            queue_range_anchor = None
             return "break"
         try:
             clicked = int(clicked_item)
@@ -3824,11 +4184,15 @@ def _launch_ui_impl() -> int:
             queue_drag_index = None
             queue_drag_moved = False
             queue_drag_allowed = False
+            queue_range_selecting = False
+            queue_range_anchor = None
             return "break"
         if clicked < 0 or clicked >= len(job_queue):
             queue_drag_index = None
             queue_drag_moved = False
             queue_drag_allowed = False
+            queue_range_selecting = False
+            queue_range_anchor = None
             return "break"
 
         clicked_col = queue_list.identify_column(event.x)
@@ -3837,6 +4201,8 @@ def _launch_ui_impl() -> int:
             queue_drag_index = None
             queue_drag_moved = False
             queue_drag_allowed = False
+            queue_range_selecting = False
+            queue_range_anchor = None
             return "break"
 
         if shift_pressed:
@@ -3859,13 +4225,36 @@ def _launch_ui_impl() -> int:
 
         update_queue_multi_action_state()
 
-        queue_drag_allowed = (not shift_pressed) and (not ctrl_pressed) and clicked_col in {"#0", "#2", "#3", "#4", "#5"}
+        can_reorder_drag = (not shift_pressed) and (not ctrl_pressed) and clicked_col == "#0" and _is_drag_handle_hotspot(clicked_item, int(event.x), int(event.y))
+        queue_drag_allowed = can_reorder_drag
         queue_drag_index = clicked if queue_drag_allowed else None
         queue_drag_moved = False
+
+        queue_range_selecting = (not shift_pressed) and (not ctrl_pressed) and (clicked_col == "#3")
+        queue_range_anchor = clicked if queue_range_selecting else None
         return "break"
 
     def on_queue_motion(event: tk.Event) -> None:
         nonlocal queue_drag_index, queue_drag_moved, queue_drag_allowed
+        nonlocal queue_range_selecting, queue_range_anchor
+        if queue_range_selecting:
+            if queue_range_anchor is None:
+                return
+            target_item = queue_list.identify_row(event.y)
+            if not target_item:
+                return
+            try:
+                target = int(target_item)
+            except ValueError:
+                return
+            if target < 0 or target >= len(job_queue):
+                return
+            start = min(queue_range_anchor, target)
+            end = max(queue_range_anchor, target)
+            set_queue_selection_indices(list(range(start, end + 1)), anchor_index=queue_range_anchor)
+            update_queue_multi_action_state()
+            return
+
         if not queue_drag_allowed:
             return
         if queue_drag_index is None:
@@ -3889,12 +4278,15 @@ def _launch_ui_impl() -> int:
 
     def on_queue_release(_event: tk.Event) -> None:
         nonlocal queue_drag_index, queue_drag_moved, queue_drag_allowed
+        nonlocal queue_range_selecting, queue_range_anchor
         if queue_drag_moved:
             save_job_order()
             update_start_button_state()
         queue_drag_index = None
         queue_drag_moved = False
         queue_drag_allowed = False
+        queue_range_selecting = False
+        queue_range_anchor = None
 
     def open_create_job_dialog(existing_job: dict[str, str] | None = None) -> None:
         from .ui.windows import create_job_window
@@ -4841,7 +5233,6 @@ def _launch_ui_impl() -> int:
     archive_datasets_button = ttk.Button(controls, text="Archive Datasets", command=archive_selected_datasets)
     create_dataset_button = ttk.Button(controls, text="Create Dataset", command=create_dataset)
     metrics_viewer_button = ttk.Button(controls, text="TensorBoard", command=open_metrics_viewer_dialog)
-    lora_merge_tool_button = ttk.Button(controls, text="LoRA EMA Merge", command=open_lora_merge_tool_dialog)
     _settings_icon_path = Path(__file__).resolve().parent / "icons" / "settings.png"
     _settings_icon_img: ImageTk.PhotoImage | None = None
     try:
@@ -4905,12 +5296,17 @@ def _launch_ui_impl() -> int:
         style="QueueAction.TButton",
         command=delete_selected_jobs_with_confirmation,
     )
+    queue_ema_merge_button = ttk.Button(
+        queue_actions_bar,
+        text="EMA Merge Selected",
+        style="QueueAction.TButton",
+        command=merge_selected_jobs_with_post_hoc_ema,
+    )
 
     restore_datasets_button.configure(style="QueueAction.TButton")
     archive_datasets_button.configure(style="QueueAction.TButton")
     create_dataset_button.configure(style="QueueAction.TButton")
     metrics_viewer_button.configure(style="QueueAction.TButton")
-    lora_merge_tool_button.configure(style="QueueAction.TButton")
 
     scan_button.grid(row=0, column=0, padx=(0, 8), sticky="w")
     dataset_select_toggle_button.grid(row=0, column=1, padx=(0, 8), sticky="w")
@@ -4918,8 +5314,7 @@ def _launch_ui_impl() -> int:
     restore_datasets_button.grid(row=0, column=3, padx=(0, 8), sticky="w")
     create_dataset_button.grid(row=0, column=5, padx=(0, 8), sticky="e")
     metrics_viewer_button.grid(row=0, column=6, padx=(0, 8), sticky="e")
-    lora_merge_tool_button.grid(row=0, column=7, padx=(0, 8), sticky="e")
-    settings_button.grid(row=0, column=8, sticky="e")
+    settings_button.grid(row=0, column=7, sticky="e")
 
     create_job_large_button.configure(style="CreateJobLarge.TButton")
     create_job_large_button.grid(row=0, column=0, sticky="ew")
@@ -4929,6 +5324,7 @@ def _launch_ui_impl() -> int:
     queue_archive_button.grid(row=0, column=3, padx=(0, 8), sticky="w")
     queue_restore_button.grid(row=0, column=4, padx=(0, 8), sticky="w")
     queue_delete_button.grid(row=0, column=5, padx=(0, 8), sticky="w")
+    queue_ema_merge_button.grid(row=0, column=6, padx=(0, 8), sticky="w")
     run_button.grid(row=0, column=7, sticky="e")
 
     queue_list.bind("<Button-3>", show_queue_context_menu)

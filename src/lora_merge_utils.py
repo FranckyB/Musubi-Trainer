@@ -12,13 +12,12 @@ def compact_merge_selection_token(selected_files: list[str]) -> str:
             step_values.append(int(match.group(1)))
 
     if not step_values:
-        return f"n{len(selected_files)}"
+        return "unknown"
 
     unique_steps = sorted(set(step_values))
-    if len(unique_steps) <= 4:
-        return "s" + "-".join(str(step) for step in unique_steps)
-
-    return f"s{unique_steps[0]}-{unique_steps[-1]}x{len(unique_steps)}"
+    first_step = unique_steps[0]
+    last_step = unique_steps[-1]
+    return f"{first_step}-{last_step}"
 
 
 def merge_preset_file_token(preset_name: str) -> str:
@@ -60,11 +59,11 @@ def next_merged_output_path(
     preset_token = merge_preset_file_token(preset_name)
     selection_token = compact_merge_selection_token(selected_files)
     if method_token and preset_token:
-        base_name = f"{dataset_name}_merged_{method_token}_{preset_token}_{selection_token}"
+        base_name = f"{dataset_name}_{method_token}_{preset_token}_{selection_token}"
     elif method_token:
-        base_name = f"{dataset_name}_merged_{method_token}_{selection_token}"
+        base_name = f"{dataset_name}_{method_token}_{selection_token}"
     else:
-        base_name = f"{dataset_name}_merged_{selection_token}"
+        base_name = f"{dataset_name}_{selection_token}"
     candidate = output_dir / f"{base_name}.safetensors"
     if not candidate.exists():
         return candidate

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
 
@@ -166,13 +168,15 @@ class LoraMergeWindow:
         preset_balanced_var = self.tk.BooleanVar(value=False)
         preset_smooth_var = self.tk.BooleanVar(value=False)
         preset_anti_overfit_var = self.tk.BooleanVar(value=False)
-        self.ttk.Checkbutton(preset_section, text="Balanced", variable=preset_balanced_var).grid(row=0, column=0, sticky="w")
-        self.ttk.Checkbutton(preset_section, text="Smooth", variable=preset_smooth_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.ttk.Checkbutton(preset_section, text="Anti-overfit", variable=preset_anti_overfit_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+        self.ttk.Checkbutton(preset_section, text="Smooth", variable=preset_smooth_var).grid(row=0, column=0, sticky="w")
+        self.ttk.Checkbutton(preset_section, text="Anti-overfit", variable=preset_anti_overfit_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.ttk.Checkbutton(preset_section, text="Balanced", variable=preset_balanced_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
 
         mode_beta_var = self.tk.BooleanVar(value=False)
         mode_beta2_var = self.tk.BooleanVar(value=False)
         mode_sigma_var = self.tk.BooleanVar(value=False)
+
         self.ttk.Checkbutton(mode_section, text="SIGMA_REL", variable=mode_sigma_var).grid(row=0, column=0, sticky="w")
         self.ttk.Checkbutton(mode_section, text="BETA", variable=mode_beta_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.ttk.Checkbutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
@@ -196,12 +200,13 @@ class LoraMergeWindow:
                 return
 
             selected_preset_names: list[str] = []
-            if preset_balanced_var.get():
-                selected_preset_names.append("Balanced")
             if preset_smooth_var.get():
                 selected_preset_names.append("Smooth")
             if preset_anti_overfit_var.get():
                 selected_preset_names.append("Anti-overfit")
+            if preset_balanced_var.get():
+                selected_preset_names.append("Balanced")
+
             if not selected_preset_names:
                 self.messagebox.showerror(
                     "Merge unavailable",
@@ -211,12 +216,12 @@ class LoraMergeWindow:
                 return
 
             mode_defs: list[tuple[str, str, str]] = []
+            if mode_sigma_var.get():
+                mode_defs.append(("SIGMA_REL", "Sigma", "sigma_rel"))
             if mode_beta_var.get():
                 mode_defs.append(("BETA", "Beta", "beta"))
             if mode_beta2_var.get():
                 mode_defs.append(("BETA2", "Beta2", "beta2"))
-            if mode_sigma_var.get():
-                mode_defs.append(("SIGMA_REL", "Sigma", "sigma_rel"))
 
             if not mode_defs:
                 self.messagebox.showerror(
@@ -253,6 +258,159 @@ class LoraMergeWindow:
         dialog.deiconify()
         dialog.focus_set()
         selected_list.focus_set()
+        self.root.wait_window(dialog)
+        return choice
+
+    def ask_post_hoc_ema_profiles(
+        self,
+        dialog_title: str = "LoRA Post-Hoc EMA Merge",
+    ) -> tuple[list[tuple[str, str, list[str], str]], bool] | None:
+        dialog = self.tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title(dialog_title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.configure(bg=self.bg_panel)
+        self.set_dark_title_bar(dialog)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+
+        frame = self.ttk.Frame(dialog, padding=12)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+
+        comfy_models_root: Path | None = None
+        settings = getattr(self, "settings_state", {})
+        app_settings_obj = getattr(self, "app_settings", None)
+        extra_key = getattr(app_settings_obj, "EXTRA_SEARCH_PATHS_KEY", "extra_search_paths")
+        try:
+            raw_extra = str(settings.get(extra_key, "")).strip() if isinstance(settings, dict) else ""
+        except Exception:
+            raw_extra = ""
+        try:
+            extra_paths = json.loads(raw_extra) if raw_extra else []
+        except Exception:
+            extra_paths = []
+        if isinstance(extra_paths, list) and extra_paths:
+            first = str(extra_paths[0]).strip()
+            if first:
+                comfy_models_root = Path(first).expanduser()
+
+        self.ttk.Label(
+            frame,
+            text="Post-Hoc EMA smooths checkpoints from the same run into one more stable LoRA.",
+        ).grid(row=0, column=0, sticky="w")
+
+        options_frame = self.ttk.Frame(frame)
+        options_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        options_frame.columnconfigure(0, weight=1)
+        options_frame.columnconfigure(1, weight=1)
+
+        mode_section = self.ttk.LabelFrame(options_frame, text="Mode(s)", padding=6)
+        mode_section.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self.attach_hover_tooltip(mode_section, self.merge_mode_tooltip_text)
+
+        preset_section = self.ttk.LabelFrame(options_frame, text="Preset(s)", padding=6)
+        preset_section.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        self.attach_hover_tooltip(preset_section, self.merge_preset_tooltip_text)
+
+        preset_balanced_var = self.tk.BooleanVar(value=False)
+        preset_smooth_var = self.tk.BooleanVar(value=False)
+        preset_anti_overfit_var = self.tk.BooleanVar(value=False)
+
+        self.ttk.Checkbutton(preset_section, text="Smooth", variable=preset_smooth_var).grid(row=0, column=0, sticky="w")
+        self.ttk.Checkbutton(preset_section, text="Anti-overfit", variable=preset_anti_overfit_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.ttk.Checkbutton(preset_section, text="Balanced", variable=preset_balanced_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+        mode_beta_var = self.tk.BooleanVar(value=False)
+        mode_beta2_var = self.tk.BooleanVar(value=False)
+        mode_sigma_var = self.tk.BooleanVar(value=False)
+
+        self.ttk.Checkbutton(mode_section, text="SIGMA_REL", variable=mode_sigma_var).grid(row=0, column=0, sticky="w")
+        self.ttk.Checkbutton(mode_section, text="BETA", variable=mode_beta_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.ttk.Checkbutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+        send_to_comfy_var = self.tk.BooleanVar(value=True)
+        if comfy_models_root is not None:
+            send_to_comfy_check = self.ttk.Checkbutton(
+                frame,
+                text="Send to Comfy",
+                variable=send_to_comfy_var,
+            )
+            send_to_comfy_check.grid(row=2, column=0, sticky="w", pady=(10, 0))
+            self.attach_hover_tooltip(
+                send_to_comfy_check,
+                "Copy merged LoRAs to ComfyUI models folder: loras/training",
+            )
+
+        button_row = self.ttk.Frame(frame)
+        button_row.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        button_row.columnconfigure(0, weight=1)
+
+        choice: tuple[list[tuple[str, str, list[str], str]], bool] | None = None
+
+        def choose_and_close() -> None:
+            nonlocal choice
+            selected_preset_names: list[str] = []
+            if preset_smooth_var.get():
+                selected_preset_names.append("Smooth")
+            if preset_anti_overfit_var.get():
+                selected_preset_names.append("Anti-overfit")
+            if preset_balanced_var.get():
+                selected_preset_names.append("Balanced")
+
+            if not selected_preset_names:
+                self.messagebox.showerror(
+                    "Merge unavailable",
+                    "Select at least one preset.",
+                    parent=dialog,
+                )
+                return
+
+            mode_defs: list[tuple[str, str, str]] = []
+            if mode_sigma_var.get():
+                mode_defs.append(("SIGMA_REL", "Sigma", "sigma_rel"))
+            if mode_beta_var.get():
+                mode_defs.append(("BETA", "Beta", "beta"))
+            if mode_beta2_var.get():
+                mode_defs.append(("BETA2", "Beta2", "beta2"))
+
+            if not mode_defs:
+                self.messagebox.showerror(
+                    "Merge unavailable",
+                    "Select at least one merge mode.",
+                    parent=dialog,
+                )
+                return
+
+            selected_jobs: list[tuple[str, str, list[str], str]] = []
+            for preset_name in selected_preset_names:
+                preset_args = self.post_hoc_ema_mode_args_for_preset(preset_name)
+                for mode_label, mode_suffix, mode_key in mode_defs:
+                    selected_jobs.append((mode_label, mode_suffix, preset_args[mode_key], preset_name))
+
+            send_to_comfy = bool(send_to_comfy_var.get()) and (comfy_models_root is not None)
+            choice = (selected_jobs, send_to_comfy)
+            dialog.destroy()
+
+        def cancel_and_close() -> None:
+            dialog.destroy()
+
+        go_button = self.ttk.Button(button_row, text="Go", command=choose_and_close)
+        go_button.grid(row=0, column=0)
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel_and_close)
+        dialog.bind("<Escape>", lambda _e: cancel_and_close())
+        dialog.bind("<Return>", lambda _e: choose_and_close())
+
+        dialog.update_idletasks()
+        requested_width = max(560, dialog.winfo_reqwidth())
+        requested_height = dialog.winfo_reqheight()
+        dialog.geometry(f"{requested_width}x{requested_height}")
+        self.center_window(dialog)
+        dialog.deiconify()
+        dialog.focus_set()
         self.root.wait_window(dialog)
         return choice
 
@@ -432,6 +590,24 @@ class LoraMergeWindow:
 
         candidate_loras: list[Path] = []
         merge_loras: list[Path] = []
+        last_created_paths: list[Path] = []
+
+        comfy_models_root: Path | None = None
+        settings = getattr(self, "settings_state", {})
+        app_settings_obj = getattr(self, "app_settings", None)
+        extra_key = getattr(app_settings_obj, "EXTRA_SEARCH_PATHS_KEY", "extra_search_paths")
+        try:
+            raw_extra = str(settings.get(extra_key, "")).strip() if isinstance(settings, dict) else ""
+        except Exception:
+            raw_extra = ""
+        try:
+            extra_paths = json.loads(raw_extra) if raw_extra else []
+        except Exception:
+            extra_paths = []
+        if isinstance(extra_paths, list) and extra_paths:
+            first = str(extra_paths[0]).strip()
+            if first:
+                comfy_models_root = Path(first).expanduser()
 
         frame = self.ttk.Frame(dialog, padding=10)
         frame.grid(row=0, column=0, sticky="nsew")
@@ -517,6 +693,7 @@ class LoraMergeWindow:
         mode_group = self.ttk.LabelFrame(mode_section, text="Mode(s)", padding=6)
         mode_group.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(8, 0))
         self.attach_hover_tooltip(mode_group, self.merge_mode_tooltip_text)
+
         self.ttk.Checkbutton(mode_group, text="SIGMA_REL", variable=mode_sigma_var).grid(row=0, column=0, sticky="w")
         self.ttk.Checkbutton(mode_group, text="BETA", variable=mode_beta_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.ttk.Checkbutton(mode_group, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
@@ -524,9 +701,10 @@ class LoraMergeWindow:
         preset_section = self.ttk.LabelFrame(mode_section, text="Preset(s)", padding=6)
         preset_section.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(8, 0))
         self.attach_hover_tooltip(preset_section, self.merge_preset_tooltip_text)
-        self.ttk.Checkbutton(preset_section, text="Balanced", variable=preset_balanced_var).grid(row=0, column=0, sticky="w")
-        self.ttk.Checkbutton(preset_section, text="Smooth", variable=preset_smooth_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.ttk.Checkbutton(preset_section, text="Anti-overfit", variable=preset_anti_overfit_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+        self.ttk.Checkbutton(preset_section, text="Smooth", variable=preset_smooth_var).grid(row=0, column=0, sticky="w")
+        self.ttk.Checkbutton(preset_section, text="Anti-overfit", variable=preset_anti_overfit_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.ttk.Checkbutton(preset_section, text="Balanced", variable=preset_balanced_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
 
         output_name_var = self.tk.StringVar(value="merged_lora")
         output_dir_var = self.tk.StringVar(value="")
@@ -773,31 +951,42 @@ class LoraMergeWindow:
 
         def build_output_path(output_folder: Path, output_name: str, mode_suffix: str, preset_name: str) -> Path:
             preset_token = self.merge_preset_file_token(preset_name)
-            return output_folder / f"{output_name}_{mode_suffix}_{preset_token}.safetensors"
+
+            step_values: list[int] = []
+            for path in merge_loras:
+                match = re.search(r"step0*(\d+)", path.name, re.IGNORECASE)
+                step_values.append(int(match.group(1)))
+                unique_steps = sorted(set(step_values))
+                selection_token = f"{unique_steps[0]}-{unique_steps[-1]}"
+
+            return output_folder / f"{output_name}_{mode_suffix}_{preset_token}_{selection_token}.safetensors"
 
         def run_merge() -> None:
+            nonlocal last_created_paths
             if len(merge_loras) < 2:
                 self.messagebox.showerror("Merge unavailable", "Add at least 2 LoRAs to merge list.", parent=dialog)
                 return
 
             selected_preset_names: list[str] = []
-            if preset_balanced_var.get():
-                selected_preset_names.append("Balanced")
             if preset_smooth_var.get():
                 selected_preset_names.append("Smooth")
             if preset_anti_overfit_var.get():
                 selected_preset_names.append("Anti-overfit")
+            if preset_balanced_var.get():
+                selected_preset_names.append("Balanced")
+
             if not selected_preset_names:
                 self.messagebox.showerror("Merge unavailable", "Select at least one preset.", parent=dialog)
                 return
 
             mode_defs: list[tuple[str, str, str]] = []
+            if mode_sigma_var.get():
+                mode_defs.append(("SIGMA_REL", "Sigma", "sigma_rel"))
             if mode_beta_var.get():
                 mode_defs.append(("BETA", "Beta", "beta"))
             if mode_beta2_var.get():
                 mode_defs.append(("BETA2", "Beta2", "beta2"))
-            if mode_sigma_var.get():
-                mode_defs.append(("SIGMA_REL", "Sigma", "sigma_rel"))
+
             if not mode_defs:
                 self.messagebox.showerror("Merge unavailable", "Select at least one merge mode.", parent=dialog)
                 return
@@ -894,7 +1083,67 @@ class LoraMergeWindow:
                 created_paths.append(output_path)
 
             created_text = "\n".join(path.stem if path.suffix.lower() == ".safetensors" else path.name for path in created_paths)
+            last_created_paths = list(created_paths)
             self.messagebox.showinfo("Merge complete", f"Created:\n{created_text}", parent=dialog)
+
+        def send_last_created_to_comfy() -> None:
+            if comfy_models_root is None:
+                self.messagebox.showerror(
+                    "Send to Comfy unavailable",
+                    "ComfyUI models path is not configured in Settings.",
+                    parent=dialog,
+                )
+                return
+            if not last_created_paths:
+                self.messagebox.showinfo(
+                    "Send to Comfy",
+                    "No merged LoRAs to send yet. Run a merge first.",
+                    parent=dialog,
+                )
+                return
+
+            target_dir = comfy_models_root / "loras" / "training"
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                self.messagebox.showerror(
+                    "Send to Comfy failed",
+                    f"Could not create target folder:\n{target_dir}\n\n{exc}",
+                    parent=dialog,
+                )
+                return
+
+            copied_names: list[str] = []
+            copy_errors: list[str] = []
+            for created_path in last_created_paths:
+                if not created_path.exists() or not created_path.is_file():
+                    copy_errors.append(f"Missing: {created_path.name}")
+                    continue
+                destination = target_dir / created_path.name
+                try:
+                    self.shutil.copy2(str(created_path), str(destination))
+                    copied_names.append(created_path.name)
+                except OSError as exc:
+                    copy_errors.append(f"{created_path.name}: {exc}")
+
+            if copied_names:
+                self.log(
+                    f"[LoRA Post-Hoc EMA Merge] Sent {len(copied_names)} file(s) to Comfy: {target_dir}"
+                )
+
+            if copy_errors:
+                self.messagebox.showerror(
+                    "Send to Comfy completed with errors",
+                    "Some files could not be copied:\n" + "\n".join(copy_errors[:12]),
+                    parent=dialog,
+                )
+                return
+
+            self.messagebox.showinfo(
+                "Send to Comfy complete",
+                f"Copied {len(copied_names)} file(s) to:\n{target_dir}",
+                parent=dialog,
+            )
 
         candidate_list.bind("<Double-Button-1>", on_candidate_double_click)
 
@@ -927,7 +1176,16 @@ class LoraMergeWindow:
         self.ttk.Button(mode_section, text="Browse", command=browse_output_folder).grid(row=6, column=2, padx=(8, 0), pady=(8, 0))
 
         self.ttk.Button(actions, text="Close", command=dialog.destroy).grid(row=0, column=1, padx=(0, 8))
-        self.ttk.Button(actions, text="Go", command=run_merge).grid(row=0, column=2)
+        go_col = 2
+        if comfy_models_root is not None:
+            send_to_comfy_button = self.ttk.Button(actions, text="Send to Comfy", command=send_last_created_to_comfy)
+            send_to_comfy_button.grid(row=0, column=2, padx=(0, 8))
+            self.attach_hover_tooltip(
+                send_to_comfy_button,
+                "Copy merged LoRAs to ComfyUI models folder: loras/training",
+            )
+            go_col = 3
+        self.ttk.Button(actions, text="Go", command=run_merge).grid(row=0, column=go_col)
 
         dialog.geometry("820x620")
         self.center_window(dialog)
