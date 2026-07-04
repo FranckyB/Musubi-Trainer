@@ -597,11 +597,8 @@ def run_steps_for_model(
             config_lines.append(f"# {section_name}")
             config_lines.extend(section_lines)
 
-        if generate_training_args_only or not train_config_path.exists():
-            train_config_path.write_text("\n".join(config_lines) + "\n", encoding="utf-8")
-            logger(f"  training_args: {train_config_path}")
-        else:
-            logger(f"  training_args: {train_config_path} (using existing)")
+        train_config_path.write_text("\n".join(config_lines) + "\n", encoding="utf-8")
+        logger(f"  training_args: {train_config_path}")
 
         if generate_training_args_only:
             logger("  training args generated (no training launched)")
@@ -933,6 +930,16 @@ def run_job(
             f"  warm-starting from finished checkpoint {finished_checkpoint.name} "
             f"(recorded step {progress_step}) via --network_weights, remaining steps {train_steps_override}"
         )
+    elif progress_step > 0 and not generate_training_args_only:
+        message = (
+            f"Progress metadata reports step {progress_step}, but no resume state/checkpoint was found "
+            f"for '{output_name_resolved}'. Refusing to start from step 0. "
+            "Reset the job for a fresh run or restore resume artifacts."
+        )
+        logger(message)
+        if on_error is not None:
+            on_error(message)
+        return JOB_EXIT_FAILED
 
     try:
         run_steps_for_model(

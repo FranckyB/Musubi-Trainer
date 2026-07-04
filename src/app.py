@@ -2035,7 +2035,6 @@ def _launch_ui_impl() -> int:
         ):
             return
         removed = job_queue.pop(idx)
-        remove_job_from_disk(removed)
         save_job_order()
         if training_dir.exists() and training_dir.is_dir():
             try:
@@ -2092,7 +2091,6 @@ def _launch_ui_impl() -> int:
                     continue
 
             removed = job_queue.pop(idx)
-            remove_job_from_disk(removed)
             archived_names.append(job_name)
 
             if training_dir.exists() and training_dir.is_dir():
@@ -2607,6 +2605,28 @@ def _launch_ui_impl() -> int:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         settings_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
 
+        # If progress metadata already exists, keep completed_step and update target_steps
+        # so editing train_steps (for example 1500 -> 3000) is reflected immediately.
+        try:
+            output_dir = Path(job.get("output_dir", "")).expanduser()
+            progress_path = output_dir.parent / JOB_PROGRESS_FILE_NAME
+            if progress_path.exists() and progress_path.is_file():
+                payload_raw = json.loads(progress_path.read_text(encoding="utf-8"))
+                if isinstance(payload_raw, dict):
+                    payload = dict(payload_raw)
+                    raw_completed = payload.get("completed_step", 0)
+                    try:
+                        completed_step = int(raw_completed)
+                    except (TypeError, ValueError):
+                        completed_step = 0
+                    payload["output_name"] = str(payload.get("output_name", training_name) or training_name)
+                    payload["completed_step"] = max(0, completed_step)
+                    payload["target_steps"] = get_positive_int_setting(job, "train_steps", DEFAULT_TRAIN_STEPS)
+                    payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                    progress_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
     def ensure_job_training_args_toml(job: dict[str, str], *, silent: bool = True) -> bool:
         model_name = (job.get("model", "klein-base-9b") or "klein-base-9b").strip()
         job_run_fn = _run_job_for_model(model_name)
@@ -2641,7 +2661,7 @@ def _launch_ui_impl() -> int:
 
         run_job_kwargs_all = {
             "dataset_name": training_name,
-            "output_name": job.get("job_name", training_name),
+            "output_name": training_name,
             "output_dir": output_dir,
             "default_caption_keyword": settings_state.get(app_settings.DEFAULT_CAPTION_KEYWORD_KEY, ""),
             "resolution": get_positive_int_setting(job, "resolution", DEFAULT_RESOLUTION, minimum=64),
@@ -2959,7 +2979,126 @@ def _launch_ui_impl() -> int:
 
         return renamed, conflicts
 
+    def _dataset_name_from_media_directory(media_dir: Path) -> str:
+        datasets_root = datasets_root_dir().resolve()
+        try:
+            resolved = media_dir.resolve()
+        except Exception:
+            resolved = media_dir
+
+        try:
+            relative = resolved.relative_to(datasets_root)
+            if relative.parts:
+                return str(relative.parts[0]).strip()
+        except Exception:
+            pass
+
+        if resolved.name.lower() in {"images", "audio"} and resolved.parent.name:
+            return resolved.parent.name.strip()
+        if resolved.name:
+            return resolved.name.strip()
+        return ""
+
+    def recovered_datasets_from_training_dir(job_dir: Path) -> list[dict[str, object]]:
+        dataset_toml = job_dir / "dataset.toml"
+        if not dataset_toml.exists() or not dataset_toml.is_file():
+            return []
+
+        try:
+            import tomllib  # Python 3.11+
+            parsed = tomllib.loads(dataset_toml.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+
+        if not isinstance(parsed, dict):
+            return []
+
+        raw_datasets = parsed.get("datasets", [])
+        if not isinstance(raw_datasets, list):
+            return []
+
+        recovered: list[dict[str, object]] = []
+        for entry in raw_datasets:
+            if not isinstance(entry, dict):
+                continue
+
+            raw_media_dir = entry.get("image_directory", "") or entry.get("audio_directory", "")
+            media_dir_text = str(raw_media_dir or "").strip()
+            if not media_dir_text:
+                continue
+
+            media_dir = Path(media_dir_text).expanduser()
+            if not media_dir.is_absolute():
+                media_dir = (dataset_toml.parent / media_dir).resolve()
+
+            dataset_name = _dataset_name_from_media_directory(media_dir)
+            if not dataset_name:
+                continue
+
+            try:
+                num_repeats = int(entry.get("num_repeats", 1))
+            except Exception:
+                num_repeats = 1
+            if num_repeats <= 0:
+                num_repeats = 1
+
+            recovered.append({"name": dataset_name, "num_repeats": num_repeats})
+
+        return recovered
+
+    def recovered_resolution_from_dataset_toml(job_dir: Path, model_name_hint: str = "") -> str:
+        dataset_toml = job_dir / "dataset.toml"
+        if not dataset_toml.exists() or not dataset_toml.is_file():
+            return ""
+
+        try:
+            import tomllib  # Python 3.11+
+            parsed = tomllib.loads(dataset_toml.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+
+        if not isinstance(parsed, dict):
+            return ""
+
+        general = parsed.get("general", {})
+        if not isinstance(general, dict):
+            return ""
+
+        raw_resolution = general.get("resolution")
+        if not isinstance(raw_resolution, list) or len(raw_resolution) < 2:
+            return ""
+
+        try:
+            width = int(raw_resolution[0])
+            height = int(raw_resolution[1])
+        except Exception:
+            return ""
+
+        if width <= 0 or height <= 0:
+            return ""
+
+        if width == height:
+            return str(width)
+
+        model_key = (model_name_hint or "").strip().lower()
+        if model_key == "ltx-2.3":
+            if width <= 64 or height <= 64:
+                return "64"
+            if (width, height) == (1280, 720):
+                return "1280"
+            if (width, height) == (1920, 1080):
+                return "1920"
+
+        return str(max(width, height))
+
     def infer_dataset_name_from_training_dir(job_dir: Path) -> str:
+        recovered_datasets = recovered_datasets_from_training_dir(job_dir)
+        if recovered_datasets:
+            first = recovered_datasets[0]
+            candidate = str(first.get("name", "") or "").strip()
+            if candidate:
+                return candidate
+
         dataset_toml = job_dir / "dataset.toml"
         if dataset_toml.exists() and dataset_toml.is_file():
             try:
@@ -2980,13 +3119,127 @@ def _launch_ui_impl() -> int:
                     pass
         return ""
 
+    def recovered_job_values_from_training_args(job_dir: Path) -> dict[str, str]:
+        training_args_path = job_dir / "training_args.toml"
+        if not training_args_path.exists() or not training_args_path.is_file():
+            return {}
+
+        try:
+            import tomllib  # Python 3.11+
+            training_args_text = training_args_path.read_text(encoding="utf-8")
+            parsed = tomllib.loads(training_args_text)
+        except Exception:
+            return {}
+
+        if not isinstance(parsed, dict):
+            return {}
+
+        recovered: dict[str, str] = {}
+
+        model_version = str(parsed.get("model_version", "") or "").strip()
+        timestep_sampling = str(parsed.get("timestep_sampling", "") or "").strip().lower()
+        network_module = str(parsed.get("network_module", "") or "").strip().lower()
+        dit_path = str(parsed.get("dit", "") or "").strip().lower()
+
+        raw_learning_rate = ""
+        learning_rate_match = re.search(
+            r"^\s*learning_rate\s*=\s*([^#\r\n]+)",
+            training_args_text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        if learning_rate_match is not None:
+            raw_learning_rate = learning_rate_match.group(1).strip()
+            if len(raw_learning_rate) >= 2 and raw_learning_rate[0] == raw_learning_rate[-1] and raw_learning_rate[0] in {'"', "'"}:
+                raw_learning_rate = raw_learning_rate[1:-1].strip()
+
+        inferred_model = ""
+        if model_version:
+            inferred_model = model_version
+        elif network_module.endswith("lora_krea2") or "lora_krea2" in network_module:
+            inferred_model = "krea2"
+        elif (
+            timestep_sampling == "krea2_shift"
+            or "weighting_scheme" in parsed
+            or "discrete_flow_shift" in parsed
+        ):
+            inferred_model = "krea2"
+        elif timestep_sampling == "flux2_shift" or network_module.endswith("lora_flux_2"):
+            if "klein-base-9b" in dit_path:
+                inferred_model = "klein-base-9b"
+            elif "klein-9b" in dit_path:
+                inferred_model = "klein-9b"
+            elif "klein-base-4b" in dit_path:
+                inferred_model = "klein-base-4b"
+            elif "klein-4b" in dit_path:
+                inferred_model = "klein-4b"
+            elif "flux2-dev" in dit_path:
+                inferred_model = "flux2-dev"
+
+        if inferred_model:
+            recovered["model"] = inferred_model
+
+        if network_module:
+            recovered["network_type"] = "lokr" if "lokr" in network_module else "lora"
+
+        output_name = str(parsed.get("output_name", "") or "").strip()
+        if output_name:
+            recovered["job_name"] = output_name
+
+        for src_key, dst_key in (
+            ("network_dim", "network_dim"),
+            ("network_alpha", "network_alpha"),
+            ("max_train_steps", "train_steps"),
+            ("save_every_n_steps", "save_every_n_steps"),
+            ("optimizer_type", "optimizer_type"),
+        ):
+            if src_key in parsed:
+                recovered[dst_key] = str(parsed.get(src_key, "")).strip()
+
+        if raw_learning_rate:
+            recovered["learning_rate"] = raw_learning_rate
+        elif "learning_rate" in parsed:
+            recovered["learning_rate"] = str(parsed.get("learning_rate", "")).strip()
+
+        if recovered.get("optimizer_type", "").strip().lower() == "prodigyopt.prodigy":
+            recovered["optimizer_type"] = "prodigy"
+
+        for src_key, dst_key in (
+            ("compile", "enable_compile"),
+            ("cuda_allow_tf32", "enable_tf32"),
+            ("cuda_cudnn_benchmark", "enable_cudnn"),
+            ("gradient_checkpointing_cpu_offload", "enable_gc"),
+        ):
+            if src_key not in parsed:
+                continue
+            try:
+                recovered[dst_key] = "1" if bool(parsed.get(src_key)) else "0"
+            except Exception:
+                continue
+
+        if ("fp8_base" in parsed) or ("fp8_scaled" in parsed):
+            try:
+                fp8_enabled = bool(parsed.get("fp8_base")) or bool(parsed.get("fp8_scaled"))
+                recovered["enable_fp8"] = "1" if fp8_enabled else "0"
+            except Exception:
+                pass
+
+        return {k: v for k, v in recovered.items() if v != ""}
+
     def build_recovered_job_from_training_dir(job_dir: Path) -> dict[str, str]:
         training_name = job_dir.name.strip()
+        recovered_datasets = recovered_datasets_from_training_dir(job_dir)
         dataset_name = infer_dataset_name_from_training_dir(job_dir).strip() or training_name
+        datasets_json = ""
+        if recovered_datasets:
+            try:
+                datasets_json = json.dumps(recovered_datasets)
+            except Exception:
+                datasets_json = ""
         output_dir = (job_dir / "output").expanduser()
-        return {
+        recovered = {
             "id": training_name,
             "dataset_name": dataset_name,
+            "datasets_json": datasets_json,
             "training_name": training_name,
             "training_dir": str(job_dir),
             "job_name": training_name,
@@ -3020,6 +3273,11 @@ def _launch_ui_impl() -> int:
             "hold": "0",
             "status": "queued",
         }
+        recovered.update(recovered_job_values_from_training_args(job_dir))
+        recovered_resolution = recovered_resolution_from_dataset_toml(job_dir, recovered.get("model", ""))
+        if recovered_resolution:
+            recovered["resolution"] = recovered_resolution
+        return recovered
 
     def detect_job_status(job: dict[str, str]) -> str:
         hold = flag_to_bool(job.get("hold", "0"))
@@ -3096,6 +3354,17 @@ def _launch_ui_impl() -> int:
                 normalized = build_recovered_job_from_training_dir(child)
             else:
                 normalized = {str(k): str(v) for k, v in raw.items()}
+
+            recovered_from_args = recovered_job_values_from_training_args(child)
+            recovered_model = recovered_from_args.get("model", "").strip()
+            if recovered_model:
+                normalized["model"] = recovered_model
+            for key, value in recovered_from_args.items():
+                normalized[key] = value
+
+            recovered_resolution = recovered_resolution_from_dataset_toml(child, normalized.get("model", ""))
+            if recovered_resolution:
+                normalized["resolution"] = recovered_resolution
 
             job_id = training_name
             normalized["id"] = training_name
@@ -5040,7 +5309,9 @@ def _launch_ui_impl() -> int:
 
                             run_job_kwargs = {
                                 "dataset_name": training_name,
-                                "output_name": job_name,
+                                # Keep checkpoint/state naming stable across edits so resume detection
+                                # always matches existing artifacts in output_dir.
+                                "output_name": training_name,
                                 "output_dir": output_dir,
                                 "default_caption_keyword": settings_state.get(app_settings.DEFAULT_CAPTION_KEYWORD_KEY, ""),
                                 "resolution": resolution_value,
