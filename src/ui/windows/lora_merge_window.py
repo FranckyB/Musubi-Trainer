@@ -14,7 +14,7 @@ class LoraMergeWindow:
         self,
         dataset_name: str,
         available_loras: list[Path],
-    ) -> tuple[list[str], list[tuple[str, str, list[str], str]]] | None:
+    ) -> tuple[list[str], list[tuple[str, str, list[str], str]], bool] | None:
         dialog = self.tk.Toplevel(self.root)
         dialog.withdraw()
         dialog.title("LoRA Post-Hoc EMA Merge")
@@ -31,6 +31,23 @@ class LoraMergeWindow:
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(3, weight=1)
+
+        comfy_models_root: Path | None = None
+        settings = getattr(self, "settings_state", {})
+        app_settings_obj = getattr(self, "app_settings", None)
+        extra_key = getattr(app_settings_obj, "EXTRA_SEARCH_PATHS_KEY", "extra_search_paths")
+        try:
+            raw_extra = str(settings.get(extra_key, "")).strip() if isinstance(settings, dict) else ""
+        except Exception:
+            raw_extra = ""
+        try:
+            extra_paths = json.loads(raw_extra) if raw_extra else []
+        except Exception:
+            extra_paths = []
+        if isinstance(extra_paths, list) and extra_paths:
+            first = str(extra_paths[0]).strip()
+            if first:
+                comfy_models_root = Path(first).expanduser()
 
         self.ttk.Label(frame, text=f"LoRAs in output for {dataset_name}:").grid(row=0, column=0, sticky="w")
         self.ttk.Label(frame, text="Select the LoRAs you want to merge.").grid(row=1, column=0, sticky="w", pady=(4, 0))
@@ -181,11 +198,24 @@ class LoraMergeWindow:
         self.ttk.Checkbutton(mode_section, text="BETA", variable=mode_beta_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.ttk.Checkbutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
 
+        send_to_comfy_var = self.tk.BooleanVar(value=True)
+        if comfy_models_root is not None:
+            send_to_comfy_check = self.ttk.Checkbutton(
+                frame,
+                text="Send to Comfy",
+                variable=send_to_comfy_var,
+            )
+            send_to_comfy_check.grid(row=6, column=0, sticky="w", pady=(10, 0))
+            self.attach_hover_tooltip(
+                send_to_comfy_check,
+                "Copy merged LoRAs to ComfyUI models folder: loras/training",
+            )
+
         button_row = self.ttk.Frame(frame)
-        button_row.grid(row=6, column=0, sticky="ew", pady=(12, 0))
+        button_row.grid(row=7, column=0, sticky="ew", pady=(12, 0))
         button_row.columnconfigure(0, weight=1)
 
-        choice: tuple[list[str], list[tuple[str, str, list[str], str]]] | None = None
+        choice: tuple[list[str], list[tuple[str, str, list[str], str]], bool] | None = None
 
         def choose_and_close() -> None:
             nonlocal choice
@@ -237,7 +267,8 @@ class LoraMergeWindow:
                 for mode_label, mode_suffix, mode_key in mode_defs:
                     selected_jobs.append((mode_label, mode_suffix, preset_args[mode_key], preset_name))
 
-            choice = (selected_file_paths, selected_jobs)
+            send_to_comfy = bool(send_to_comfy_var.get()) and (comfy_models_root is not None)
+            choice = (selected_file_paths, selected_jobs, send_to_comfy)
             dialog.destroy()
 
         def cancel_and_close() -> None:
@@ -474,7 +505,45 @@ class LoraMergeWindow:
         merge_options = self.ask_lora_merge_options(target_name, available)
         if merge_options is None:
             return
-        selected_files, selected_jobs = merge_options
+        selected_files, selected_jobs, send_to_comfy = merge_options
+
+        comfy_target_dir: Path | None = None
+        if send_to_comfy:
+            settings = getattr(self, "settings_state", {})
+            app_settings_obj = getattr(self, "app_settings", None)
+            extra_key = getattr(app_settings_obj, "EXTRA_SEARCH_PATHS_KEY", "extra_search_paths")
+            try:
+                raw_extra = str(settings.get(extra_key, "")).strip() if isinstance(settings, dict) else ""
+            except Exception:
+                raw_extra = ""
+            try:
+                extra_paths = json.loads(raw_extra) if raw_extra else []
+            except Exception:
+                extra_paths = []
+            if isinstance(extra_paths, list) and extra_paths:
+                first = str(extra_paths[0]).strip()
+                if first:
+                    comfy_target_dir = Path(first).expanduser() / "loras" / "training"
+
+        if send_to_comfy and comfy_target_dir is None:
+            self.messagebox.showerror(
+                "Merge unavailable",
+                "Send to Comfy is enabled, but ComfyUI models path is not configured.",
+                parent=self.root,
+            )
+            return
+
+        if send_to_comfy and comfy_target_dir is not None:
+            try:
+                comfy_target_dir.mkdir(parents=True, exist_ok=True)
+                merge_output_dir = comfy_target_dir
+            except OSError as exc:
+                self.messagebox.showerror(
+                    "Merge unavailable",
+                    f"Could not create Comfy target folder:\n{comfy_target_dir}\n\n{exc}",
+                    parent=self.root,
+                )
+                return
 
         musubi_python = self.runtime_config.musubi_python
         if musubi_python is None or not musubi_python.is_file():
@@ -500,60 +569,134 @@ class LoraMergeWindow:
         existing_pythonpath = run_env.get("PYTHONPATH", "")
         run_env["PYTHONPATH"] = musubi_src if not existing_pythonpath else f"{musubi_src}{self.os.pathsep}{existing_pythonpath}"
 
+        total_steps = len(selected_jobs)
+        loading_overlay = self.tk.Toplevel(self.root)
+        loading_overlay.overrideredirect(True)
+        loading_overlay.configure(bg=self.bg_panel, bd=2, relief="solid")
+        loading_overlay.transient(self.root)
+        loading_overlay.lift(self.root)
+
+        self.root.update_idletasks()
+        ox = self.root.winfo_x() + max(0, (self.root.winfo_width() - 340) // 2)
+        oy = self.root.winfo_y() + max(0, (self.root.winfo_height() - 130) // 2)
+        loading_overlay.geometry(f"340x130+{ox}+{oy}")
+
+        overlay_label = self.ttk.Label(
+            loading_overlay,
+            text=f"EMA Merge... 0/{total_steps}",
+            font=("Segoe UI", 11, "bold"),
+            background=self.bg_panel,
+            foreground="#ffffff",
+        )
+        overlay_label.pack(pady=(24, 6))
+
+        overlay_sub = self.ttk.Label(
+            loading_overlay,
+            text="",
+            background=self.bg_panel,
+            foreground=self.fg_muted,
+        )
+        overlay_sub.pack(pady=(0, 8))
+
+        pb_frame = self.tk.Frame(loading_overlay, height=8, width=260, bg=self.bg_panel)
+        pb_frame.pack_propagate(False)
+        pb_frame.pack(pady=(0, 14))
+
+        pb_bg = self.tk.Canvas(
+            pb_frame,
+            width=260,
+            height=8,
+            bg="#1e1e1e",
+            bd=0,
+            highlightthickness=0,
+        )
+        pb_bg.pack(fill="both", expand=True)
+        pb_fill = pb_bg.create_rectangle(0, 0, 0, 8, fill="#0090d8", width=0)
+
+        def _set_progress(value: int, subtitle: str = "") -> None:
+            clamped = max(0, min(value, total_steps))
+            ratio = 0.0 if total_steps <= 0 else (clamped / total_steps)
+            width = int(260 * ratio)
+            pb_bg.coords(pb_fill, 0, 0, width, 8)
+            overlay_label.configure(text=f"EMA Merge... {clamped}/{total_steps}")
+            if subtitle:
+                overlay_sub.configure(text=subtitle)
+            loading_overlay.update_idletasks()
+
+        _set_progress(0)
+        loading_overlay.update()
+
         self.log("")
         created_paths: list[Path] = []
-        for merge_mode_label, merge_mode_suffix, merge_mode_args, preset_name in selected_jobs:
-            output_path = self.next_merged_output_path(
-                target_name,
-                merge_output_dir,
-                merge_mode_suffix,
-                preset_name,
-                selected_files,
-            )
-            command = [
-                str(musubi_python),
-                str(compat_script),
-                "--musubi_src",
-                musubi_src,
-                *selected_files,
-                "--output_file",
-                str(output_path),
-                *merge_mode_args,
-            ]
+        completed_steps = 0
+        try:
+            for merge_mode_label, merge_mode_suffix, merge_mode_args, preset_name in selected_jobs:
+                _set_progress(completed_steps, f"{target_name}: {merge_mode_label} / {preset_name}")
+                output_path = self.next_merged_output_path(
+                    target_name,
+                    merge_output_dir,
+                    merge_mode_suffix,
+                    preset_name,
+                    selected_files,
+                )
+                command = [
+                    str(musubi_python),
+                    str(compat_script),
+                    "--musubi_src",
+                    musubi_src,
+                    *selected_files,
+                    "--output_file",
+                    str(output_path),
+                    *merge_mode_args,
+                ]
 
-            self.log(
-                f"[Post-Hoc EMA] Merging {len(selected_files)} checkpoint(s) for '{target_name}' "
-                f"using {merge_mode_label} / {preset_name}..."
-            )
-            result = self.subprocess.run(
-                command,
-                cwd=str(self.runtime_config.musubi_dir),
-                env=run_env,
-                capture_output=True,
-                text=True,
-            )
+                self.log(
+                    f"[Post-Hoc EMA] Merging {len(selected_files)} checkpoint(s) for '{target_name}' "
+                    f"using {merge_mode_label} / {preset_name}..."
+                )
+                result = self.subprocess.run(
+                    command,
+                    cwd=str(self.runtime_config.musubi_dir),
+                    env=run_env,
+                    capture_output=True,
+                    text=True,
+                )
 
-            stdout_text = result.stdout.strip()
-            stderr_text = result.stderr.strip()
-            if stdout_text:
-                self.log(stdout_text)
+                stdout_text = result.stdout.strip()
+                stderr_text = result.stderr.strip()
+                if stdout_text:
+                    self.log(stdout_text)
 
-            if result.returncode != 0:
-                message = stderr_text if stderr_text else "lora_post_hoc_ema.py failed with no error output."
-                self.log(f"[Post-Hoc EMA] Failed ({result.returncode}) while running {merge_mode_label} / {preset_name}.")
+                if result.returncode != 0:
+                    message = stderr_text if stderr_text else "lora_post_hoc_ema.py failed with no error output."
+                    self.log(f"[Post-Hoc EMA] Failed ({result.returncode}) while running {merge_mode_label} / {preset_name}.")
+                    if stderr_text:
+                        self.log(stderr_text)
+                    self.messagebox.showerror("Post-Hoc EMA merge failed", message, parent=self.root)
+                    return
+
+                self.log(f"[Post-Hoc EMA] Created ({merge_mode_suffix} / {preset_name}): {output_path}")
                 if stderr_text:
                     self.log(stderr_text)
-                self.messagebox.showerror("Post-Hoc EMA merge failed", message, parent=self.root)
-                return
-
-            self.log(f"[Post-Hoc EMA] Created ({merge_mode_suffix} / {preset_name}): {output_path}")
-            if stderr_text:
-                self.log(stderr_text)
-            created_paths.append(output_path)
+                created_paths.append(output_path)
+                completed_steps += 1
+                _set_progress(completed_steps, f"{target_name}: {merge_mode_label} / {preset_name}")
+        finally:
+            try:
+                loading_overlay.destroy()
+            except self.tk.TclError:
+                pass
 
         if created_paths:
             created_text = "\n".join(path.stem if path.suffix.lower() == ".safetensors" else path.name for path in created_paths)
-            self.messagebox.showinfo("Post-Hoc EMA merge complete", f"Created:\n{created_text}", parent=self.root)
+            if send_to_comfy and comfy_target_dir is not None:
+                self.messagebox.showinfo(
+                    "Post-Hoc EMA merge complete",
+                    f"Created in Comfy loras/training:\n{created_text}",
+                    parent=self.root,
+                )
+            else:
+                self.messagebox.showinfo("Post-Hoc EMA merge complete", f"Created:\n{created_text}", parent=self.root)
 
         self.checkpoint_cache.pop(target_name, None)
         self.rebuild_folder_list(force=True)

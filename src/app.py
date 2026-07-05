@@ -1693,6 +1693,7 @@ def _launch_ui_impl() -> int:
             "center_window": center_window,
             "checkpoint_cache": checkpoint_cache,
             "fg_text": fg_text,
+            "fg_muted": fg_muted,
             "filedialog": filedialog,
             "log": log,
             "merge_mode_tooltip_text": merge_mode_tooltip_text,
@@ -1718,7 +1719,7 @@ def _launch_ui_impl() -> int:
     def ask_lora_merge_options(
         dataset_name: str,
         available_loras: list[Path],
-    ) -> tuple[list[str], list[tuple[str, str, list[str], str]]] | None:
+    ) -> tuple[list[str], list[tuple[str, str, list[str], str]], bool] | None:
         return _lora_merge_window().ask_lora_merge_options(dataset_name, available_loras)
 
     def lora_post_hoc_ema_merge(dataset_name: str) -> None:
@@ -3807,13 +3808,13 @@ def _launch_ui_impl() -> int:
         merged_output_dir.mkdir(parents=True, exist_ok=True)
         lora_post_hoc_ema_merge_for_output(job_name, output_dir, merged_output_dir)
 
-    def merge_selected_jobs_with_post_hoc_ema() -> None:
-        selected_indices = selected_queue_indices()
+    def _merge_jobs_with_post_hoc_ema(selected_indices: list[int], dialog_title: str) -> None:
+        selected_indices = sorted({idx for idx in selected_indices if 0 <= idx < len(job_queue)})
         if not selected_indices:
             messagebox.showinfo("EMA Merge", "Select at least one job first.", parent=root)
             return
 
-        merge_profile_choice = _lora_merge_window().ask_post_hoc_ema_profiles("EMA Merge Selected Jobs")
+        merge_profile_choice = _lora_merge_window().ask_post_hoc_ema_profiles(dialog_title)
         if not merge_profile_choice:
             return
         merge_profiles, send_to_comfy = merge_profile_choice
@@ -4142,6 +4143,9 @@ def _launch_ui_impl() -> int:
                 messagebox.showinfo("EMA Merge", "No merges were produced.", parent=root)
 
         root.after(0, _poll_merge_progress)
+
+    def merge_selected_jobs_with_post_hoc_ema() -> None:
+        _merge_jobs_with_post_hoc_ema(selected_queue_indices(), "EMA Merge Selected Jobs")
 
     def fix_job_element_names(index: int | None = None) -> None:
         idx = selected_queue_index() if index is None else index
