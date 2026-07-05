@@ -2541,6 +2541,68 @@ def _launch_ui_impl() -> int:
             return -1
         return value if (value == -1 or value > 0) else -1
 
+    def _job_dataset_names(job: dict[str, str]) -> list[str]:
+        raw_datasets = str(job.get("datasets_json", "") or "").strip()
+        names: list[str] = []
+        if raw_datasets:
+            try:
+                parsed = json.loads(raw_datasets)
+            except Exception:
+                parsed = []
+            if isinstance(parsed, list):
+                for entry in parsed:
+                    if not isinstance(entry, dict):
+                        continue
+                    name = str(entry.get("name", "") or "").strip()
+                    if name:
+                        names.append(name)
+
+        if not names:
+            single = str(job.get("dataset_name", "") or "").strip()
+            if single:
+                names.append(single)
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(name)
+        return deduped
+
+    def clear_sd_scripts_npz_for_job(job: dict[str, str], reason: str) -> None:
+        model_name = str(job.get("model", "") or "").strip().lower()
+        if model_name not in _SDXL_MODELS:
+            return
+
+        removed = 0
+        errors: list[str] = []
+        for dataset_name in _job_dataset_names(job):
+            dataset_dir = dataset_dir_path(dataset_name)
+            if not dataset_dir.exists() or not dataset_dir.is_dir():
+                continue
+            try:
+                for npz_path in dataset_dir.rglob("*.npz"):
+                    if not npz_path.is_file():
+                        continue
+                    try:
+                        npz_path.unlink(missing_ok=True)
+                        removed += 1
+                    except OSError as exc:
+                        errors.append(f"{npz_path}: {exc}")
+            except OSError as exc:
+                errors.append(f"{dataset_dir}: {exc}")
+
+        job_name = str(job.get("job_name", "unnamed") or "unnamed")
+        if removed > 0:
+            log(f"[Cleanup] Removed {removed} sd-scripts .npz cache file(s) for job '{job_name}' ({reason}).")
+        if errors:
+            log(f"[Cleanup] Some .npz files could not be removed for job '{job_name}' ({reason}):")
+            for line in errors[:20]:
+                log(f"  - {line}")
+
     def save_job_order() -> None:
         ensure_jobs_storage()
         order = [job.get("training_name", "").strip() for job in job_queue if job.get("training_name", "").strip()]
@@ -3523,6 +3585,7 @@ def _launch_ui_impl() -> int:
             job_queue[idx]["hold"] = bool_to_flag(target_hold)
             if target_hold and job_queue[idx].get("status", "") in {"queued", "failed", "running", "resume"}:
                 job_queue[idx]["status"] = "paused"
+                clear_sd_scripts_npz_for_job(job_queue[idx], "paused")
             elif (not target_hold) and job_queue[idx].get("status", "") in {"paused", "failed", "cancelled"}:
                 job_queue[idx]["status"] = "queued"
             save_job_to_disk(job_queue[idx])
@@ -3650,6 +3713,7 @@ def _launch_ui_impl() -> int:
         job_queue[idx]["hold"] = bool_to_flag(next_hold)
         if next_hold and job_queue[idx].get("status", "") in {"queued", "failed", "running", "resume"}:
             job_queue[idx]["status"] = "paused"
+            clear_sd_scripts_npz_for_job(job_queue[idx], "paused")
         elif (not next_hold) and job_queue[idx].get("status", "") in {"paused", "failed", "cancelled"}:
             job_queue[idx]["status"] = "queued"
         save_job_to_disk(job_queue[idx])
@@ -5398,8 +5462,10 @@ def _launch_ui_impl() -> int:
 
                     if exit_code == JOB_EXIT_SUCCESS:
                         next_status = "done"
+                        clear_sd_scripts_npz_for_job(job_queue[queue_index], "completed")
                     elif exit_code == JOB_EXIT_CANCELLED:
                         next_status = "cancelled"
+                        clear_sd_scripts_npz_for_job(job_queue[queue_index], "stopped")
                     else:
                         next_status = "failed"
                     job_queue[queue_index]["status"] = next_status
