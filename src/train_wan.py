@@ -46,6 +46,7 @@ from .train_utils import (
     write_recorded_completed_steps,
     next_dataset_log_run_dir,
     require_model_file,
+    should_disable_compile_with_fp8,
     toml_quote,
     toml_string_list,
 )
@@ -255,9 +256,14 @@ def run_steps_for_model(
         else:
             resolved_workers = max(1, int(resolved_workers))
 
-        compile_enabled = bool(enable_compile_optimizations and not enable_fp8_dit)
-        if enable_compile_optimizations and enable_fp8_dit:
-            logger("  compile note: ignoring --compile because FP8 is enabled")
+        disable_compile_for_fp8 = (
+            enable_compile_optimizations
+            and enable_fp8_dit
+            and should_disable_compile_with_fp8("Wan")
+        )
+        compile_enabled = bool(enable_compile_optimizations and not disable_compile_for_fp8)
+        if disable_compile_for_fp8:
+            logger("  compile note: ignoring --compile because FP8 is enabled for Wan family")
 
         model_lines = [
             f"dit = {toml_quote(str(dit_path))}",

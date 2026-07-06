@@ -44,6 +44,7 @@ from .train_utils import (  # noqa: F401  (re-exported for backward compat)
     remap_resume_artifacts_for_output,
     require_model_file,
     run_command,
+    should_disable_compile_with_fp8,
     toml_quote,
     toml_string_list,
     write_recorded_completed_steps,
@@ -409,9 +410,14 @@ def run_steps_for_model(
         output_dir.mkdir(parents=True, exist_ok=True)
 
         train_steps_for_run = train_steps_override if train_steps_override is not None else train_steps
-        compile_enabled = bool(enable_compile_optimizations and not enable_fp8_dit)
-        if enable_compile_optimizations and enable_fp8_dit:
-            logger("  compile note: ignoring --compile because FP8 is enabled")
+        disable_compile_for_fp8 = (
+            enable_compile_optimizations
+            and enable_fp8_dit
+            and should_disable_compile_with_fp8("FLUX.2")
+        )
+        compile_enabled = bool(enable_compile_optimizations and not disable_compile_for_fp8)
+        if disable_compile_for_fp8:
+            logger("  compile note: ignoring --compile because FP8 is enabled for FLUX.2 family")
         if compile_enabled and (not args_only_mode) and not module_available("triton"):
             logger("  compile note: ignoring --compile because triton is not installed/available")
             compile_enabled = False

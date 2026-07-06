@@ -33,6 +33,17 @@ DEFAULT_LEARNING_RATE = "1e-4"
 DEFAULT_TRAIN_STEPS = 3000
 DEFAULT_SAVE_EVERY_N_STEPS = 250
 
+# Family policy: disable Torch Compile whenever FP8 is enabled for these families.
+# Keep this list centralized so behavior can be changed in one place.
+COMPILE_DISABLED_WITH_FP8_FAMILIES = {
+    "flux.2",
+    "wan",
+}
+
+
+def should_disable_compile_with_fp8(family_name: str) -> bool:
+    return (family_name or "").strip().casefold() in COMPILE_DISABLED_WITH_FP8_FAMILIES
+
 # Job exit codes
 JOB_EXIT_SUCCESS = 0
 JOB_EXIT_FAILED = 1
