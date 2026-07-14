@@ -7,8 +7,6 @@ Datasets/*
 !Datasets/.gitkeep
 Archives/*
 !Archives/.gitkeep
-Presets/*
-!Presets/.gitkeep
 Trainers/*
 !Trainers/.gitkeep
 
