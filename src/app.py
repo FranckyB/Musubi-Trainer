@@ -3938,6 +3938,21 @@ def _launch_ui_impl() -> int:
         loading_overlay.transient(root)
         loading_overlay.lift(root)
 
+        _overlay_bind_ids: list[tuple[str, str]] = []
+
+        def _keep_overlay_front(_event: object | None = None) -> None:
+            try:
+                if loading_overlay.winfo_exists():
+                    loading_overlay.transient(root)
+                    loading_overlay.lift(root)
+            except tk.TclError:
+                pass
+
+        for _event_name in ("<FocusIn>", "<Configure>"):
+            _bind_id = root.bind(_event_name, _keep_overlay_front, add="+")
+            if _bind_id:
+                _overlay_bind_ids.append((_event_name, _bind_id))
+
         root.update_idletasks()
         ox = root.winfo_x() + max(0, (root.winfo_width() - 340) // 2)
         oy = root.winfo_y() + max(0, (root.winfo_height() - 130) // 2)
@@ -3983,6 +3998,7 @@ def _launch_ui_impl() -> int:
             overlay_label.configure(text=f"EMA Merge... {clamped}/{total_steps}")
             if subtitle:
                 overlay_sub.configure(text=subtitle)
+            _keep_overlay_front()
             loading_overlay.update_idletasks()
 
         _set_progress(0)
@@ -4108,6 +4124,11 @@ def _launch_ui_impl() -> int:
                 loading_overlay.destroy()
             except tk.TclError:
                 pass
+            for _event_name, _bind_id in _overlay_bind_ids:
+                try:
+                    root.unbind(_event_name, _bind_id)
+                except tk.TclError:
+                    pass
 
             rebuild_folder_list(force=True)
 

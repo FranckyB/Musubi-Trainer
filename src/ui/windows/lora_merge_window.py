@@ -576,6 +576,21 @@ class LoraMergeWindow:
         loading_overlay.transient(self.root)
         loading_overlay.lift(self.root)
 
+        _overlay_bind_ids: list[tuple[str, str]] = []
+
+        def _keep_overlay_front(_event: object | None = None) -> None:
+            try:
+                if loading_overlay.winfo_exists():
+                    loading_overlay.transient(self.root)
+                    loading_overlay.lift(self.root)
+            except self.tk.TclError:
+                pass
+
+        for _event_name in ("<FocusIn>", "<Configure>"):
+            _bind_id = self.root.bind(_event_name, _keep_overlay_front, add="+")
+            if _bind_id:
+                _overlay_bind_ids.append((_event_name, _bind_id))
+
         self.root.update_idletasks()
         ox = self.root.winfo_x() + max(0, (self.root.winfo_width() - 340) // 2)
         oy = self.root.winfo_y() + max(0, (self.root.winfo_height() - 130) // 2)
@@ -621,6 +636,7 @@ class LoraMergeWindow:
             overlay_label.configure(text=f"EMA Merge... {clamped}/{total_steps}")
             if subtitle:
                 overlay_sub.configure(text=subtitle)
+            _keep_overlay_front()
             loading_overlay.update_idletasks()
 
         _set_progress(0)
@@ -686,6 +702,11 @@ class LoraMergeWindow:
                 loading_overlay.destroy()
             except self.tk.TclError:
                 pass
+            for _event_name, _bind_id in _overlay_bind_ids:
+                try:
+                    self.root.unbind(_event_name, _bind_id)
+                except self.tk.TclError:
+                    pass
 
         if created_paths:
             created_text = "\n".join(path.stem if path.suffix.lower() == ".safetensors" else path.name for path in created_paths)
