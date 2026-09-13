@@ -1,0 +1,14 @@
+# Normalize text files across platforms while preserving Windows batch scripts.
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

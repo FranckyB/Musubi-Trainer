@@ -84,11 +84,27 @@ Set up the shared app/training Python environment:
 Setup.bat
 ```
 
+On Linux:
+
+```bash
+./Setup.sh
+```
+
 `Setup.bat` attempts to auto-download a matching SageAttention wheel from:
 https://github.com/sdbds/SageAttention-for-windows/releases
 
 If auto-download fails, download a matching `.whl` manually from that releases page
 and run Setup with `--sage-wheel` pointing to the downloaded file.
+
+`Setup.sh` follows the same shared-venv flow for Linux, but skips the Windows-only
+`triton-windows` dependency and does not auto-download SageAttention.
+
+On Linux, the visual launcher also needs the system Tk runtime for `tkinter`.
+On CachyOS/Arch, install it with:
+
+```bash
+sudo pacman -S tk
+```
 
 
 ## Launch
@@ -99,7 +115,15 @@ From repository root:
 Launch.bat
 ```
 
+On Linux:
+
+```bash
+./Launch.sh
+```
+
 `Launch.bat` prefers `venv\Scripts\pythonw.exe` then `venv\Scripts\python.exe`.
+
+`Launch.sh` runs the app with `venv/bin/python` and reports if the shared venv has not been created yet.
 
 ## First-Time Setup
 
