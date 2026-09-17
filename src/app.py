@@ -152,6 +152,108 @@ def _launch_ui_impl() -> int:
         print("Use CLI mode with names and step flags, or install Pillow.")
         return 1
 
+    class _FileDialogAdapter:
+        def __init__(self, tk_filedialog: object) -> None:
+            self._tk_filedialog = tk_filedialog
+            self._use_kdialog = bool(sys.platform.startswith("linux") and shutil.which("kdialog"))
+
+        def askopenfilename(self, **kwargs: object) -> str:
+            if not self._use_kdialog:
+                return str(self._tk_filedialog.askopenfilename(**kwargs))
+
+            selection = self._run_kdialog(
+                mode="open-file",
+                title=str(kwargs.get("title") or "Select file"),
+                initialdir=str(kwargs.get("initialdir") or ""),
+                filetypes=kwargs.get("filetypes"),
+                multiple=False,
+            )
+            return selection[0] if selection else ""
+
+        def askopenfilenames(self, **kwargs: object) -> tuple[str, ...]:
+            if not self._use_kdialog:
+                return tuple(self._tk_filedialog.askopenfilenames(**kwargs))
+
+            selection = self._run_kdialog(
+                mode="open-file",
+                title=str(kwargs.get("title") or "Select files"),
+                initialdir=str(kwargs.get("initialdir") or ""),
+                filetypes=kwargs.get("filetypes"),
+                multiple=True,
+            )
+            return tuple(selection)
+
+        def askdirectory(self, **kwargs: object) -> str:
+            if not self._use_kdialog:
+                return str(self._tk_filedialog.askdirectory(**kwargs))
+
+            selection = self._run_kdialog(
+                mode="directory",
+                title=str(kwargs.get("title") or "Select folder"),
+                initialdir=str(kwargs.get("initialdir") or ""),
+                filetypes=None,
+                multiple=False,
+            )
+            return selection[0] if selection else ""
+
+        def _resolve_initialdir(self, initialdir: str) -> str:
+            candidate = Path(initialdir).expanduser() if initialdir else Path.home()
+            if candidate.exists():
+                return str(candidate)
+            if candidate.parent.exists():
+                return str(candidate.parent)
+            return str(Path.home())
+
+        def _build_filter(self, filetypes: object) -> str:
+            if not isinstance(filetypes, (list, tuple)):
+                return "*|All Files"
+
+            filters: list[str] = []
+            for entry in filetypes:
+                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                    continue
+                label = str(entry[0]).strip() or "Files"
+                raw_patterns = str(entry[1]).split()
+                patterns = ["*" if pattern == "*.*" else pattern for pattern in raw_patterns if pattern.strip()]
+                if not patterns:
+                    patterns = ["*"]
+                filters.append(f"{' '.join(patterns)}|{label}")
+
+            return "\n".join(filters) if filters else "*|All Files"
+
+        def _run_kdialog(
+            self,
+            *,
+            mode: str,
+            title: str,
+            initialdir: str,
+            filetypes: object,
+            multiple: bool,
+        ) -> list[str]:
+            command = ["kdialog", "--title", title]
+            if mode == "directory":
+                command.extend(["--getexistingdirectory", self._resolve_initialdir(initialdir)])
+            else:
+                if multiple:
+                    command.extend(["--multiple", "--separate-output"])
+                command.extend([
+                    "--getopenfilename",
+                    self._resolve_initialdir(initialdir),
+                    self._build_filter(filetypes),
+                ])
+
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            if result.returncode == 1:
+                return []
+
+            print(f"[UI] kdialog failed (exit {result.returncode}), falling back to Tk file dialog.")
+            self._use_kdialog = False
+            return []
+
+    filedialog = _FileDialogAdapter(filedialog)
+
     bg_root = "#181818"
     bg_panel = "#242424"
     bg_card = "#2d2d2d"
@@ -1249,6 +1351,9 @@ def _launch_ui_impl() -> int:
         nonlocal settings_reset_requested
         settings_reset_requested = bool(value)
 
+    def log(message: str) -> None:
+        print(message, flush=True)
+
     def open_settings_dialog(required: bool) -> RuntimeConfig | None:
         from .ui.windows import settings_window
         dependencies = {
@@ -1307,14 +1412,8 @@ def _launch_ui_impl() -> int:
             parent=root,
         )
         runtime_config = open_settings_dialog(required=False)
-        if runtime_config is None:
-            root.destroy()
-            return 1
     elif runtime_config is None:
         runtime_config = open_settings_dialog(required=False)
-        if runtime_config is None:
-            root.destroy()
-            return 1
 
     maybe_autostart_tensorboard()
 
@@ -1433,20 +1532,33 @@ def _launch_ui_impl() -> int:
                 parent=root,
             )
 
+    def _open_path_in_file_manager(path: Path, description: str, *, title: str = "Open failed") -> None:
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(path))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                if shutil.which("dolphin"):
+                    log(f"[Open] dolphin {path}")
+                    subprocess.Popen(["dolphin", str(path)])
+                    return
+                if shutil.which("xdg-open"):
+                    log(f"[Open] xdg-open {path}")
+                    subprocess.Popen(["xdg-open", str(path)])
+                    return
+                raise OSError("No supported Linux opener found (tried dolphin and xdg-open).")
+        except OSError as exc:
+            log(f"[Open] failed to open {path}: {exc}")
+            messagebox.showerror(title, f"Could not open {description}:\n{exc}", parent=root)
+
     def open_dataset_in_file_manager(dataset_name: str) -> None:
         dataset_dir = dataset_dir_path(dataset_name)
+        log(f"[Open Dataset] dataset_name={dataset_name}, path={dataset_dir}")
         if not dataset_dir.exists() or not dataset_dir.is_dir():
             messagebox.showerror("Open failed", f"Dataset folder not found:\n{dataset_dir}", parent=root)
             return
-        try:
-            if sys.platform == "win32":
-                os.startfile(str(dataset_dir))
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(dataset_dir)])
-            else:
-                subprocess.Popen(["xdg-open", str(dataset_dir)])
-        except OSError as exc:
-            messagebox.showerror("Open failed", f"Could not open folder:\n{exc}", parent=root)
+        _open_path_in_file_manager(dataset_dir, "folder")
 
     def open_metrics_viewer_dialog() -> None:
         nonlocal tensorboard_launch_in_progress
@@ -2291,12 +2403,57 @@ def _launch_ui_impl() -> int:
             )
 
     def show_thumbnail_context_menu(event: tk.Event, dataset_name: str) -> str:
+        return _show_popup_menu(
+            event,
+            [
+                ("command", {"label": "Edit Dataset", "command": lambda: open_edit_dataset_dialog(dataset_name)}),
+                ("command", {"label": "Open Dataset", "command": lambda: open_dataset_in_file_manager(dataset_name)}),
+                ("command", {"label": "Add Media", "command": lambda: add_images_to_dataset(dataset_name)}),
+                ("separator", {}),
+                ("command", {"label": "Archive Dataset", "command": lambda: archive_dataset(dataset_name)}),
+            ],
+        )
+
+    def _show_popup_menu(event: tk.Event, items: list[tuple[str, dict[str, object]]]) -> str:
         menu = tk.Menu(root, tearoff=0)
-        menu.add_command(label="Edit Dataset", command=lambda: open_edit_dataset_dialog(dataset_name))
-        menu.add_command(label="Open Dataset", command=lambda: open_dataset_in_file_manager(dataset_name))
-        menu.add_command(label="Add Media", command=lambda: add_images_to_dataset(dataset_name))
-        menu.add_separator()
-        menu.add_command(label="Archive Dataset", command=lambda: archive_dataset(dataset_name))
+        for item_type, payload in items:
+            if item_type == "separator":
+                menu.add_separator()
+            else:
+                menu.add_command(**payload)
+
+        def _dismiss_menu(_event: tk.Event | None = None) -> None:
+            try:
+                menu.unpost()
+            except tk.TclError:
+                pass
+            try:
+                root.unbind("<Button-1>", binding_id)
+            except tk.TclError:
+                pass
+            try:
+                root.unbind("<Escape>", escape_binding_id)
+            except tk.TclError:
+                pass
+            try:
+                menu.destroy()
+            except tk.TclError:
+                pass
+
+        def _dismiss_if_outside(click_event: tk.Event) -> None:
+            try:
+                widget = root.winfo_containing(click_event.x_root, click_event.y_root)
+            except tk.TclError:
+                widget = None
+            current = widget
+            while current is not None:
+                if current == menu:
+                    return
+                current = getattr(current, "master", None)
+            _dismiss_menu()
+
+        binding_id = root.bind("<Button-1>", _dismiss_if_outside, add="+")
+        escape_binding_id = root.bind("<Escape>", _dismiss_menu, add="+")
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -2456,14 +2613,10 @@ def _launch_ui_impl() -> int:
         log_box.configure(state="disabled")
 
     def _show_log_context_menu(event: "tk.Event[tk.Text]") -> None:
-        menu = tk.Menu(
-            root, tearoff=0,
-            bg=bg_card, fg=fg_text,
-            activebackground="#3a3f4b", activeforeground=fg_text,
-            bd=0, relief="flat",
+        _show_popup_menu(
+            event,
+            [("command", {"label": "Clear console", "command": _clear_log_box})],
         )
-        menu.add_command(label="Clear console", command=_clear_log_box)
-        menu.tk_popup(event.x_root, event.y_root)
 
     log_box.bind("<Button-3>", _show_log_context_menu)
 
@@ -3768,34 +3921,35 @@ def _launch_ui_impl() -> int:
             reset_job_with_confirmation(clicked)
 
         clicked_status = detect_job_status(job_queue[clicked])
-        menu = tk.Menu(root, tearoff=0)
-        menu.add_command(label="Open Output Folder", command=lambda: open_job_output_folder(clicked))
-        menu.add_command(label="LoRA Post-Hoc EMA Merge", command=lambda: merge_job_output_loras(clicked))
-        menu.add_command(label="Duplicate Job", command=lambda: duplicate_job(clicked))
-        menu.add_command(label="Edit Job", command=lambda: open_create_job_dialog(existing_job=job_queue[clicked]))
-        menu.add_command(label="Clear Job Cache", command=clear_clicked_job_cache)
-        menu.add_command(label="Reset Job (Fresh Start)", command=reset_clicked_job)
+        menu_items: list[tuple[str, dict[str, object]]] = [
+            ("command", {"label": "Open Output Folder", "command": lambda: open_job_output_folder(clicked)}),
+            ("command", {"label": "LoRA Post-Hoc EMA Merge", "command": lambda: merge_job_output_loras(clicked)}),
+            ("command", {"label": "Duplicate Job", "command": lambda: duplicate_job(clicked)}),
+            ("command", {"label": "Edit Job", "command": lambda: open_create_job_dialog(existing_job=job_queue[clicked])}),
+            ("command", {"label": "Clear Job Cache", "command": clear_clicked_job_cache}),
+            ("command", {"label": "Reset Job (Fresh Start)", "command": reset_clicked_job}),
+        ]
         if clicked_status == "broken":
-            menu.add_command(label="Fix LoRA Names", command=fix_clicked_job_names)
-        menu.add_separator()
-        menu.add_command(label="Archive Job", command=lambda: archive_job(clicked))
-        menu.add_command(label="Delete Job", command=lambda: delete_job_with_confirmation(clicked))
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
-        return "break"
+            menu_items.append(("command", {"label": "Fix LoRA Names", "command": fix_clicked_job_names}))
+        menu_items.extend(
+            [
+                ("separator", {}),
+                ("command", {"label": "Archive Job", "command": lambda: archive_job(clicked)}),
+                ("command", {"label": "Delete Job", "command": lambda: delete_job_with_confirmation(clicked)}),
+            ]
+        )
+        return _show_popup_menu(event, menu_items)
 
     def open_job_output_folder(index: int | None = None) -> None:
         idx = selected_queue_index() if index is None else index
+        log(f"[Open Output Folder] index={index}, resolved={idx}")
         if idx is None or idx < 0 or idx >= len(job_queue):
+            log("[Open Output Folder] no valid job selected")
             return
         output_dir = Path(job_queue[idx].get("output_dir", "")).expanduser()
+        log(f"[Open Output Folder] output_dir={output_dir}")
         output_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            os.startfile(str(output_dir))
-        except OSError as exc:
-            messagebox.showerror("Open output failed", f"Could not open output folder:\n{exc}", parent=root)
+        _open_path_in_file_manager(output_dir, "output folder", title="Open output failed")
 
     def merge_job_output_loras(index: int | None = None) -> None:
         idx = selected_queue_index() if index is None else index
@@ -4497,9 +4651,20 @@ def _launch_ui_impl() -> int:
         log("Stop requested for running job. It will be paused after cancellation.")
         update_start_button_state()
 
+    def _unpost_any_open_popup() -> None:
+        for child in root.winfo_children():
+            if isinstance(child, tk.Menu):
+                try:
+                    child.unpost()
+                    child.destroy()
+                except tk.TclError:
+                    pass
+
     def on_queue_press(event: tk.Event) -> str:
         nonlocal queue_drag_index, queue_drag_moved, queue_drag_allowed, queue_selection_anchor
         nonlocal queue_range_selecting, queue_range_anchor
+
+        _unpost_any_open_popup()
 
         def _is_drag_handle_hotspot(item_id: str, x: int, y: int) -> bool:
             bbox = queue_list.bbox(item_id, "#0")
@@ -4690,6 +4855,7 @@ def _launch_ui_impl() -> int:
             "detect_job_element_base_mismatch": detect_job_element_base_mismatch,
             "detect_job_status": detect_job_status,
             "ensure_training_job_structure": ensure_training_job_structure,
+            "filedialog": filedialog,
             "flag_to_bool": flag_to_bool,
             "get_positive_int_setting": get_positive_int_setting,
             "is_truthy": is_truthy,
@@ -5306,13 +5472,18 @@ def _launch_ui_impl() -> int:
                         time.sleep(0.3)
                         continue
 
-                    if runtime_config is None or runtime_config.dit is None or runtime_config.vae is None or runtime_config.text_encoder is None:
+                    queue_index = runnable_indices[0]
+                    queued_job = job_queue[queue_index]
+                    queued_model_name = queued_job.get("model", "klein-base-9b") or "klein-base-9b"
+                    queued_runtime_config = runtime_config_for_model(settings_state, queued_model_name) or runtime_config
+
+                    if queued_runtime_config is None or queued_runtime_config.dit is None or queued_runtime_config.vae is None or queued_runtime_config.text_encoder is None:
                         missing = []
-                        if runtime_config is None or runtime_config.dit is None:
+                        if queued_runtime_config is None or queued_runtime_config.dit is None:
                             missing.append("Model (DiT)")
-                        if runtime_config is None or runtime_config.vae is None:
+                        if queued_runtime_config is None or queued_runtime_config.vae is None:
                             missing.append("VAE")
-                        if runtime_config is None or runtime_config.text_encoder is None:
+                        if queued_runtime_config is None or queued_runtime_config.text_encoder is None:
                             missing.append("Text Encoder")
 
                         queue_play_mode = False
@@ -5332,7 +5503,6 @@ def _launch_ui_impl() -> int:
                         root.after(0, show_missing_model_error)
                         break
 
-                    queue_index = runnable_indices[0]
                     run_cancel_event = threading.Event()
                     run_in_progress = True
                     root.after(0, update_start_button_state)
@@ -5455,10 +5625,49 @@ def _launch_ui_impl() -> int:
                                 except ValueError:
                                     run_job_kwargs["ltx_first_frame_conditioning_p"] = 0.1
                             elif job_run_fn is _run_job_krea2:
+                                try:
+                                    model_paths_payload = json.loads(settings_state.get(app_settings.MODEL_PATHS_KEY, "{}") or "{}")
+                                except Exception:
+                                    model_paths_payload = {}
+                                krea2_model_paths = model_paths_payload.get("krea2", {}) if isinstance(model_paths_payload, dict) else {}
                                 run_job_kwargs["blocks_to_swap"] = get_non_negative_int_setting(job, "blocks_to_swap", 0)
                                 run_job_kwargs["timestep_sampling"] = str(job.get("timestep_sampling", "krea2_shift") or "krea2_shift")
                                 run_job_kwargs["weighting_scheme"] = str(job.get("weighting_scheme", "none") or "none")
                                 run_job_kwargs["discrete_flow_shift"] = str(job.get("discrete_flow_shift", "") or "")
+                                sample_prompts_raw = str(job.get("krea2_sample_prompts", "") or "").strip()
+                                if sample_prompts_raw:
+                                    run_job_kwargs["sample_prompts_path"] = Path(sample_prompts_raw).expanduser()
+                                sample_every_raw = str(job.get("krea2_sample_every_n_epochs", "") or "").strip()
+                                if sample_every_raw:
+                                    try:
+                                        parsed_sample_every = int(sample_every_raw)
+                                    except ValueError:
+                                        parsed_sample_every = 0
+                                    if parsed_sample_every > 0:
+                                        run_job_kwargs["sample_every_n_epochs"] = parsed_sample_every
+                                run_job_kwargs["sample_at_first"] = flag_to_bool(job.get("krea2_sample_at_first", "0"))
+                                try:
+                                    run_job_kwargs["guidance_scale"] = float(str(job.get("krea2_guidance_scale", "1.0") or "1.0"))
+                                except ValueError:
+                                    run_job_kwargs["guidance_scale"] = 1.0
+                                turbo_mode = str(job.get("krea2_turbo_mode", "raw") or "raw").strip().lower()
+                                if turbo_mode == "turbo_dit":
+                                    turbo_dit_raw = str(krea2_model_paths.get("dit_turbo", "") or "").strip()
+                                    if turbo_dit_raw:
+                                        run_job_kwargs["turbo_dit_path"] = Path(turbo_dit_raw).expanduser()
+                                    run_job_kwargs["turbo_dit_cache"] = flag_to_bool(job.get("krea2_turbo_dit_cache", "0"))
+                                elif turbo_mode == "turbo_lora":
+                                    turbo_lora_raw = str(job.get("krea2_turbo_lora_path", "") or "").strip()
+                                    if turbo_lora_raw:
+                                        run_job_kwargs["turbo_lora_path"] = Path(turbo_lora_raw).expanduser()
+                                    try:
+                                        run_job_kwargs["turbo_lora_multiplier"] = float(
+                                            str(job.get("krea2_turbo_lora_multiplier", "1.0") or "1.0")
+                                        )
+                                    except ValueError:
+                                        run_job_kwargs["turbo_lora_multiplier"] = 1.0
+                                run_job_kwargs["convrot_int8"] = flag_to_bool(job.get("krea2_convrot_int8", "0"))
+                                run_job_kwargs["convrot_int8_bwd"] = str(job.get("krea2_convrot_int8_bwd", "bf16") or "bf16")
                             elif job_run_fn is _run_job_sdxl:
                                 run_job_kwargs["lr_scheduler"] = str(job.get("lr_scheduler", "constant") or "constant")
                                 run_job_kwargs["lr_warmup_steps"] = get_non_negative_int_setting(job, "lr_warmup_steps", 0)

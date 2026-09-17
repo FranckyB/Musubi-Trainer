@@ -126,6 +126,14 @@ class CreateJobWindow:
             fam = _model_to_family.get(mn, "")
             return fam or mn
 
+        def _normalize_krea2_convrot_int8_bwd_ui(value: str) -> str:
+            normalized = str(value or "bf16").strip().lower()
+            if normalized in {"fp16", "fp32"}:
+                return "bf16"
+            if normalized not in {"bf16", "int8"}:
+                return "bf16"
+            return normalized
+
         _MODEL_UNSELECTED_LABEL = "-------------"
         model_var = self.tk.StringVar(value=(existing_job or {}).get("model", "").strip())
         network_type_var = self.tk.StringVar(value=str((existing_job or {}).get("network_type", "lora")).strip().lower() or "lora")
@@ -553,6 +561,30 @@ class CreateJobWindow:
         timestep_sampling_var = self.tk.StringVar(value=(existing_job or {}).get("timestep_sampling", "sigma"))
         krea2_weighting_scheme_var = self.tk.StringVar(value=(existing_job or {}).get("weighting_scheme", "none"))
         krea2_discrete_flow_shift_var = self.tk.StringVar(value=(existing_job or {}).get("discrete_flow_shift", "2.5"))
+        krea2_sample_prompts_var = self.tk.StringVar(value=(existing_job or {}).get("krea2_sample_prompts", ""))
+        krea2_sample_every_n_epochs_var = self.tk.StringVar(
+            value=(existing_job or {}).get("krea2_sample_every_n_epochs", "")
+        )
+        krea2_sample_at_first_var = self.tk.BooleanVar(
+            value=self.flag_to_bool((existing_job or {}).get("krea2_sample_at_first", self.bool_to_flag(False)))
+        )
+        krea2_guidance_scale_var = self.tk.StringVar(value=(existing_job or {}).get("krea2_guidance_scale", "1.0"))
+        krea2_turbo_mode_var = self.tk.StringVar(value=(existing_job or {}).get("krea2_turbo_mode", "raw"))
+        if krea2_turbo_mode_var.get().strip() not in {"raw", "turbo_dit", "turbo_lora"}:
+            krea2_turbo_mode_var.set("raw")
+        krea2_turbo_dit_cache_var = self.tk.BooleanVar(
+            value=self.flag_to_bool((existing_job or {}).get("krea2_turbo_dit_cache", self.bool_to_flag(False)))
+        )
+        krea2_turbo_lora_path_var = self.tk.StringVar(value=(existing_job or {}).get("krea2_turbo_lora_path", ""))
+        krea2_turbo_lora_multiplier_var = self.tk.StringVar(
+            value=(existing_job or {}).get("krea2_turbo_lora_multiplier", "1.0")
+        )
+        krea2_convrot_int8_var = self.tk.BooleanVar(
+            value=self.flag_to_bool((existing_job or {}).get("krea2_convrot_int8", self.bool_to_flag(False)))
+        )
+        krea2_convrot_int8_bwd_var = self.tk.StringVar(
+            value=_normalize_krea2_convrot_int8_bwd_ui((existing_job or {}).get("krea2_convrot_int8_bwd", "bf16"))
+        )
         ltx_lora_target_preset_var = self.tk.StringVar(value=(existing_job or {}).get("ltx_lora_target_preset", "full"))
         ltx_first_frame_conditioning_p_var = self.tk.StringVar(value=(existing_job or {}).get("ltx_first_frame_conditioning_p", "0.5"))
         ltx_gemma_load_in_4bit_var = self.tk.BooleanVar(
@@ -613,6 +645,16 @@ class CreateJobWindow:
                 "timestep_sampling": timestep_sampling_var.get().strip(),
                 "weighting_scheme": krea2_weighting_scheme_var.get().strip(),
                 "discrete_flow_shift": krea2_discrete_flow_shift_var.get().strip(),
+                "krea2_sample_prompts": krea2_sample_prompts_var.get().strip(),
+                "krea2_sample_every_n_epochs": krea2_sample_every_n_epochs_var.get().strip(),
+                "krea2_sample_at_first": self.bool_to_flag(krea2_sample_at_first_var.get()),
+                "krea2_guidance_scale": krea2_guidance_scale_var.get().strip(),
+                "krea2_turbo_mode": krea2_turbo_mode_var.get().strip(),
+                "krea2_turbo_dit_cache": self.bool_to_flag(krea2_turbo_dit_cache_var.get()),
+                "krea2_turbo_lora_path": krea2_turbo_lora_path_var.get().strip(),
+                "krea2_turbo_lora_multiplier": krea2_turbo_lora_multiplier_var.get().strip(),
+                "krea2_convrot_int8": self.bool_to_flag(krea2_convrot_int8_var.get()),
+                "krea2_convrot_int8_bwd": krea2_convrot_int8_bwd_var.get().strip(),
                 "ltx_mode": _normalize_ltx_mode_ui(ltx_mode_var.get()),
                 "ltx_lora_target_preset": ltx_lora_target_preset_var.get().strip(),
                 "ltx_first_frame_conditioning_p": ltx_first_frame_conditioning_p_var.get().strip(),
@@ -679,6 +721,28 @@ class CreateJobWindow:
                 krea2_weighting_scheme_var.set(values["weighting_scheme"])
             if "discrete_flow_shift" in values:
                 krea2_discrete_flow_shift_var.set(values["discrete_flow_shift"])
+            if "krea2_sample_prompts" in values:
+                krea2_sample_prompts_var.set(values["krea2_sample_prompts"])
+            if "krea2_sample_every_n_epochs" in values:
+                krea2_sample_every_n_epochs_var.set(values["krea2_sample_every_n_epochs"])
+            if "krea2_sample_at_first" in values:
+                krea2_sample_at_first_var.set(self.flag_to_bool(values["krea2_sample_at_first"]))
+            if "krea2_guidance_scale" in values:
+                krea2_guidance_scale_var.set(values["krea2_guidance_scale"])
+            if "krea2_turbo_mode" in values:
+                preset_turbo_mode = values["krea2_turbo_mode"].strip()
+                if preset_turbo_mode in {"raw", "turbo_dit", "turbo_lora"}:
+                    krea2_turbo_mode_var.set(preset_turbo_mode)
+            if "krea2_turbo_dit_cache" in values:
+                krea2_turbo_dit_cache_var.set(self.flag_to_bool(values["krea2_turbo_dit_cache"]))
+            if "krea2_turbo_lora_path" in values:
+                krea2_turbo_lora_path_var.set(values["krea2_turbo_lora_path"])
+            if "krea2_turbo_lora_multiplier" in values:
+                krea2_turbo_lora_multiplier_var.set(values["krea2_turbo_lora_multiplier"])
+            if "krea2_convrot_int8" in values:
+                krea2_convrot_int8_var.set(self.flag_to_bool(values["krea2_convrot_int8"]))
+            if "krea2_convrot_int8_bwd" in values:
+                krea2_convrot_int8_bwd_var.set(_normalize_krea2_convrot_int8_bwd_ui(values["krea2_convrot_int8_bwd"]))
             if "ltx_mode" in values:
                 ltx_mode_var.set(_normalize_ltx_mode_ui(values["ltx_mode"]))
             if "ltx_lora_target_preset" in values:
@@ -887,9 +951,16 @@ class CreateJobWindow:
         self.attach_hover_tooltip(_reload_preset_button, "Reload presets from disk")
         self.attach_hover_tooltip(_delete_preset_button, "Delete selected preset")
 
-        def _attach_field_tooltip(label_widget: WidgetType, input_widget: WidgetType, text: str) -> None:
+        def _attach_field_tooltip(
+            label_widget: WidgetType,
+            input_widget_or_text: WidgetType | str,
+            text: str | None = None,
+        ) -> None:
+            if text is None:
+                self.attach_hover_tooltip(label_widget, str(input_widget_or_text))
+                return
             self.attach_hover_tooltip(label_widget, text)
-            self.attach_hover_tooltip(input_widget, text)
+            self.attach_hover_tooltip(input_widget_or_text, text)
 
         def _spinbox_positive_int_validator(proposed: str) -> bool:
             if not proposed:
@@ -1263,6 +1334,190 @@ class CreateJobWindow:
             _krea2_discrete_flow_shift_entry,
             "Krea2 discrete flow shift used with timestep_sampling=shift (example: 2.5 at 1024).",
         )
+
+        def _browse_krea2_sample_prompts() -> None:
+            selected_path = self.filedialog.askopenfilename(
+                parent=dialog,
+                title="Select Krea2 sample prompts file",
+                filetypes=(("Prompt files", "*.txt *.json"), ("All files", "*.*")),
+            )
+            if selected_path:
+                krea2_sample_prompts_var.set(selected_path)
+
+        def _browse_krea2_turbo_lora() -> None:
+            selected_path = self.filedialog.askopenfilename(
+                parent=dialog,
+                title="Select Krea2 Turbo LoRA",
+                filetypes=(("Safetensors", "*.safetensors"), ("All files", "*.*")),
+            )
+            if selected_path:
+                krea2_turbo_lora_path_var.set(selected_path)
+
+        self.ttk.Label(krea2_specific_frame, text="Sample prompts:").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0)
+        )
+        _krea2_sample_prompts_entry = self.ttk.Entry(
+            krea2_specific_frame,
+            textvariable=krea2_sample_prompts_var,
+            style="Flat.TEntry",
+        )
+        _krea2_sample_prompts_entry.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        self.ttk.Button(
+            krea2_specific_frame,
+            text="Browse",
+            command=_browse_krea2_sample_prompts,
+            style="CreateJobAction.TButton",
+        ).grid(row=1, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        _krea2_sampling_timing_frame = self.ttk.Frame(krea2_specific_frame)
+        _krea2_sampling_timing_frame.grid(row=1, column=3, sticky="ew", pady=(6, 0))
+        _krea2_sampling_timing_frame.columnconfigure(1, weight=1)
+        self.ttk.Label(_krea2_sampling_timing_frame, text="Every N epochs:").grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        _krea2_sample_every_entry = self.ttk.Entry(
+            _krea2_sampling_timing_frame,
+            textvariable=krea2_sample_every_n_epochs_var,
+            style="Flat.TEntry",
+            width=8,
+        )
+        _krea2_sample_every_entry.grid(row=0, column=1, sticky="w")
+        _krea2_sample_at_first_check = self.ttk.Checkbutton(
+            _krea2_sampling_timing_frame,
+            text="Sample at first",
+            variable=krea2_sample_at_first_var,
+        )
+        _krea2_sample_at_first_check.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        self.ttk.Label(krea2_specific_frame, text="Guidance scale:").grid(
+            row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0)
+        )
+        _krea2_guidance_scale_entry = self.ttk.Entry(
+            krea2_specific_frame,
+            textvariable=krea2_guidance_scale_var,
+            style="Flat.TEntry",
+        )
+        _krea2_guidance_scale_entry.grid(row=2, column=1, sticky="ew", pady=(6, 0))
+        self.ttk.Label(krea2_specific_frame, text="Turbo sampling:").grid(
+            row=2, column=2, sticky="w", padx=(12, 8), pady=(6, 0)
+        )
+        _krea2_turbo_mode_combo = self.ttk.Combobox(
+            krea2_specific_frame,
+            textvariable=krea2_turbo_mode_var,
+            values=("raw", "turbo_dit", "turbo_lora"),
+            state="readonly",
+        )
+        _krea2_turbo_mode_combo.grid(row=2, column=3, sticky="ew", pady=(6, 0))
+
+        _krea2_turbo_lora_path_label = self.ttk.Label(krea2_specific_frame, text="Turbo LoRA path:")
+        _krea2_turbo_lora_path_entry = self.ttk.Entry(
+            krea2_specific_frame,
+            textvariable=krea2_turbo_lora_path_var,
+            style="Flat.TEntry",
+        )
+        _krea2_turbo_lora_browse = self.ttk.Button(
+            krea2_specific_frame,
+            text="Browse",
+            command=_browse_krea2_turbo_lora,
+            style="CreateJobAction.TButton",
+        )
+        _krea2_turbo_lora_multiplier_frame = self.ttk.Frame(krea2_specific_frame)
+        _krea2_turbo_lora_multiplier_frame.columnconfigure(1, weight=1)
+        _krea2_turbo_lora_multiplier_label = self.ttk.Label(_krea2_turbo_lora_multiplier_frame, text="Turbo LoRA multiplier:")
+        _krea2_turbo_lora_multiplier_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        _krea2_turbo_lora_multiplier_entry = self.ttk.Entry(
+            _krea2_turbo_lora_multiplier_frame,
+            textvariable=krea2_turbo_lora_multiplier_var,
+            style="Flat.TEntry",
+        )
+        _krea2_turbo_lora_multiplier_entry.grid(row=0, column=1, sticky="ew")
+        _krea2_turbo_dit_cache_check = self.ttk.Checkbutton(
+            krea2_specific_frame,
+            text="Cache Turbo DiT in CPU RAM",
+            variable=krea2_turbo_dit_cache_var,
+        )
+
+        _krea2_convrot_int8_check = self.ttk.Checkbutton(
+            krea2_specific_frame,
+            text="Enable ConvRot int8",
+            variable=krea2_convrot_int8_var,
+        )
+        _krea2_convrot_int8_check.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        _krea2_convrot_int8_bwd_label = self.ttk.Label(krea2_specific_frame, text="ConvRot int8 bwd:")
+        _krea2_convrot_int8_bwd_label.grid(row=4, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+        _krea2_convrot_int8_bwd_combo = self.ttk.Combobox(
+            krea2_specific_frame,
+            textvariable=krea2_convrot_int8_bwd_var,
+            values=("bf16", "int8"),
+            state="readonly",
+        )
+        _krea2_convrot_int8_bwd_combo.grid(row=4, column=3, sticky="ew", pady=(6, 0))
+
+        def _sync_krea2_turbo_controls(*_args: object) -> None:
+            turbo_mode = krea2_turbo_mode_var.get().strip()
+
+            for widget in (
+                _krea2_turbo_lora_path_label,
+                _krea2_turbo_lora_path_entry,
+                _krea2_turbo_lora_browse,
+                _krea2_turbo_lora_multiplier_label,
+                _krea2_turbo_lora_multiplier_entry,
+                _krea2_turbo_dit_cache_check,
+            ):
+                widget.grid_remove()
+
+            if turbo_mode == "turbo_dit":
+                _krea2_turbo_dit_cache_check.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
+            elif turbo_mode == "turbo_lora":
+                _krea2_turbo_lora_path_label.grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+                _krea2_turbo_lora_path_entry.grid(row=3, column=1, sticky="ew", pady=(6, 0))
+                _krea2_turbo_lora_browse.grid(row=3, column=2, sticky="w", padx=(12, 8), pady=(6, 0))
+                _krea2_turbo_lora_multiplier_frame.grid(row=3, column=3, sticky="ew", pady=(6, 0))
+
+            _fit_create_job_dialog_to_content()
+
+        _attach_field_tooltip(
+            _krea2_sample_prompts_entry,
+            "Optional sample prompt file used for image previews during training. Required for Turbo sampling to do anything.",
+        )
+        _attach_field_tooltip(
+            _krea2_sample_every_entry,
+            "Generate sample images every N epochs. Leave blank to disable periodic samples; you can still use 'Sample at first'.",
+        )
+        self.attach_hover_tooltip(
+            _krea2_sample_at_first_check,
+            "Generate sample images before training starts. Requires a sample prompts file.",
+        )
+        _attach_field_tooltip(
+            _krea2_guidance_scale_entry,
+            "Krea2 sample CFG scale. Use 1.0 to disable CFG; Turbo samples are typically previewed at 1.0.",
+        )
+        _attach_field_tooltip(
+            _krea2_turbo_mode_combo,
+            "Preview samples on RAW training weights, a Turbo DiT checkpoint, or a Turbo LoRA composed on top of RAW.",
+        )
+        self.attach_hover_tooltip(
+            _krea2_turbo_dit_cache_check,
+            "Keep Turbo DiT weights cached in CPU RAM for faster sample generation. Only applies in Turbo DiT mode.",
+        )
+        _attach_field_tooltip(
+            _krea2_turbo_lora_path_entry,
+            "Path to the Turbo LoRA safetensors used only for Krea2 sample generation during training.",
+        )
+        _attach_field_tooltip(
+            _krea2_turbo_lora_multiplier_entry,
+            "Turbo LoRA strength for sample generation. 1.0 matches the upstream default.",
+        )
+        self.attach_hover_tooltip(
+            _krea2_convrot_int8_check,
+            "Enable int8 quantization for ConvRot linear layers. Compatible with blocks_to_swap and gradient checkpointing, but not Turbo DiT.",
+        )
+        _attach_field_tooltip(
+            _krea2_convrot_int8_bwd_label,
+            _krea2_convrot_int8_bwd_combo,
+            "Backward mode for ConvRot int8 linears. bf16 is the standard path; int8 reuses the fused int8 GEMM and requires ConvRot int8 to be enabled.",
+        )
+        krea2_turbo_mode_var.trace_add("write", _sync_krea2_turbo_controls)
+        _sync_krea2_turbo_controls()
 
         self.ttk.Label(ltx_specific_frame, text="LTX mode:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
         _ltx_mode_display_var = self.tk.StringVar(
@@ -1732,6 +1987,16 @@ class CreateJobWindow:
                 "timestep_sampling": "krea2_shift",
                 "weighting_scheme": "none",
                 "discrete_flow_shift": "2.5",
+                "krea2_sample_prompts": "",
+                "krea2_sample_every_n_epochs": "",
+                "krea2_sample_at_first": "0",
+                "krea2_guidance_scale": "1.0",
+                "krea2_turbo_mode": "raw",
+                "krea2_turbo_dit_cache": "0",
+                "krea2_turbo_lora_path": "",
+                "krea2_turbo_lora_multiplier": "1.0",
+                "krea2_convrot_int8": "0",
+                "krea2_convrot_int8_bwd": "bf16",
                 "resolution": "1024",
                 "batch_size": "1",
                 "max_data_loader_n_workers": _recommended_data_loader_workers_text(),
@@ -1850,6 +2115,16 @@ class CreateJobWindow:
             timestep_sampling_var.set(profile["timestep_sampling"])
             krea2_weighting_scheme_var.set(profile.get("weighting_scheme", "none"))
             krea2_discrete_flow_shift_var.set(profile.get("discrete_flow_shift", "2.5"))
+            krea2_sample_prompts_var.set(profile.get("krea2_sample_prompts", ""))
+            krea2_sample_every_n_epochs_var.set(profile.get("krea2_sample_every_n_epochs", ""))
+            krea2_sample_at_first_var.set(self.flag_to_bool(profile.get("krea2_sample_at_first", "0")))
+            krea2_guidance_scale_var.set(profile.get("krea2_guidance_scale", "1.0"))
+            krea2_turbo_mode_var.set(profile.get("krea2_turbo_mode", "raw"))
+            krea2_turbo_dit_cache_var.set(self.flag_to_bool(profile.get("krea2_turbo_dit_cache", "0")))
+            krea2_turbo_lora_path_var.set(profile.get("krea2_turbo_lora_path", ""))
+            krea2_turbo_lora_multiplier_var.set(profile.get("krea2_turbo_lora_multiplier", "1.0"))
+            krea2_convrot_int8_var.set(self.flag_to_bool(profile.get("krea2_convrot_int8", "0")))
+            krea2_convrot_int8_bwd_var.set(_normalize_krea2_convrot_int8_bwd_ui(profile.get("krea2_convrot_int8_bwd", "bf16")))
             train_resolution_var.set(profile["resolution"])
             train_batch_var.set(profile["batch_size"])
             train_data_loader_workers_var.set(
@@ -2314,6 +2589,114 @@ class CreateJobWindow:
                 except ValueError:
                     self.messagebox.showerror("Invalid value", "Discrete flow shift must be a number greater than 0.", parent=dialog)
                     return
+            krea2_sample_prompts_value = krea2_sample_prompts_var.get().strip()
+            krea2_sample_every_n_epochs_value = krea2_sample_every_n_epochs_var.get().strip()
+            if krea2_sample_every_n_epochs_value:
+                try:
+                    if int(krea2_sample_every_n_epochs_value) < 1:
+                        raise ValueError
+                except ValueError:
+                    self.messagebox.showerror(
+                        "Invalid value",
+                        "Sample every N epochs must be a positive integer.",
+                        parent=dialog,
+                    )
+                    return
+            krea2_sample_at_first_value = krea2_sample_at_first_var.get()
+            try:
+                krea2_guidance_scale_value = float(krea2_guidance_scale_var.get().strip())
+                if krea2_guidance_scale_value <= 0:
+                    raise ValueError
+            except ValueError:
+                self.messagebox.showerror(
+                    "Invalid value",
+                    "Guidance scale must be a number greater than 0.",
+                    parent=dialog,
+                )
+                return
+            krea2_turbo_mode_value = krea2_turbo_mode_var.get().strip().lower() or "raw"
+            if krea2_turbo_mode_value not in {"raw", "turbo_dit", "turbo_lora"}:
+                self.messagebox.showerror("Invalid value", "Turbo sampling mode is invalid.", parent=dialog)
+                return
+            krea2_turbo_lora_path_value = krea2_turbo_lora_path_var.get().strip()
+            try:
+                krea2_turbo_lora_multiplier_value = float(krea2_turbo_lora_multiplier_var.get().strip())
+                if krea2_turbo_lora_multiplier_value <= 0:
+                    raise ValueError
+            except ValueError:
+                self.messagebox.showerror(
+                    "Invalid value",
+                    "Turbo LoRA multiplier must be a number greater than 0.",
+                    parent=dialog,
+                )
+                return
+            krea2_convrot_int8_value = krea2_convrot_int8_var.get()
+            krea2_convrot_int8_bwd_value = _normalize_krea2_convrot_int8_bwd_ui(krea2_convrot_int8_bwd_var.get())
+            if krea2_convrot_int8_bwd_value not in {"bf16", "int8"}:
+                self.messagebox.showerror("Invalid value", "ConvRot int8 bwd must be bf16 or int8.", parent=dialog)
+                return
+
+            is_krea2_job = _model_to_family.get(selected_model_name, "") == "Krea2"
+            if is_krea2_job:
+                if krea2_sample_prompts_value:
+                    sample_prompts_path = Path(krea2_sample_prompts_value).expanduser()
+                    if not sample_prompts_path.is_file():
+                        self.messagebox.showerror(
+                            "Missing file",
+                            "Krea2 sample prompts must point to an existing file.",
+                            parent=dialog,
+                        )
+                        return
+                if (krea2_sample_every_n_epochs_value or krea2_sample_at_first_value or krea2_turbo_mode_value != "raw") and not krea2_sample_prompts_value:
+                    self.messagebox.showerror(
+                        "Missing value",
+                        "Krea2 sampling requires a sample prompts file when sample previews or Turbo sampling are enabled.",
+                        parent=dialog,
+                    )
+                    return
+                if krea2_turbo_mode_value == "turbo_dit" and blocks_to_swap_value > 0:
+                    self.messagebox.showerror(
+                        "Invalid combination",
+                        "Turbo DiT sampling cannot be combined with blocks_to_swap for Krea2.",
+                        parent=dialog,
+                    )
+                    return
+                if krea2_turbo_mode_value == "turbo_dit" and krea2_convrot_int8_value:
+                    self.messagebox.showerror(
+                        "Invalid combination",
+                        "ConvRot int8 is not supported together with Turbo DiT sampling for Krea2.",
+                        parent=dialog,
+                    )
+                    return
+                if krea2_convrot_int8_value and fp8_var.get():
+                    self.messagebox.showerror(
+                        "Invalid combination",
+                        "ConvRot int8 cannot be combined with FP8 DiT for Krea2.",
+                        parent=dialog,
+                    )
+                    return
+                if krea2_convrot_int8_bwd_value == "int8" and not krea2_convrot_int8_value:
+                    self.messagebox.showerror(
+                        "Invalid combination",
+                        "ConvRot int8 bwd mode 'int8' requires ConvRot int8 to be enabled.",
+                        parent=dialog,
+                    )
+                    return
+                if krea2_turbo_mode_value == "turbo_lora":
+                    if not krea2_turbo_lora_path_value:
+                        self.messagebox.showerror(
+                            "Missing value",
+                            "Turbo LoRA mode requires a Turbo LoRA safetensors path.",
+                            parent=dialog,
+                        )
+                        return
+                    if not Path(krea2_turbo_lora_path_value).expanduser().is_file():
+                        self.messagebox.showerror(
+                            "Missing file",
+                            "Turbo LoRA path must point to an existing file.",
+                            parent=dialog,
+                        )
+                        return
             ltx_mode_value = _normalize_ltx_mode_ui(ltx_mode_var.get())
             ltx_lora_target_preset_value = ltx_lora_target_preset_var.get().strip().lower()
             if ltx_mode_value == "audio":
@@ -2536,6 +2919,16 @@ class CreateJobWindow:
                     "timestep_sampling": timestep_sampling_value,
                     "weighting_scheme": krea2_weighting_scheme_value,
                     "discrete_flow_shift": krea2_discrete_flow_shift_value,
+                    "krea2_sample_prompts": krea2_sample_prompts_value,
+                    "krea2_sample_every_n_epochs": krea2_sample_every_n_epochs_value,
+                    "krea2_sample_at_first": self.bool_to_flag(krea2_sample_at_first_value),
+                    "krea2_guidance_scale": str(krea2_guidance_scale_value),
+                    "krea2_turbo_mode": krea2_turbo_mode_value,
+                    "krea2_turbo_dit_cache": self.bool_to_flag(krea2_turbo_dit_cache_var.get()),
+                    "krea2_turbo_lora_path": krea2_turbo_lora_path_value,
+                    "krea2_turbo_lora_multiplier": str(krea2_turbo_lora_multiplier_value),
+                    "krea2_convrot_int8": self.bool_to_flag(krea2_convrot_int8_value),
+                    "krea2_convrot_int8_bwd": krea2_convrot_int8_bwd_value,
                     "ltx_lora_target_preset": ltx_lora_target_preset_value,
                     "ltx_first_frame_conditioning_p": str(ltx_first_frame_conditioning_p_value),
                     "ltx_gemma_load_in_4bit": self.bool_to_flag(ltx_gemma_load_in_4bit_var.get()),

@@ -86,7 +86,7 @@ torch_stack_matches() {
 
 check_gui_runtime() {
     if ! "$PY" -c "import tkinter" >/dev/null 2>&1; then
-        echo "Tkinter is not available in python3.13 on this system." >&2
+        echo "Tkinter is not available in python3.12 on this system." >&2
         echo "Install the system Tk runtime and rerun Setup.sh." >&2
         echo "On CachyOS/Arch this is usually: sudo pacman -S tk" >&2
         return 1
@@ -94,8 +94,8 @@ check_gui_runtime() {
 }
 
 find_python() {
-    if command -v python3.13 >/dev/null 2>&1; then
-        echo "python3.13"
+    if command -v python3.12 >/dev/null 2>&1; then
+        echo "python3.12"
         return 0
     fi
 
@@ -103,7 +103,7 @@ find_python() {
 }
 
 if ! BASE_PYTHON="$(find_python)"; then
-    echo "python3.13 is required. Install python3.13 and rerun Setup.sh." >&2
+    echo "python3.12 is required. Install python3.12 and rerun Setup.sh." >&2
     exit 1
 fi
 
@@ -115,7 +115,7 @@ if [[ ! -x "$PY" ]]; then
     exit 1
 fi
 
-"$PY" -c "import sys; raise SystemExit(0 if sys.version_info[:2]==(3,13) else 1)"
+"$PY" -c "import sys; raise SystemExit(0 if sys.version_info[:2]==(3,12) else 1)"
 "$PY" -c "import struct; raise SystemExit(0 if struct.calcsize('P')*8==64 else 1)"
 
 check_gui_runtime
@@ -137,7 +137,7 @@ while IFS= read -r requirement; do
             continue
             ;;
         tensorflow==*|tensorflow\>=*)
-            SKIPPED_REQUIREMENTS+=("$requirement (no Linux wheel for python3.13 on this setup)")
+            SKIPPED_REQUIREMENTS+=("$requirement (optional on this Linux setup; skipped to avoid interpreter-specific wheel issues)")
             continue
             ;;
         deepfilternet==*)
@@ -174,7 +174,7 @@ fi
 "$PY" -m pip install -r "$REQ_FILE"
 
 echo
-echo "[4/5] Installing SageAttention wheel (optional)..."
+echo "[4/5] Installing SageAttention (optional)..."
 if [[ -n "$SAGE_WHEEL" ]]; then
     if [[ -f "$SAGE_WHEEL" ]]; then
         echo "  Using explicit wheel: $SAGE_WHEEL"
@@ -184,8 +184,13 @@ if [[ -n "$SAGE_WHEEL" ]]; then
         exit 1
     fi
 else
-    echo "  No SageAttention wheel provided. Skipping on Linux."
-    echo "  Tip: use --sage-wheel /path/to/sageattention.whl if you have a compatible build."
+    echo "  No SageAttention wheel provided. Trying pip package for Linux..."
+    if "$PY" -m pip install sageattention; then
+        echo "  Installed SageAttention from pip."
+    else
+        echo "  Could not install SageAttention from pip. Continuing without it."
+        echo "  Tip: rerun with --sage-wheel /path/to/sageattention.whl if you have a compatible local build."
+    fi
 fi
 
 echo

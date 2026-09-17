@@ -96,8 +96,10 @@ https://github.com/sdbds/SageAttention-for-windows/releases
 If auto-download fails, download a matching `.whl` manually from that releases page
 and run Setup with `--sage-wheel` pointing to the downloaded file.
 
-`Setup.sh` follows the same shared-venv flow for Linux, but skips the Windows-only
-`triton-windows` dependency and does not auto-download SageAttention.
+`Setup.sh` follows the same shared-venv flow for Linux, skips the Windows-only
+`triton-windows` dependency, and tries to install the standard `sageattention`
+pip package automatically. If that optional install fails, Setup continues and
+you can rerun it with `--sage-wheel` pointing to a compatible local wheel.
 
 On Linux, the visual launcher also needs the system Tk runtime for `tkinter`.
 On CachyOS/Arch, install it with:

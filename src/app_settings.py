@@ -44,6 +44,183 @@ MODEL_PATHS_KEY = "model_paths"
 EXTRA_SEARCH_PATHS_KEY = "extra_search_paths"
 PREFERRED_PRESETS_BY_FAMILY_KEY = "preferred_presets_by_family"
 
+_WORKSPACE_PATH_KEYS = {
+    BACKENDS_ROOT_KEY,
+    TRAINERS_ROOT_KEY,
+    MUSUBI_DIR_KEY,
+    MUSUBI_PYTHON_KEY,
+    MUSUBI_MAIN_DIR_KEY,
+    MUSUBI_LTX_DIR_KEY,
+    SD_SCRIPTS_DIR_KEY,
+    KLEIN_DIT_KEY,
+    KLEIN_VAE_KEY,
+    KLEIN_TEXT_ENCODER_KEY,
+    LTX_DIT_KEY,
+    LTX_VAE_KEY,
+    LTX_TEXT_ENCODER_KEY,
+}
+
+
+def _looks_like_windows_absolute_path(raw: str) -> bool:
+    raw = str(raw or "").strip()
+    if len(raw) < 3:
+        return False
+    return raw[1] == ":" and raw[0].isalpha() and raw[2] in {"\\", "/"}
+
+
+def _workspace_root() -> Path:
+    return SETTINGS_FILE.resolve().parent.parent
+
+
+def _split_path_parts(raw: str) -> list[str]:
+    normalized = str(raw or "").replace("\\", "/").strip()
+    if not normalized:
+        return []
+    return [part for part in normalized.split("/") if part and part != "."]
+
+
+def _rebase_workspace_path(raw: str) -> Path | None:
+    workspace_root = _workspace_root()
+    workspace_name = workspace_root.name.casefold()
+    parts = _split_path_parts(raw)
+    lowered_parts = [part.casefold() for part in parts]
+    try:
+        workspace_index = lowered_parts.index(workspace_name)
+    except ValueError:
+        return None
+
+    suffix = parts[workspace_index + 1 :]
+    rebased = workspace_root
+    for part in suffix:
+        rebased /= part
+    return rebased
+
+
+def _load_path_value(raw: str) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+
+    expanded = Path(value).expanduser()
+    if expanded.is_absolute():
+        return str(expanded)
+
+    if _looks_like_windows_absolute_path(value):
+        rebased = _rebase_workspace_path(value)
+        return str(rebased) if rebased is not None else value
+
+    rebased = _rebase_workspace_path(value)
+    if rebased is not None:
+        return str(rebased)
+
+    return str((_workspace_root() / expanded).resolve(strict=False))
+
+
+def _store_path_value(raw: str) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+
+    if _looks_like_windows_absolute_path(value):
+        rebased = _rebase_workspace_path(value)
+        if rebased is not None:
+            try:
+                return rebased.relative_to(_workspace_root()).as_posix()
+            except ValueError:
+                return str(rebased)
+        return value
+
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        return candidate.as_posix()
+
+    try:
+        return candidate.relative_to(_workspace_root()).as_posix()
+    except ValueError:
+        return str(candidate)
+
+
+def _normalize_loaded_settings(settings: dict[str, str]) -> tuple[dict[str, str], bool]:
+    normalized = dict(settings)
+    changed = False
+
+    for key in _WORKSPACE_PATH_KEYS:
+        value = normalized.get(key, "")
+        loaded_value = _load_path_value(value)
+        if loaded_value != value:
+            normalized[key] = loaded_value
+            changed = True
+
+    raw_extra = normalized.get(EXTRA_SEARCH_PATHS_KEY, "").strip()
+    if raw_extra:
+        try:
+            extra_paths = json.loads(raw_extra)
+        except Exception:
+            extra_paths = None
+        if isinstance(extra_paths, list):
+            loaded_extra = [_load_path_value(str(item)) for item in extra_paths]
+            if loaded_extra != [str(item) for item in extra_paths]:
+                normalized[EXTRA_SEARCH_PATHS_KEY] = json.dumps(loaded_extra)
+                changed = True
+
+    raw_model_paths = normalized.get(MODEL_PATHS_KEY, "").strip()
+    if raw_model_paths:
+        try:
+            model_paths = json.loads(raw_model_paths)
+        except Exception:
+            model_paths = None
+        if isinstance(model_paths, dict):
+            loaded_model_paths: dict[str, dict[str, str]] = {}
+            for model_name, component_map in model_paths.items():
+                if not isinstance(component_map, dict):
+                    continue
+                loaded_model_paths[str(model_name)] = {
+                    str(component): _load_path_value(str(path_value))
+                    for component, path_value in component_map.items()
+                    if str(path_value).strip()
+                }
+            if loaded_model_paths != model_paths:
+                normalized[MODEL_PATHS_KEY] = json.dumps(loaded_model_paths)
+                changed = True
+
+    return normalized, changed
+
+
+def _prepare_settings_for_disk(settings: dict[str, str]) -> dict[str, str]:
+    prepared = dict(settings)
+
+    for key in _WORKSPACE_PATH_KEYS:
+        prepared[key] = _store_path_value(prepared.get(key, ""))
+
+    raw_extra = prepared.get(EXTRA_SEARCH_PATHS_KEY, "").strip()
+    if raw_extra:
+        try:
+            extra_paths = json.loads(raw_extra)
+        except Exception:
+            extra_paths = None
+        if isinstance(extra_paths, list):
+            prepared[EXTRA_SEARCH_PATHS_KEY] = json.dumps([_store_path_value(str(item)) for item in extra_paths])
+
+    raw_model_paths = prepared.get(MODEL_PATHS_KEY, "").strip()
+    if raw_model_paths:
+        try:
+            model_paths = json.loads(raw_model_paths)
+        except Exception:
+            model_paths = None
+        if isinstance(model_paths, dict):
+            stored_model_paths: dict[str, dict[str, str]] = {}
+            for model_name, component_map in model_paths.items():
+                if not isinstance(component_map, dict):
+                    continue
+                stored_model_paths[str(model_name)] = {
+                    str(component): _store_path_value(str(path_value))
+                    for component, path_value in component_map.items()
+                    if str(path_value).strip()
+                }
+            prepared[MODEL_PATHS_KEY] = json.dumps(stored_model_paths)
+
+    return prepared
+
 
 def load_settings() -> dict[str, str]:
     if not SETTINGS_FILE.exists():
@@ -57,12 +234,16 @@ def load_settings() -> dict[str, str]:
     if not isinstance(raw, dict):
         return {}
 
-    return {str(k): str(v) for k, v in raw.items()}
+    loaded = {str(k): str(v) for k, v in raw.items()}
+    normalized, changed = _normalize_loaded_settings(loaded)
+    if changed:
+        save_settings(normalized)
+    return normalized
 
 
 def save_settings(settings: dict[str, str]) -> None:
     try:
-        SETTINGS_FILE.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        SETTINGS_FILE.write_text(json.dumps(_prepare_settings_for_disk(settings), indent=2), encoding="utf-8")
     except OSError:
         # Keep UI running even if settings file is temporarily locked/read-only.
         return

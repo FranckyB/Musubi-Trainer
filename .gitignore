@@ -46,3 +46,4 @@ Musubi-Trainer-Workspace.code-workspace
 settings.json
 src/settings.json
 .musubi-trainer.lock
+.hidden

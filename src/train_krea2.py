@@ -72,6 +72,41 @@ def _network_settings(network_type: str, lora_module: str) -> tuple[str, bool]:
     return ("networks.lokr" if use_lokr else lora_module, use_lokr)
 
 
+def _normalize_convrot_int8_bwd(value: str) -> str:
+    normalized = (value or "bf16").strip().lower()
+    if normalized in {"fp16", "fp32"}:
+        normalized = "bf16"
+    if normalized not in {"bf16", "int8"}:
+        raise RuntimeError("Krea2 ConvRot int8 bwd must be one of: bf16, int8.")
+    return normalized
+
+
+def _validate_krea2_sampling_options(
+    *,
+    sample_prompts_path: Path | None,
+    sample_every_n_epochs: int | None,
+    sample_at_first: bool,
+    turbo_dit_path: Path | None,
+    turbo_dit_cache: bool,
+    turbo_lora_path: Path | None,
+    convrot_int8: bool,
+    blocks_to_swap: int,
+) -> None:
+    if turbo_dit_cache and turbo_dit_path is None:
+        raise RuntimeError("Krea2 Turbo DiT cache requires a Turbo DiT path.")
+    if turbo_dit_path is not None and turbo_lora_path is not None:
+        raise RuntimeError("Krea2 Turbo DiT and Turbo LoRA are mutually exclusive for sample generation.")
+    if turbo_dit_path is not None and blocks_to_swap > 0:
+        raise RuntimeError("Krea2 Turbo DiT sampling cannot be combined with blocks_to_swap.")
+    if turbo_dit_path is not None and convrot_int8:
+        raise RuntimeError("Krea2 ConvRot int8 is not supported together with Turbo DiT sampling.")
+
+    sampling_enabled = bool(sample_prompts_path is not None or sample_every_n_epochs or sample_at_first)
+    turbo_enabled = turbo_dit_path is not None or turbo_lora_path is not None
+    if (sampling_enabled or turbo_enabled) and sample_prompts_path is None:
+        raise RuntimeError("Krea2 sampling requires a sample prompts file.")
+
+
 def _validate_krea2_transformers_compatibility(musubi_python: Path, musubi_dir: Path) -> None:
     probe_code = (
         "import json\n"
@@ -163,6 +198,16 @@ def run_steps_for_model(
     timestep_sampling: str,
     weighting_scheme: str,
     discrete_flow_shift: str,
+    sample_prompts_path: Path | None = None,
+    sample_every_n_epochs: int | None = None,
+    sample_at_first: bool = False,
+    guidance_scale: float = 1.0,
+    turbo_dit_path: Path | None = None,
+    turbo_dit_cache: bool = False,
+    turbo_lora_path: Path | None = None,
+    turbo_lora_multiplier: float = 1.0,
+    convrot_int8: bool = False,
+    convrot_int8_bwd: str = "bf16",
     train_steps: int,
     save_every_n_steps: int = DEFAULT_SAVE_EVERY_N_STEPS,
     enable_compile_optimizations: bool = False,
@@ -225,6 +270,34 @@ def run_steps_for_model(
     dit_path = require_model_file(runtime_config.dit, "Krea2 RAW DiT")
     vae_path = require_model_file(runtime_config.vae, "Krea2 VAE")
     text_encoder_path = require_model_file(runtime_config.text_encoder, "Krea2 Text Encoder")
+    turbo_dit_path = require_model_file(turbo_dit_path, "Krea2 Turbo DiT") if turbo_dit_path is not None else None
+    turbo_lora_path = require_model_file(turbo_lora_path, "Krea2 Turbo LoRA") if turbo_lora_path is not None else None
+
+    if sample_prompts_path is not None:
+        sample_prompts_path = sample_prompts_path.expanduser().resolve()
+        if not sample_prompts_path.is_file():
+            raise RuntimeError(f"Krea2 sample prompts file not found: {sample_prompts_path}")
+    if sample_every_n_epochs is not None and sample_every_n_epochs < 1:
+        raise RuntimeError("Krea2 sample_every_n_epochs must be a positive integer.")
+    if guidance_scale <= 0:
+        raise RuntimeError("Krea2 guidance_scale must be greater than 0.")
+    if turbo_lora_path is not None and turbo_lora_multiplier <= 0:
+        raise RuntimeError("Krea2 turbo_lora_multiplier must be greater than 0.")
+    convrot_int8_bwd = _normalize_convrot_int8_bwd(convrot_int8_bwd)
+    if convrot_int8 and enable_fp8_dit:
+        raise RuntimeError("Krea2 ConvRot int8 cannot be combined with FP8 DiT.")
+    if convrot_int8_bwd == "int8" and not convrot_int8:
+        raise RuntimeError("Krea2 ConvRot int8 bwd mode 'int8' requires ConvRot int8 to be enabled.")
+    _validate_krea2_sampling_options(
+        sample_prompts_path=sample_prompts_path,
+        sample_every_n_epochs=sample_every_n_epochs,
+        sample_at_first=sample_at_first,
+        turbo_dit_path=turbo_dit_path,
+        turbo_dit_cache=turbo_dit_cache,
+        turbo_lora_path=turbo_lora_path,
+        convrot_int8=convrot_int8,
+        blocks_to_swap=max(0, int(blocks_to_swap)),
+    )
 
     # Step 2: cache latents
     if do_cache_latents:
@@ -325,6 +398,7 @@ def run_steps_for_model(
         model_lines = [
             f"dit = {toml_quote(str(dit_path))}",
             f"vae = {toml_quote(str(vae_path))}",
+            f"text_encoder = {toml_quote(str(text_encoder_path))}",
         ]
         data_output_lines = [
             f"dataset_config = {toml_quote(str(dataset_config))}",
@@ -375,6 +449,8 @@ def run_steps_for_model(
             f"blocks_to_swap = {max(0, int(blocks_to_swap))}",
             f"fp8_base = {'true' if enable_fp8_dit else 'false'}",
             f"fp8_scaled = {'true' if enable_fp8_dit else 'false'}",
+            f"convrot_int8 = {'true' if convrot_int8 else 'false'}",
+            f"convrot_int8_bwd = {toml_quote(convrot_int8_bwd)}",
             f"compile = {'true' if compile_enabled else 'false'}",
             f"cuda_allow_tf32 = {'true' if (compile_enabled and enable_cuda_allow_tf32) else 'false'}",
             f"cuda_cudnn_benchmark = {'true' if (compile_enabled and enable_cuda_cudnn_benchmark) else 'false'}",
@@ -403,6 +479,23 @@ def run_steps_for_model(
             if tracker_name:
                 logging_lines.append(f"log_tracker_name = {toml_quote(tracker_name)}")
 
+        sampling_lines: list[str] = []
+        if sample_prompts_path is not None:
+            sampling_lines.append(f"sample_prompts = {toml_quote(str(sample_prompts_path))}")
+        if sample_every_n_epochs is not None:
+            sampling_lines.append(f"sample_every_n_epochs = {sample_every_n_epochs}")
+        if sample_at_first:
+            sampling_lines.append("sample_at_first = true")
+        if sample_prompts_path is not None:
+            sampling_lines.append(f"guidance_scale = {guidance_scale}")
+        if turbo_dit_path is not None:
+            sampling_lines.append(f"turbo_dit = {toml_quote(str(turbo_dit_path))}")
+            if turbo_dit_cache:
+                sampling_lines.append("turbo_dit_cache = true")
+        if turbo_lora_path is not None:
+            sampling_lines.append(f"turbo_lora = {toml_quote(str(turbo_lora_path))}")
+            sampling_lines.append(f"turbo_lora_multiplier = {turbo_lora_multiplier}")
+
         config_lines: list[str] = []
         config_sections: list[tuple[str, list[str]]] = [
             ("Model", model_lines),
@@ -414,6 +507,8 @@ def run_steps_for_model(
         ]
         if restore_lines:
             config_sections.append(("Resume and Warmstart", restore_lines))
+        if sampling_lines:
+            config_sections.append(("Sampling", sampling_lines))
         if logging_lines:
             config_sections.append(("Logging", logging_lines))
 
@@ -494,6 +589,16 @@ def run_job(
     timestep_sampling: str = "krea2_shift",
     weighting_scheme: str = "none",
     discrete_flow_shift: str = "",
+    sample_prompts_path: Path | None = None,
+    sample_every_n_epochs: int | None = None,
+    sample_at_first: bool = False,
+    guidance_scale: float = 1.0,
+    turbo_dit_path: Path | None = None,
+    turbo_dit_cache: bool = False,
+    turbo_lora_path: Path | None = None,
+    turbo_lora_multiplier: float = 1.0,
+    convrot_int8: bool = False,
+    convrot_int8_bwd: str = "bf16",
     generate_training_args_only: bool = False,
     save_every_n_steps: int = DEFAULT_SAVE_EVERY_N_STEPS,
     cancel_requested: Callable[[], bool] | None = None,
@@ -589,6 +694,16 @@ def run_job(
             timestep_sampling=timestep_sampling,
             weighting_scheme=weighting_scheme,
             discrete_flow_shift=discrete_flow_shift,
+            sample_prompts_path=sample_prompts_path,
+            sample_every_n_epochs=sample_every_n_epochs,
+            sample_at_first=sample_at_first,
+            guidance_scale=guidance_scale,
+            turbo_dit_path=turbo_dit_path,
+            turbo_dit_cache=turbo_dit_cache,
+            turbo_lora_path=turbo_lora_path,
+            turbo_lora_multiplier=turbo_lora_multiplier,
+            convrot_int8=convrot_int8,
+            convrot_int8_bwd=convrot_int8_bwd,
             train_steps=train_steps,
             save_every_n_steps=save_every_n_steps,
             enable_compile_optimizations=enable_compile_optimizations,
