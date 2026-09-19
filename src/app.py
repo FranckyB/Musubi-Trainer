@@ -878,6 +878,8 @@ def _launch_ui_impl() -> int:
     drag_moved = False
     drag_start_x: int | None = None
     drag_start_y: int | None = None
+    last_card_click_name: str | None = None
+    last_card_click_time: float = 0.0
     tensorboard_launch_in_progress = False
     tensorboard_started_by_app = False
     tensorboard_process: subprocess.Popen | None = None
@@ -5065,6 +5067,7 @@ def _launch_ui_impl() -> int:
 
     def on_card_release(target_name: str) -> str:
         nonlocal drag_dataset_name, drag_hover_dataset_name, drag_moved, drag_start_x, drag_start_y
+        nonlocal last_card_click_name, last_card_click_time
         if drag_dataset_name is None:
             return "break"
 
@@ -5084,13 +5087,23 @@ def _launch_ui_impl() -> int:
         if moved:
             return "break"
 
+        # Manual double-click detection: sub-widgets differ per click, so Tk's
+        # per-widget <Double-Button-1> tracking can miss it. Track name+time instead.
+        now = time.monotonic()
+        is_double_click = (
+            last_card_click_name == source_name
+            and (now - last_card_click_time) <= 0.4
+        )
+        last_card_click_name = None if is_double_click else source_name
+        last_card_click_time = 0.0 if is_double_click else now
+
+        if is_double_click:
+            open_edit_dataset_dialog(source_name)
+            return "break"
+
         toggle_dataset(source_name)
         apply_card_style(source_name)
         update_start_button_state()
-        return "break"
-
-    def on_card_double_click(name: str) -> str:
-        open_edit_dataset_dialog(name)
         return "break"
 
     def show_drag_preview(name: str) -> None:
@@ -5227,7 +5240,6 @@ def _launch_ui_impl() -> int:
                 clickable.bind("<ButtonPress-1>", lambda _e, n=name: on_card_press(n))
                 clickable.bind("<B1-Motion>", lambda _e: on_card_motion())
                 clickable.bind("<ButtonRelease-1>", lambda _e, n=name: on_card_release(n))
-                clickable.bind("<Double-Button-1>", lambda _e, n=name: on_card_double_click(n))
                 clickable.bind("<Button-3>", lambda e, n=name: show_thumbnail_context_menu(e, n))
 
             card_widgets.append(card)

@@ -90,7 +90,6 @@ class DatasetEditorWindow:
         dialog.withdraw()
         dialog.title(f"Edit Dataset: {dataset_name}")
         dialog.transient(self.root)
-        dialog.grab_set()
         dialog.configure(bg=self.bg_panel)
         dialog.resizable(False, True)
         self.set_dark_title_bar(dialog)
@@ -941,6 +940,8 @@ class DatasetEditorWindow:
 
         self.center_window(dialog)
         dialog.deiconify()
+        # grab_set requires a mapped/viewable window; X11 rejects it while withdrawn.
+        dialog.grab_set()
         self.root.wait_window(dialog)
 
     def _open_media_dataset_dialog(
@@ -967,7 +968,6 @@ class DatasetEditorWindow:
         dialog.withdraw()
         dialog.title(f"Edit Dataset: {dataset_name}")
         dialog.transient(self.root)
-        dialog.grab_set()
         dialog.configure(bg=self.bg_panel)
         dialog.resizable(False, True)
         self.set_dark_title_bar(dialog)
@@ -1193,6 +1193,8 @@ class DatasetEditorWindow:
             prompt.protocol("WM_DELETE_WINDOW", _cancel)
             self.center_window(prompt)
             prompt.deiconify()
+            # grab_set requires a mapped/viewable window; X11 rejects it while withdrawn.
+            prompt.grab_set()
             dialog.wait_window(prompt)
             return result["value"]
 
@@ -3420,6 +3422,8 @@ class DatasetEditorWindow:
             _poll_playback_state()
             self.center_window(trim_prompt)
             trim_prompt.deiconify()
+            # grab_set requires a mapped/viewable window; X11 rejects it while withdrawn.
+            trim_prompt.grab_set()
 
             def _load_waveform_preview() -> None:
                 nonlocal waveform_values
@@ -3679,4 +3683,6 @@ class DatasetEditorWindow:
 
         self.center_window(dialog)
         dialog.deiconify()
+        # grab_set requires a mapped/viewable window; X11 rejects it while withdrawn.
+        dialog.grab_set()
         self.root.wait_window(dialog)

@@ -198,7 +198,7 @@ class LoraMergeWindow:
         self.ttk.Checkbutton(mode_section, text="BETA", variable=mode_beta_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.ttk.Checkbutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
 
-        send_to_comfy_var = self.tk.BooleanVar(value=True)
+        send_to_comfy_var = self.tk.BooleanVar(value=False)
         if comfy_models_root is not None:
             send_to_comfy_check = self.ttk.Checkbutton(
                 frame,
@@ -362,7 +362,7 @@ class LoraMergeWindow:
         self.ttk.Checkbutton(mode_section, text="BETA", variable=mode_beta_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.ttk.Checkbutton(mode_section, text="BETA + BETA2 (Interpolated)", variable=mode_beta2_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
 
-        send_to_comfy_var = self.tk.BooleanVar(value=True)
+        send_to_comfy_var = self.tk.BooleanVar(value=False)
         if comfy_models_root is not None:
             send_to_comfy_check = self.ttk.Checkbutton(
                 frame,

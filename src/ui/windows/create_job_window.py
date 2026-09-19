@@ -51,7 +51,6 @@ class CreateJobWindow:
         dialog.withdraw()
         dialog.title("Edit Job" if existing_job is not None else "Create Job")
         dialog.transient(self.root)
-        dialog.grab_set()
         dialog.configure(bg=self.bg_panel)
         dialog.resizable(False, False)
         self.set_dark_title_bar(dialog)
@@ -3033,6 +3032,8 @@ class CreateJobWindow:
         _fit_create_job_dialog_to_content()
         self.center_window(dialog)
         dialog.deiconify()
+        # grab_set requires a mapped/viewable window; X11 rejects it while withdrawn.
+        dialog.grab_set()
         self.root.wait_window(dialog)
 
 
