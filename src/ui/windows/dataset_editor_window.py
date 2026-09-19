@@ -603,6 +603,39 @@ class DatasetEditorWindow:
             menu.add_command(label="Auto Tag+Caption", command=lambda p=image_path: _run_autotag_for_images(True, "tag_plus_caption_selected", p))
             menu.add_separator()
             menu.add_command(label="Delete", command=lambda p=image_path: _delete_image_item(p))
+
+            def _dismiss_menu(_event: Any = None) -> None:
+                try:
+                    menu.unpost()
+                except self.tk.TclError:
+                    pass
+                try:
+                    dialog.unbind("<Button-1>", button_binding_id)
+                except self.tk.TclError:
+                    pass
+                try:
+                    dialog.unbind("<Escape>", escape_binding_id)
+                except self.tk.TclError:
+                    pass
+                try:
+                    menu.destroy()
+                except self.tk.TclError:
+                    pass
+
+            def _dismiss_if_outside(click_event: Any) -> None:
+                try:
+                    widget = dialog.winfo_containing(click_event.x_root, click_event.y_root)
+                except self.tk.TclError:
+                    widget = None
+                current = widget
+                while current is not None:
+                    if current == menu:
+                        return
+                    current = getattr(current, "master", None)
+                _dismiss_menu()
+
+            button_binding_id = dialog.bind("<Button-1>", _dismiss_if_outside, add="+")
+            escape_binding_id = dialog.bind("<Escape>", _dismiss_menu, add="+")
             try:
                 menu.tk_popup(event.x_root, event.y_root)
             finally:
@@ -3467,6 +3500,39 @@ class DatasetEditorWindow:
                 )
             menu.add_separator()
             menu.add_command(label="Delete", command=lambda p=media_path: _delete_media_item(p, ask_confirmation=True))
+
+            def _dismiss_menu(_event: Any = None) -> None:
+                try:
+                    menu.unpost()
+                except self.tk.TclError:
+                    pass
+                try:
+                    dialog.unbind("<Button-1>", button_binding_id)
+                except self.tk.TclError:
+                    pass
+                try:
+                    dialog.unbind("<Escape>", escape_binding_id)
+                except self.tk.TclError:
+                    pass
+                try:
+                    menu.destroy()
+                except self.tk.TclError:
+                    pass
+
+            def _dismiss_if_outside(click_event: Any) -> None:
+                try:
+                    widget = dialog.winfo_containing(click_event.x_root, click_event.y_root)
+                except self.tk.TclError:
+                    widget = None
+                current = widget
+                while current is not None:
+                    if current == menu:
+                        return
+                    current = getattr(current, "master", None)
+                _dismiss_menu()
+
+            button_binding_id = dialog.bind("<Button-1>", _dismiss_if_outside, add="+")
+            escape_binding_id = dialog.bind("<Escape>", _dismiss_menu, add="+")
             try:
                 menu.tk_popup(event.x_root, event.y_root)
             finally:
