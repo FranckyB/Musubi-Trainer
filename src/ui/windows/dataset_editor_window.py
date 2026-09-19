@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tkinter.font as tkfont
 import wave
 from pathlib import Path
 import threading
@@ -40,6 +41,30 @@ WHISPER_LANGUAGE_CODES = {
 }
 
 
+def _set_single_line_name(label: Any, full_name: str, max_width_px: int) -> None:
+    """Show a filename on one line, truncated with an ellipsis instead of wrapping."""
+    try:
+        label_font = tkfont.Font(font=label.cget("font"))
+    except Exception:
+        label.configure(text=full_name)
+        return
+    if label_font.measure(full_name) <= max_width_px:
+        label.configure(text=full_name)
+        return
+    ellipsis = "\u2026"
+    low, high = 0, len(full_name)
+    truncated = ellipsis
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = full_name[:mid].rstrip() + ellipsis
+        if label_font.measure(candidate) <= max_width_px:
+            truncated = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    label.configure(text=truncated)
+
+
 class DatasetEditorWindow:
     def __init__(self, **dependencies: object) -> None:
         for name, value in dependencies.items():
@@ -53,6 +78,9 @@ class DatasetEditorWindow:
         # Include dialog frame padding and the vertical scrollbar lane.
         dialog_width_px = grid_width_px + 80
         tile_side_pad_px = tile_gap_px // 2
+        # Extra vertical room for reading/editing longer captions.
+        caption_shell_height_px = 198
+        caption_text_lines = 9
 
         dataset_dir = self.dataset_dir_path(dataset_name)
         if not dataset_dir.exists() or not dataset_dir.is_dir():
@@ -103,11 +131,12 @@ class DatasetEditorWindow:
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(0, weight=1)
 
-        self.ttk.Label(
+        header_label = self.ttk.Label(
             outer,
             text=f"{dataset_name} ({len(image_paths)} images)",
             style="TLabel",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        )
+        header_label.grid(row=0, column=0, sticky="w", pady=(0, 8))
 
         controls = self.ttk.Frame(outer)
         controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -149,7 +178,6 @@ class DatasetEditorWindow:
         editor_canvas.grid(row=0, column=0, sticky="nsew")
         editor_scroll.grid(row=0, column=1, sticky="ns")
 
-        thumb_refs: list[Any] = []
         caption_path_by_widget: dict[Any, Path] = {}
         pending_save_by_widget: dict[Any, str] = {}
         caption_widget_by_path: dict[Path, Any] = {}
@@ -594,8 +622,7 @@ class DatasetEditorWindow:
                     self.messagebox.showerror("Delete image", f"Could not delete image:\n{exc}", parent=dialog)
                     return
 
-                dialog.destroy()
-                self.root.after(0, lambda: self.open(dataset_name))
+                _refresh_grid()
 
             menu = self.tk.Menu(dialog, tearoff=0)
             menu.add_command(label="Auto Caption", command=lambda p=image_path: _run_autotag_for_images(True, "caption_selected", p))
@@ -704,6 +731,20 @@ class DatasetEditorWindow:
             if isinstance(widget, self.tk.Text):
                 flush_caption_save(widget)
 
+        def on_caption_undo(event: Any) -> str:
+            try:
+                event.widget.edit_undo()
+            except self.tk.TclError:
+                pass
+            return "break"
+
+        def on_caption_redo(event: Any) -> str:
+            try:
+                event.widget.edit_redo()
+            except self.tk.TclError:
+                pass
+            return "break"
+
         def _apply_replace_to_all_captions() -> None:
             find_text = replace_find_var.get()
             replace_text = replace_with_var.get()
@@ -811,7 +852,7 @@ class DatasetEditorWindow:
 
         def on_caption_mousewheel(event: Any) -> str:
             widget = event.widget
-            if isinstance(widget, self.tk.Text):
+            if isinstance(widget, self.tk.Text) and widget.focus_get() == widget:
                 delta = int(-event.delta / 120)
                 if delta == 0:
                     delta = -1 if event.delta > 0 else 1
@@ -821,14 +862,14 @@ class DatasetEditorWindow:
 
         def on_caption_linux_up(event: Any) -> str:
             widget = event.widget
-            if isinstance(widget, self.tk.Text):
+            if isinstance(widget, self.tk.Text) and widget.focus_get() == widget:
                 widget.yview_scroll(-1, "units")
                 return "break"
             return on_editor_linux_up(event)
 
         def on_caption_linux_down(event: Any) -> str:
             widget = event.widget
-            if isinstance(widget, self.tk.Text):
+            if isinstance(widget, self.tk.Text) and widget.focus_get() == widget:
                 widget.yview_scroll(1, "units")
                 return "break"
             return on_editor_linux_down(event)
@@ -864,7 +905,9 @@ class DatasetEditorWindow:
         for column_index in range(columns):
             editor_inner.columnconfigure(column_index, weight=0, minsize=tile_size_px)
 
-        for idx, image_path in enumerate(image_paths):
+        tile_frame_by_path: dict[Path, Any] = {}
+
+        def _build_tile(image_path: Path) -> Any:
             caption_path = image_path.with_suffix(".txt")
             caption_text = ""
             if caption_path.exists() and caption_path.is_file():
@@ -874,12 +917,11 @@ class DatasetEditorWindow:
                     caption_text = ""
 
             item_frame = self.ttk.Frame(editor_inner, padding=(4, 4, 4, 6), style="TFrame")
-            item_frame.grid(row=idx // columns, column=idx % columns, sticky="n", padx=tile_side_pad_px, pady=4)
             item_frame.columnconfigure(0, weight=1)
 
             photo = build_caption_thumb(image_path)
-            thumb_refs.append(photo)
             image_label = self.ttk.Label(item_frame, image=photo, anchor="center")
+            image_label.image = photo  # keep a reference alive (avoids a separate thumb_refs list)
             image_label.grid(row=0, column=0, sticky="n")
             image_label.bind("<MouseWheel>", on_editor_mousewheel)
             image_label.bind("<Button-4>", on_editor_linux_up)
@@ -892,15 +934,15 @@ class DatasetEditorWindow:
                 style="CardMeta.TLabel",
                 anchor="center",
                 justify="center",
-                wraplength=tile_size_px,
             )
             name_label.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+            _set_single_line_name(name_label, image_path.name, tile_size_px)
             name_label.bind("<Button-3>", lambda event, p=image_path: _show_image_autotag_menu(event, p))
 
             caption_shell = self.tk.Frame(
                 item_frame,
                 width=tile_size_px,
-                height=64,
+                height=caption_shell_height_px,
                 bg="#111826",
                 highlightthickness=1,
                 highlightbackground="#2a3a50",
@@ -913,7 +955,7 @@ class DatasetEditorWindow:
             caption_widget = self.tk.Text(
                 caption_shell,
                 width=1,
-                height=3,
+                height=caption_text_lines,
                 wrap="word",
                 bg="#111826",
                 fg=self.fg_text,
@@ -923,6 +965,9 @@ class DatasetEditorWindow:
                 highlightthickness=0,
                 padx=6,
                 pady=5,
+                undo=True,
+                autoseparators=True,
+                maxundo=-1,
             )
             caption_widget.pack(side="left", fill="both", expand=True)
 
@@ -934,14 +979,64 @@ class DatasetEditorWindow:
             )
             attach_autohide_scrollbar(caption_widget, caption_scroll)
             caption_widget.insert("1.0", caption_text)
+            caption_widget.edit_reset()  # don't let Ctrl+Z undo the initial load
             caption_widget.edit_modified(False)
             caption_widget.bind("<<Modified>>", schedule_caption_save)
             caption_widget.bind("<FocusOut>", on_caption_focus_out)
             caption_widget.bind("<MouseWheel>", on_caption_mousewheel)
             caption_widget.bind("<Button-4>", on_caption_linux_up)
             caption_widget.bind("<Button-5>", on_caption_linux_down)
+            caption_widget.bind("<Control-z>", on_caption_undo)
+            caption_widget.bind("<Control-Z>", on_caption_undo)
+            caption_widget.bind("<Control-y>", on_caption_redo)
+            caption_widget.bind("<Control-Shift-Z>", on_caption_redo)
             caption_path_by_widget[caption_widget] = caption_path
             caption_widget_by_path[caption_path] = caption_widget
+
+            tile_frame_by_path[image_path] = item_frame
+            return item_frame
+
+        def _remove_tile(image_path: Path) -> None:
+            frame = tile_frame_by_path.pop(image_path, None)
+            if frame is not None:
+                try:
+                    frame.destroy()
+                except Exception:
+                    pass
+            caption_path = image_path.with_suffix(".txt")
+            widget = caption_widget_by_path.pop(caption_path, None)
+            if widget is not None:
+                caption_path_by_widget.pop(widget, None)
+                pending_save_by_widget.pop(widget, None)
+
+        def _regrid_tiles() -> None:
+            for idx, image_path in enumerate(image_paths):
+                frame = tile_frame_by_path.get(image_path)
+                if frame is not None:
+                    frame.grid(row=idx // columns, column=idx % columns, sticky="n", padx=tile_side_pad_px, pady=4)
+
+        def _refresh_grid() -> None:
+            """Re-scan the dataset folder and add/remove only the changed tiles in place."""
+            nonlocal image_paths
+            new_image_paths = self.dataset_image_files(self.datasets_root_dir(), dataset_name)
+            new_set = set(new_image_paths)
+
+            for existing_path in list(tile_frame_by_path.keys()):
+                if existing_path not in new_set:
+                    _remove_tile(existing_path)
+
+            for image_path in new_image_paths:
+                if image_path not in tile_frame_by_path:
+                    _build_tile(image_path)
+
+            image_paths = new_image_paths
+            _regrid_tiles()
+            header_label.configure(text=f"{dataset_name} ({len(image_paths)} images)")
+
+        def _populate_initial_grid() -> None:
+            for image_path in image_paths:
+                _build_tile(image_path)
+            _regrid_tiles()
 
         def close_editor() -> None:
             for text_widget in list(caption_path_by_widget.keys()):
@@ -969,12 +1064,19 @@ class DatasetEditorWindow:
         editor_inner.bind("<MouseWheel>", on_editor_mousewheel)
         editor_inner.bind("<Button-4>", on_editor_linux_up)
         editor_inner.bind("<Button-5>", on_editor_linux_down)
+        # Fallback for every other widget in the grid (labels, frames, buttons, ...):
+        # the toplevel is in every child's default bindtags, so this catches wheel
+        # events that land on widgets with no scroll binding of their own.
+        dialog.bind("<MouseWheel>", on_editor_mousewheel)
+        dialog.bind("<Button-4>", on_editor_linux_up)
+        dialog.bind("<Button-5>", on_editor_linux_down)
         dialog.protocol("WM_DELETE_WINDOW", close_editor)
 
-        self.center_window(dialog)
+        # Show the window immediately, then stream thumbnails in so opening feels instant.
         dialog.deiconify()
-        # grab_set requires a mapped/viewable window; X11 rejects it while withdrawn.
+        self.center_window(dialog)
         dialog.grab_set()
+        dialog.after(1, _populate_initial_grid)
         self.root.wait_window(dialog)
 
     def _open_media_dataset_dialog(
@@ -988,6 +1090,10 @@ class DatasetEditorWindow:
         dialog_width_px: int,
         tile_side_pad_px: int,
     ) -> None:
+        # Extra vertical room for reading/editing longer captions.
+        caption_shell_height_px = 198
+        caption_text_lines = 9
+
         media_items: list[tuple[Path, str]] = [(path, "audio") for path in audio_paths] + [
             (path, "video") for path in video_paths
         ]
@@ -1014,20 +1120,20 @@ class DatasetEditorWindow:
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(0, weight=1)
 
-        audio_count = len(audio_paths)
-        video_count = len(video_paths)
-        header_parts: list[str] = []
-        if audio_count:
-            header_parts.append(f"{audio_count} audio clip{'s' if audio_count != 1 else ''}")
-        if video_count:
-            header_parts.append(f"{video_count} video clip{'s' if video_count != 1 else ''}")
-        header_text = ", ".join(header_parts) if header_parts else "0 media"
+        def _media_header_text(audio_count: int, video_count: int) -> str:
+            header_parts: list[str] = []
+            if audio_count:
+                header_parts.append(f"{audio_count} audio clip{'s' if audio_count != 1 else ''}")
+            if video_count:
+                header_parts.append(f"{video_count} video clip{'s' if video_count != 1 else ''}")
+            return ", ".join(header_parts) if header_parts else "0 media"
 
-        self.ttk.Label(
+        header_label = self.ttk.Label(
             outer,
-            text=f"{dataset_name} ({header_text})",
+            text=f"{dataset_name} ({_media_header_text(len(audio_paths), len(video_paths))})",
             style="TLabel",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        )
+        header_label.grid(row=0, column=0, sticky="w", pady=(0, 8))
 
         controls = self.ttk.Frame(outer)
         controls.grid(row=1, column=0, sticky="w", pady=(0, 8))
@@ -1116,7 +1222,6 @@ class DatasetEditorWindow:
         editor_canvas.grid(row=0, column=0, sticky="nsew")
         editor_scroll.grid(row=0, column=1, sticky="ns")
 
-        thumb_refs: list[Any] = []
         active_players: dict[Path, subprocess.Popen[Any]] = {}
         ffplay_path = shutil.which("ffplay")
         ffprobe_path = shutil.which("ffprobe")
@@ -1315,8 +1420,7 @@ class DatasetEditorWindow:
                 self.messagebox.showerror("Delete clip", f"Could not delete clip:\n{exc}", parent=dialog)
                 return
 
-            dialog.destroy()
-            self.root.after(0, lambda: self.open(dataset_name))
+            _refresh_media_grid()
 
         def _run_whisper_transcription(audio_file_paths: list[Path], replace_existing: bool) -> tuple[int, int, int]:
             if not audio_file_paths:
@@ -2092,8 +2196,7 @@ class DatasetEditorWindow:
                     def _finish_extract() -> None:
                         _set_transcribe_busy(False, f"Extracted {extracted} clip(s), {errors} errors")
                         if extracted > 0:
-                            dialog.destroy()
-                            self.root.after(0, lambda: self.open(dataset_name))
+                            _refresh_media_grid()
 
                     dialog.after(0, _finish_extract)
                 except Exception as exc:
@@ -2203,8 +2306,7 @@ class DatasetEditorWindow:
                     def _finish_normalize() -> None:
                         _set_transcribe_busy(False, f"Normalized {normalized_count} clip(s), {errors} errors")
                         if normalized_count > 0:
-                            dialog.destroy()
-                            self.root.after(0, lambda: self.open(dataset_name))
+                            _refresh_media_grid()
 
                     dialog.after(0, _finish_normalize)
                 except Exception as exc:
@@ -2421,8 +2523,7 @@ class DatasetEditorWindow:
                                     parent=dialog,
                                 )
                         if processed_count > 0:
-                            dialog.destroy()
-                            self.root.after(0, lambda: self.open(dataset_name))
+                            _refresh_media_grid()
 
                     dialog.after(0, _finish_enhance)
                 except Exception as exc:
@@ -2477,6 +2578,8 @@ class DatasetEditorWindow:
                             )
                             if remove_original:
                                 _delete_media_item(source_clip, ask_confirmation=False)
+                        if created > 0:
+                            _refresh_media_grid()
 
                     dialog.after(0, _finish_split)
                 except ImportError:
@@ -2534,7 +2637,7 @@ class DatasetEditorWindow:
 
         def on_caption_mousewheel(event: Any) -> str:
             widget = event.widget
-            if isinstance(widget, self.tk.Text):
+            if isinstance(widget, self.tk.Text) and widget.focus_get() == widget:
                 delta = int(-event.delta / 120)
                 if delta == 0:
                     delta = -1 if event.delta > 0 else 1
@@ -2544,14 +2647,14 @@ class DatasetEditorWindow:
 
         def on_caption_linux_up(event: Any) -> str:
             widget = event.widget
-            if isinstance(widget, self.tk.Text):
+            if isinstance(widget, self.tk.Text) and widget.focus_get() == widget:
                 widget.yview_scroll(-1, "units")
                 return "break"
             return on_editor_linux_up(event)
 
         def on_caption_linux_down(event: Any) -> str:
             widget = event.widget
-            if isinstance(widget, self.tk.Text):
+            if isinstance(widget, self.tk.Text) and widget.focus_get() == widget:
                 widget.yview_scroll(1, "units")
                 return "break"
             return on_editor_linux_down(event)
@@ -2620,6 +2723,20 @@ class DatasetEditorWindow:
             widget = event.widget
             if isinstance(widget, self.tk.Text):
                 flush_caption_save(widget)
+
+        def on_caption_undo(event: Any) -> str:
+            try:
+                event.widget.edit_undo()
+            except self.tk.TclError:
+                pass
+            return "break"
+
+        def on_caption_redo(event: Any) -> str:
+            try:
+                event.widget.edit_redo()
+            except self.tk.TclError:
+                pass
+            return "break"
 
         def open_media_external(path: Path) -> None:
             try:
@@ -3401,8 +3518,7 @@ class DatasetEditorWindow:
                 except Exception:
                     pass
                 trim_prompt.destroy()
-                dialog.destroy()
-                self.root.after(0, lambda: self.open(dataset_name))
+                _refresh_media_grid()
 
             trim_holder = self.tk.Frame(values_trim_row, bg=self.bg_panel, bd=0)
             trim_holder.grid(row=0, column=9, sticky="e")
@@ -3599,7 +3715,9 @@ class DatasetEditorWindow:
         for column_index in range(columns):
             editor_inner.columnconfigure(column_index, weight=0, minsize=tile_size_px)
 
-        for idx, (media_path, media_kind) in enumerate(media_items):
+        tile_frame_by_path: dict[Path, Any] = {}
+
+        def _build_media_tile(media_path: Path, media_kind: str) -> Any:
             caption_path = media_path.with_suffix(".txt")
             caption_text = ""
             if caption_path.exists() and caption_path.is_file():
@@ -3609,13 +3727,12 @@ class DatasetEditorWindow:
                     caption_text = ""
 
             item_frame = self.ttk.Frame(editor_inner, padding=(4, 4, 4, 6), style="TFrame")
-            item_frame.grid(row=idx // columns, column=idx % columns, sticky="n", padx=tile_side_pad_px, pady=4)
             item_frame.columnconfigure(0, weight=1)
 
             long_audio_warning = media_kind == "audio" and _is_long_audio_clip(media_path)
             photo = build_media_thumb(media_kind, show_split_warning=long_audio_warning)
-            thumb_refs.append(photo)
             image_label = self.ttk.Label(item_frame, image=photo, anchor="center")
+            image_label.image = photo  # keep a reference alive (avoids a separate thumb_refs list)
             image_label.grid(row=0, column=0, sticky="n")
             if media_kind == "audio":
                 image_label.bind("<Double-Button-1>", lambda _event, p=media_path: _open_trim_audio_dialog(p))
@@ -3648,14 +3765,14 @@ class DatasetEditorWindow:
                 style="CardMeta.TLabel",
                 anchor="center",
                 justify="center",
-                wraplength=tile_size_px,
             )
             name_label.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+            _set_single_line_name(name_label, media_path.name, tile_size_px)
 
             caption_shell = self.tk.Frame(
                 item_frame,
                 width=tile_size_px,
-                height=64,
+                height=caption_shell_height_px,
                 bg="#111826",
                 highlightthickness=1,
                 highlightbackground="#2a3a50",
@@ -3668,7 +3785,7 @@ class DatasetEditorWindow:
             caption_widget = self.tk.Text(
                 caption_shell,
                 width=1,
-                height=3,
+                height=caption_text_lines,
                 wrap="word",
                 bg="#111826",
                 fg=self.fg_text,
@@ -3678,6 +3795,9 @@ class DatasetEditorWindow:
                 highlightthickness=0,
                 padx=6,
                 pady=5,
+                undo=True,
+                autoseparators=True,
+                maxundo=-1,
             )
             caption_widget.pack(side="left", fill="both", expand=True)
 
@@ -3689,18 +3809,81 @@ class DatasetEditorWindow:
             )
             attach_autohide_scrollbar(caption_widget, caption_scroll)
             caption_widget.insert("1.0", caption_text)
+            caption_widget.edit_reset()  # don't let Ctrl+Z undo the initial load
             caption_widget.edit_modified(False)
             caption_widget.bind("<<Modified>>", schedule_caption_save)
             caption_widget.bind("<FocusOut>", on_caption_focus_out)
             caption_widget.bind("<MouseWheel>", on_caption_mousewheel)
             caption_widget.bind("<Button-4>", on_caption_linux_up)
             caption_widget.bind("<Button-5>", on_caption_linux_down)
+            caption_widget.bind("<Control-z>", on_caption_undo)
+            caption_widget.bind("<Control-Z>", on_caption_undo)
+            caption_widget.bind("<Control-y>", on_caption_redo)
+            caption_widget.bind("<Control-Shift-Z>", on_caption_redo)
             caption_path_by_widget[caption_widget] = caption_path
 
             image_label.bind("<Button-3>", lambda event, p=media_path, k=media_kind: _show_media_context_menu(event, p, k))
             name_label.bind("<Button-3>", lambda event, p=media_path, k=media_kind: _show_media_context_menu(event, p, k))
 
             caption_widget_by_path[caption_path] = caption_widget
+            tile_frame_by_path[media_path] = item_frame
+            return item_frame
+
+        def _remove_media_tile(media_path: Path) -> None:
+            stop_media(media_path)
+            frame = tile_frame_by_path.pop(media_path, None)
+            if frame is not None:
+                try:
+                    frame.destroy()
+                except Exception:
+                    pass
+            caption_path = media_path.with_suffix(".txt")
+            widget = caption_widget_by_path.pop(caption_path, None)
+            if widget is not None:
+                caption_path_by_widget.pop(widget, None)
+                pending_save_by_widget.pop(widget, None)
+
+        def _regrid_media_tiles() -> None:
+            for idx, (media_path, _media_kind) in enumerate(media_items):
+                frame = tile_frame_by_path.get(media_path)
+                if frame is not None:
+                    frame.grid(row=idx // columns, column=idx % columns, sticky="n", padx=tile_side_pad_px, pady=4)
+
+        def _refresh_media_grid() -> None:
+            """Re-scan the dataset folder and add/remove only the changed tiles in place."""
+            nonlocal media_items, audio_paths, video_paths
+            new_audio_paths = dataset_audio_files(self.datasets_root_dir(), dataset_name)
+            new_video_paths = sorted(
+                [
+                    path
+                    for path in self.dataset_dir_path(dataset_name).iterdir()
+                    if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
+                ]
+            )
+            new_media_items: list[tuple[Path, str]] = [(path, "audio") for path in new_audio_paths] + [
+                (path, "video") for path in new_video_paths
+            ]
+            new_media_items.sort(key=lambda pair: pair[0].name.casefold())
+            new_paths = {path for path, _kind in new_media_items}
+
+            for existing_path in list(tile_frame_by_path.keys()):
+                if existing_path not in new_paths:
+                    _remove_media_tile(existing_path)
+
+            for media_path, media_kind in new_media_items:
+                if media_path not in tile_frame_by_path:
+                    _build_media_tile(media_path, media_kind)
+
+            media_items = new_media_items
+            audio_paths = new_audio_paths
+            video_paths = new_video_paths
+            _regrid_media_tiles()
+            header_label.configure(text=f"{dataset_name} ({_media_header_text(len(audio_paths), len(video_paths))})")
+
+        def _populate_initial_media_grid() -> None:
+            for media_path, media_kind in media_items:
+                _build_media_tile(media_path, media_kind)
+            _regrid_media_tiles()
 
         transcribe_all_button.configure(
             command=lambda: _start_whisper_transcription(audio_paths, bool(replace_existing_var.get()))
@@ -3745,10 +3928,17 @@ class DatasetEditorWindow:
         editor_inner.bind("<MouseWheel>", on_editor_mousewheel)
         editor_inner.bind("<Button-4>", on_editor_linux_up)
         editor_inner.bind("<Button-5>", on_editor_linux_down)
+        # Fallback for every other widget in the grid (labels, frames, buttons, ...):
+        # the toplevel is in every child's default bindtags, so this catches wheel
+        # events that land on widgets with no scroll binding of their own.
+        dialog.bind("<MouseWheel>", on_editor_mousewheel)
+        dialog.bind("<Button-4>", on_editor_linux_up)
+        dialog.bind("<Button-5>", on_editor_linux_down)
         dialog.protocol("WM_DELETE_WINDOW", close_editor)
 
-        self.center_window(dialog)
+        # Show the window immediately, then stream tiles in so opening feels instant.
         dialog.deiconify()
-        # grab_set requires a mapped/viewable window; X11 rejects it while withdrawn.
+        self.center_window(dialog)
         dialog.grab_set()
+        dialog.after(1, _populate_initial_media_grid)
         self.root.wait_window(dialog)
