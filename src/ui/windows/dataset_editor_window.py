@@ -8,6 +8,8 @@ import sys
 import tempfile
 import time
 import tkinter.font as tkfont
+import urllib.error
+import urllib.request
 import wave
 from pathlib import Path
 import threading
@@ -39,6 +41,10 @@ WHISPER_LANGUAGE_CODES = {
     "Spanish": "es",
     "Italian": "it",
 }
+
+ARNNDN_MODEL_URL = "https://raw.githubusercontent.com/GregorR/rnnoise-models/master/marathon-prescription-2018-08-29/mp.rnnn"
+ARNNDN_MODEL_FILENAME = "mp.rnnn"
+ARNNDN_MODEL_DIRNAME = "ffmpeg-arnndn"
 
 
 def _set_single_line_name(label: Any, full_name: str, max_width_px: int) -> None:
@@ -140,7 +146,7 @@ class DatasetEditorWindow:
 
         controls = self.ttk.Frame(outer)
         controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        controls.columnconfigure(9, weight=1)
+        controls.columnconfigure(0, weight=1)
         autotag_all_var = self.tk.BooleanVar(master=dialog, value=False)
         autotag_status_var = self.tk.StringVar(master=dialog, value="Captions auto-save as .txt sidecar files.")
         trigger_word_var = self.tk.StringVar(master=dialog, value="")
@@ -152,6 +158,11 @@ class DatasetEditorWindow:
         caption_button: Any = None
         detailed_button: Any = None
         replace_apply_button: Any = None
+
+        image_controls_row = self.ttk.Frame(controls)
+        image_controls_row.grid(row=0, column=0, sticky="w")
+        image_replace_row = self.ttk.Frame(controls)
+        image_replace_row.grid(row=1, column=0, sticky="w", pady=(6, 0))
 
         grid_host = self.tk.Frame(
             outer,
@@ -174,6 +185,37 @@ class DatasetEditorWindow:
         editor_inner = self.ttk.Frame(editor_canvas)
         editor_inner_id = editor_canvas.create_window((0, 0), window=editor_inner, anchor="nw")
         editor_canvas.configure(yscrollcommand=editor_scroll.set)
+
+        loading_label = self.tk.Label(
+            grid_host,
+            text="LOADING ...",
+            bg=self.bg_panel,
+            fg=getattr(self, "fg_muted", self.fg_text),
+            anchor="center",
+            justify="center",
+        )
+        loading_label.place(relx=0.5, rely=0.5, anchor="center")
+
+        busy_overlay = self.tk.Frame(
+            grid_host,
+            bg="#0b1018",
+            highlightthickness=1,
+            highlightbackground="#4a6ea3",
+            bd=0,
+        )
+        busy_overlay.columnconfigure(0, weight=1)
+        busy_overlay.rowconfigure(0, weight=1)
+        busy_overlay_status_var = self.tk.StringVar(master=dialog, value="")
+        self.tk.Label(
+            busy_overlay,
+            textvariable=busy_overlay_status_var,
+            bg="#0b1018",
+            fg=self.fg_text,
+            anchor="center",
+            justify="center",
+            padx=16,
+            pady=16,
+        ).grid(row=0, column=0, sticky="nsew")
 
         editor_canvas.grid(row=0, column=0, sticky="nsew")
         editor_scroll.grid(row=0, column=1, sticky="ns")
@@ -540,17 +582,17 @@ class DatasetEditorWindow:
 
             threading.Thread(target=worker, name="dataset-editor-autotag", daemon=True).start()
 
-        self.ttk.Label(controls, text="Trigger word:", style="TLabel").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.ttk.Label(image_controls_row, text="Trigger word:", style="TLabel").grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.ttk.Entry(
-            controls,
+            image_controls_row,
             textvariable=trigger_word_var,
             width=16,
             style="Flat.TEntry",
         ).grid(row=0, column=1, sticky="w", padx=(0, 10))
 
-        self.ttk.Label(controls, text="Caption mode:", style="TLabel").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        self.ttk.Label(image_controls_row, text="Caption mode:", style="TLabel").grid(row=0, column=2, sticky="w", padx=(0, 6))
         self.ttk.Combobox(
-            controls,
+            image_controls_row,
             textvariable=caption_mode_var,
             values=caption_mode_choices,
             state="readonly",
@@ -558,31 +600,31 @@ class DatasetEditorWindow:
         ).grid(row=0, column=3, sticky="w", padx=(0, 10))
 
         caption_button = self.ttk.Button(
-            controls,
+            image_controls_row,
             text="Auto Caption",
             command=lambda: _run_autotag_for_images(bool(autotag_all_var.get()), "caption_selected"),
         )
         caption_button.grid(row=0, column=4, sticky="w")
         autotag_button = self.ttk.Button(
-            controls,
+            image_controls_row,
             text="Auto Tag (SDXL)",
             command=lambda: _run_autotag_for_images(bool(autotag_all_var.get()), "tags"),
         )
         autotag_button.grid(row=0, column=5, sticky="w", padx=(8, 0))
         detailed_button = self.ttk.Button(
-            controls,
+            image_controls_row,
             text="Auto Tag+Caption",
             command=lambda: _run_autotag_for_images(bool(autotag_all_var.get()), "tag_plus_caption_selected"),
         )
         detailed_button.grid(row=0, column=6, sticky="w", padx=(8, 0))
         self.ttk.Checkbutton(
-            controls,
+            image_controls_row,
             text="Replace All",
             variable=autotag_all_var,
         ).grid(row=0, column=7, sticky="w", padx=(12, 0))
 
-        replace_controls = self.ttk.Frame(controls)
-        replace_controls.grid(row=0, column=10, sticky="e", padx=(24, 0))
+        replace_controls = self.ttk.Frame(image_replace_row)
+        replace_controls.grid(row=0, column=0, sticky="w")
         self.ttk.Label(replace_controls, text="Replace:", style="TLabel").grid(row=0, column=0, sticky="e", padx=(0, 4))
         self.ttk.Entry(
             replace_controls,
@@ -631,7 +673,13 @@ class DatasetEditorWindow:
             menu.add_separator()
             menu.add_command(label="Delete", command=lambda p=image_path: _delete_image_item(p))
 
+            menu_dismissed = False
+
             def _dismiss_menu(_event: Any = None) -> None:
+                nonlocal menu_dismissed
+                if menu_dismissed:
+                    return
+                menu_dismissed = True
                 try:
                     menu.unpost()
                 except self.tk.TclError:
@@ -661,8 +709,12 @@ class DatasetEditorWindow:
                     current = getattr(current, "master", None)
                 _dismiss_menu()
 
+            def _handle_menu_unmap(_event: Any = None) -> None:
+                dialog.after_idle(_dismiss_menu)
+
             button_binding_id = dialog.bind("<Button-1>", _dismiss_if_outside, add="+")
             escape_binding_id = dialog.bind("<Escape>", _dismiss_menu, add="+")
+            menu.bind("<Unmap>", _handle_menu_unmap, add="+")
             try:
                 menu.tk_popup(event.x_root, event.y_root)
             finally:
@@ -1034,9 +1086,13 @@ class DatasetEditorWindow:
             header_label.configure(text=f"{dataset_name} ({len(image_paths)} images)")
 
         def _populate_initial_grid() -> None:
-            for image_path in image_paths:
-                _build_tile(image_path)
-            _regrid_tiles()
+            try:
+                for image_path in image_paths:
+                    _build_tile(image_path)
+                _regrid_tiles()
+            finally:
+                if loading_label.winfo_exists():
+                    loading_label.destroy()
 
         def close_editor() -> None:
             for text_widget in list(caption_path_by_widget.keys()):
@@ -1136,7 +1192,8 @@ class DatasetEditorWindow:
         header_label.grid(row=0, column=0, sticky="w", pady=(0, 8))
 
         controls = self.ttk.Frame(outer)
-        controls.grid(row=1, column=0, sticky="w", pady=(0, 8))
+        controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        controls.columnconfigure(1, weight=1)
         transcribe_model_var = self.tk.StringVar(master=dialog, value="Medium")
         transcribe_language_var = self.tk.StringVar(master=dialog, value="Auto-detect")
         replace_existing_var = self.tk.BooleanVar(master=dialog, value=False)
@@ -1144,25 +1201,32 @@ class DatasetEditorWindow:
         transcribe_all_button: Any = None
         extract_audio_button: Any = None
         normalize_audio_button: Any = None
+        denoise_audio_button: Any = None
+        remove_music_button: Any = None
         split_defaults: dict[str, float] = {
-            "split_min": 4.0,
-            "split_max": 8.0,
+            "split_min": 15.0,
+            "split_max": 25.0,
             "silence_trim": 1.0,
             "discard_under": 1.0,
         }
 
-        self.ttk.Label(controls, text="Whisper:", style="TLabel").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        audio_settings_row = self.ttk.Frame(controls)
+        audio_settings_row.grid(row=0, column=0, sticky="w")
+        audio_actions_row = self.ttk.Frame(controls)
+        audio_actions_row.grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        self.ttk.Label(audio_settings_row, text="Whisper:", style="TLabel").grid(row=0, column=0, sticky="w", padx=(0, 4))
         self.ttk.Combobox(
-            controls,
+            audio_settings_row,
             textvariable=transcribe_model_var,
             values=["Medium", "Large"],
             state="readonly",
             width=10,
         ).grid(row=0, column=1, sticky="w", padx=(0, 8))
 
-        self.ttk.Label(controls, text="Language:", style="TLabel").grid(row=0, column=2, sticky="w", padx=(0, 4))
+        self.ttk.Label(audio_settings_row, text="Language:", style="TLabel").grid(row=0, column=2, sticky="w", padx=(0, 4))
         self.ttk.Combobox(
-            controls,
+            audio_settings_row,
             textvariable=transcribe_language_var,
             values=["Auto-detect", *WHISPER_LANGUAGE_CODES.keys()],
             state="readonly",
@@ -1170,31 +1234,43 @@ class DatasetEditorWindow:
         ).grid(row=0, column=3, sticky="w", padx=(0, 8))
 
         self.ttk.Checkbutton(
-            controls,
+            audio_settings_row,
             text="Replace Existing",
             variable=replace_existing_var,
         ).grid(row=0, column=4, sticky="w", padx=(0, 8))
 
         transcribe_all_button = self.ttk.Button(
-            controls,
+            audio_actions_row,
             text="Transcribe All Audio",
         )
         transcribe_all_button.grid(row=0, column=5, sticky="w")
 
         extract_audio_button = self.ttk.Button(
-            controls,
+            audio_actions_row,
             text="Extract Audio From Videos",
         )
         extract_audio_button.grid(row=0, column=6, sticky="w", padx=(8, 0))
 
         normalize_audio_button = self.ttk.Button(
-            controls,
+            audio_actions_row,
             text="Normalize Gain (All Audio)",
         )
         normalize_audio_button.grid(row=0, column=7, sticky="w", padx=(8, 0))
 
+        denoise_audio_button = self.ttk.Button(
+            audio_actions_row,
+            text="Denoise (All Audio)",
+        )
+        denoise_audio_button.grid(row=0, column=8, sticky="w", padx=(8, 0))
+
+        remove_music_button = self.ttk.Button(
+            audio_actions_row,
+            text="Remove Music (All Audio)",
+        )
+        remove_music_button.grid(row=0, column=9, sticky="w", padx=(8, 0))
+
         self.ttk.Label(controls, textvariable=transcribe_status_var, style="TLabel").grid(
-            row=0, column=8, sticky="w", padx=(10, 0)
+            row=1, column=1, sticky="w", padx=(10, 0), pady=(6, 0)
         )
 
         grid_host = self.tk.Frame(
@@ -1219,6 +1295,37 @@ class DatasetEditorWindow:
         editor_inner_id = editor_canvas.create_window((0, 0), window=editor_inner, anchor="nw")
         editor_canvas.configure(yscrollcommand=editor_scroll.set)
 
+        loading_label = self.tk.Label(
+            grid_host,
+            text="LOADING ...",
+            bg=self.bg_panel,
+            fg=getattr(self, "fg_muted", self.fg_text),
+            anchor="center",
+            justify="center",
+        )
+        loading_label.place(relx=0.5, rely=0.5, anchor="center")
+
+        busy_overlay = self.tk.Frame(
+            grid_host,
+            bg="#0b1018",
+            highlightthickness=1,
+            highlightbackground="#4a6ea3",
+            bd=0,
+        )
+        busy_overlay.columnconfigure(0, weight=1)
+        busy_overlay.rowconfigure(0, weight=1)
+        busy_overlay_status_var = self.tk.StringVar(master=dialog, value="")
+        self.tk.Label(
+            busy_overlay,
+            textvariable=busy_overlay_status_var,
+            bg="#0b1018",
+            fg=self.fg_text,
+            anchor="center",
+            justify="center",
+            padx=16,
+            pady=16,
+        ).grid(row=0, column=0, sticky="nsew")
+
         editor_canvas.grid(row=0, column=0, sticky="nsew")
         editor_scroll.grid(row=0, column=1, sticky="ns")
 
@@ -1229,17 +1336,32 @@ class DatasetEditorWindow:
         pending_save_by_widget: dict[Any, str] = {}
         caption_widget_by_path: dict[Path, Any] = {}
         audio_duration_cache: dict[Path, float | None] = {}
-        enhancement_notice_state = {"remove_music_download_logged": False}
+        enhancement_notice_state = {
+            "denoise_download_logged": False,
+            "remove_music_download_logged": False,
+        }
 
         def _set_transcribe_busy(is_busy: bool, status_text: str = "") -> None:
             button_state = "disabled" if is_busy else "normal"
-            for action_button in (transcribe_all_button, extract_audio_button, normalize_audio_button):
+            for action_button in (
+                transcribe_all_button,
+                extract_audio_button,
+                normalize_audio_button,
+                denoise_audio_button,
+                remove_music_button,
+            ):
                 if action_button is not None:
                     try:
                         action_button.configure(state=button_state)
                     except Exception:
                         pass
             transcribe_status_var.set(status_text)
+            if is_busy:
+                busy_overlay_status_var.set(status_text or "Working...")
+                busy_overlay.place(relx=0.0, rely=0.0, relwidth=1.0, relheight=1.0)
+                busy_overlay.lift()
+            else:
+                busy_overlay.place_forget()
 
         def _resolve_ffmpeg_executable() -> str:
             ffmpeg_path = shutil.which("ffmpeg")
@@ -1255,11 +1377,81 @@ class DatasetEditorWindow:
                 )
             return ffmpeg_executable
 
+        def _resolve_audio_separator_executable() -> str:
+            scripts_dir = Path(sys.executable).resolve().parent
+            for candidate in (scripts_dir / "audio-separator.exe", scripts_dir / "audio-separator"):
+                if candidate.exists() and candidate.is_file():
+                    return str(candidate)
+
+            workspace_root = Path(__file__).resolve().parents[3]
+            for candidate in (
+                workspace_root / "venv" / "Scripts" / "audio-separator.exe",
+                workspace_root / "venv" / "Scripts" / "audio-separator",
+                workspace_root / "venv" / "bin" / "audio-separator",
+            ):
+                if candidate.exists() and candidate.is_file():
+                    return str(candidate)
+
+            cli_path = shutil.which("audio-separator.exe") or shutil.which("audio-separator")
+            if cli_path:
+                resolved = Path(cli_path).resolve()
+                if resolved.exists():
+                    return str(resolved)
+
+            raise RuntimeError(
+                "audio-separator was not found in the current Python environment. Install requirements and restart Musubi-Trainer."
+            )
+
         def _workspace_root_for_downloads() -> Path:
             ws_root_fn = getattr(self, "download_workspace_root", None)
             if callable(ws_root_fn):
                 return ws_root_fn()
             return Path(__file__).resolve().parents[3]
+
+        def _audio_separator_model_dir() -> Path:
+            model_dir = _workspace_root_for_downloads() / "Models" / "audio-separator"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            return model_dir
+
+        def _escape_ffmpeg_filter_value(value: str) -> str:
+            return value.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+        def _ensure_arnndn_model_path() -> Path:
+            model_dir = _workspace_root_for_downloads() / "Models" / ARNNDN_MODEL_DIRNAME
+            model_dir.mkdir(parents=True, exist_ok=True)
+            model_path = model_dir / ARNNDN_MODEL_FILENAME
+            if model_path.exists() and model_path.is_file() and model_path.stat().st_size > 0:
+                return model_path
+
+            temp_model_path = model_path.with_suffix(model_path.suffix + ".tmp")
+            try:
+                if temp_model_path.exists():
+                    temp_model_path.unlink()
+            except OSError:
+                pass
+
+            try:
+                with urllib.request.urlopen(ARNNDN_MODEL_URL, timeout=120) as response, open(temp_model_path, "wb") as handle:
+                    shutil.copyfileobj(response, handle)
+                if temp_model_path.stat().st_size <= 0:
+                    raise RuntimeError("downloaded model file is empty")
+                temp_model_path.replace(model_path)
+            except urllib.error.URLError as exc:
+                raise RuntimeError(
+                    f"Could not download the FFmpeg RNNoise model from {ARNNDN_MODEL_URL}: {exc}"
+                ) from exc
+            except OSError as exc:
+                raise RuntimeError(f"Could not store the FFmpeg RNNoise model at {model_path}: {exc}") from exc
+            except RuntimeError:
+                raise
+            finally:
+                try:
+                    if temp_model_path.exists():
+                        temp_model_path.unlink()
+                except OSError:
+                    pass
+
+            return model_path
 
         def _ask_auto_split_params() -> tuple[float, float, float, float] | None:
             prompt = self.tk.Toplevel(dialog)
@@ -1345,6 +1537,110 @@ class DatasetEditorWindow:
                     candidate_path = candidate
             return candidate_path.resolve()
 
+        def _audio_backup_root_dir() -> Path:
+            backup_root = _workspace_root_for_downloads() / "Temp" / "dataset_audio_backups" / dataset_name
+            backup_root.mkdir(parents=True, exist_ok=True)
+            return backup_root
+
+        def _audio_backup_paths(audio_path: Path) -> tuple[Path, Path]:
+            normalized_audio_path = _normalize_media_path(audio_path)
+            backup_root = _audio_backup_root_dir()
+            return (
+                backup_root / normalized_audio_path.name,
+                backup_root / f"{normalized_audio_path.stem}.txt",
+            )
+
+        def _is_dataset_audio_path(audio_path: Path) -> bool:
+            normalized_audio_path = _normalize_media_path(audio_path)
+            return normalized_audio_path.parent == self.dataset_dir_path(dataset_name).resolve()
+
+        def _has_audio_backup(audio_path: Path) -> bool:
+            backup_audio_path, _backup_caption_path = _audio_backup_paths(audio_path)
+            return backup_audio_path.exists()
+
+        def _ensure_audio_backup(audio_path: Path) -> None:
+            normalized_audio_path = _normalize_media_path(audio_path)
+            backup_audio_path, backup_caption_path = _audio_backup_paths(normalized_audio_path)
+            if backup_audio_path.exists():
+                return
+            if not normalized_audio_path.exists():
+                raise RuntimeError(f"Audio clip not found for backup: {normalized_audio_path}")
+
+            shutil.copy2(str(normalized_audio_path), str(backup_audio_path))
+            source_caption_path = normalized_audio_path.with_suffix(".txt")
+            if source_caption_path.exists() and source_caption_path.is_file():
+                shutil.copy2(str(source_caption_path), str(backup_caption_path))
+
+        def _invalidate_audio_path_cache(audio_path: Path) -> None:
+            normalized_audio_path = _normalize_media_path(audio_path)
+            audio_duration_cache.pop(normalized_audio_path, None)
+
+        def _replace_audio_clip_with_output(audio_path: Path, replacement_path: Path, operation_label: str) -> None:
+            normalized_audio_path = _normalize_media_path(audio_path)
+            replacement_resolved = Path(replacement_path).resolve()
+            if not replacement_resolved.exists():
+                raise RuntimeError(f"Processed output not found for {operation_label}: {replacement_resolved}")
+
+            if _is_dataset_audio_path(normalized_audio_path):
+                _ensure_audio_backup(normalized_audio_path)
+            stop_media(normalized_audio_path)
+            if normalized_audio_path.exists():
+                normalized_audio_path.unlink()
+            shutil.move(str(replacement_resolved), str(normalized_audio_path))
+            _invalidate_audio_path_cache(normalized_audio_path)
+
+        def _revert_audio_clip(audio_path: Path, *, ask_confirmation: bool = True, parent: Any | None = None) -> bool:
+            normalized_audio_path = _normalize_media_path(audio_path)
+            backup_audio_path, backup_caption_path = _audio_backup_paths(normalized_audio_path)
+            if not backup_audio_path.exists():
+                if parent is not None:
+                    self.messagebox.showinfo(
+                        "Revert Audio",
+                        f"No original backup exists for '{normalized_audio_path.name}'.",
+                        parent=parent,
+                    )
+                return False
+
+            if ask_confirmation:
+                confirmed = self.messagebox.askyesno(
+                    "Revert Audio",
+                    (
+                        f"Revert '{normalized_audio_path.name}' to its original backed-up version?\n\n"
+                        "This discards the current processed version."
+                    ),
+                    parent=parent or dialog,
+                )
+                if not confirmed:
+                    return False
+
+            stop_media(normalized_audio_path)
+            caption_path = normalized_audio_path.with_suffix(".txt")
+            widget = caption_widget_by_path.get(caption_path)
+            if widget is not None:
+                flush_caption_save(widget)
+
+            try:
+                if normalized_audio_path.exists():
+                    normalized_audio_path.unlink()
+                shutil.move(str(backup_audio_path), str(normalized_audio_path))
+                if backup_caption_path.exists():
+                    if caption_path.exists():
+                        caption_path.unlink()
+                    shutil.move(str(backup_caption_path), str(caption_path))
+                _invalidate_audio_path_cache(normalized_audio_path)
+            except OSError as exc:
+                if parent is not None:
+                    self.messagebox.showerror("Revert Audio", f"Could not revert clip:\n{exc}", parent=parent)
+                return False
+
+            try:
+                backup_root = _audio_backup_root_dir()
+                if not any(backup_root.iterdir()):
+                    backup_root.rmdir()
+            except OSError:
+                pass
+            return True
+
         def _audio_duration_seconds(audio_path: Path) -> float | None:
             normalized = _normalize_media_path(audio_path)
             cached = audio_duration_cache.get(normalized)
@@ -1390,7 +1686,7 @@ class DatasetEditorWindow:
             audio_duration_cache[normalized] = duration_s
             return duration_s
 
-        def _is_long_audio_clip(audio_path: Path, threshold_s: float = 15.0) -> bool:
+        def _is_long_audio_clip(audio_path: Path, threshold_s: float = 25.0) -> bool:
             duration_s = _audio_duration_seconds(audio_path)
             return duration_s is not None and duration_s > threshold_s
 
@@ -1416,6 +1712,12 @@ class DatasetEditorWindow:
                     normalized_media_path.unlink()
                 if caption_path.exists():
                     caption_path.unlink()
+                if normalized_media_path.suffix.lower() == ".wav":
+                    backup_audio_path, backup_caption_path = _audio_backup_paths(normalized_media_path)
+                    if backup_audio_path.exists():
+                        backup_audio_path.unlink()
+                    if backup_caption_path.exists():
+                        backup_caption_path.unlink()
             except OSError as exc:
                 self.messagebox.showerror("Delete clip", f"Could not delete clip:\n{exc}", parent=dialog)
                 return
@@ -1673,6 +1975,8 @@ class DatasetEditorWindow:
             if not word_rows or not full_text.strip():
                 return []
 
+            trailing_pad = 0.35
+
             class _WordTs:
                 def __init__(self, text: str, start_time: float, end_time: float) -> None:
                     self.text = text
@@ -1718,6 +2022,10 @@ class DatasetEditorWindow:
             if not sentence_ranges:
                 return []
 
+            def _segment_end_time(word_index: int) -> float:
+                capped_index = min(max(word_index, 0), len(all_words) - 1)
+                return all_words[capped_index].end_time + trailing_pad
+
             silence_cuts: set[int] = set()
             if silence_trim > 0:
                 for i in range(len(all_words) - 1):
@@ -1736,7 +2044,7 @@ class DatasetEditorWindow:
                 if cuts_in_sentence:
                     if group_texts:
                         grp_start = all_words[group_word_start].start_time
-                        grp_end = all_words[s_start - 1].end_time if s_start > 0 else grp_start
+                        grp_end = _segment_end_time(s_start - 1) if s_start > 0 else grp_start
                         combined = " ".join(group_texts).strip()
                         if combined:
                             segments.append((grp_start, grp_end, combined))
@@ -1751,7 +2059,7 @@ class DatasetEditorWindow:
                         chunk_text = " ".join(get_word_text(wi) for wi in range(chunk_start, chunk_end + 1)).strip()
                         if not chunk_text:
                             continue
-                        segments.append((all_words[chunk_start].start_time, all_words[chunk_end].end_time, chunk_text))
+                        segments.append((all_words[chunk_start].start_time, _segment_end_time(chunk_end), chunk_text))
 
                     if not is_last_sentence:
                         group_word_start = sentence_ranges[si + 1][0]
@@ -1759,7 +2067,7 @@ class DatasetEditorWindow:
 
                 if group_texts and s_start > 0 and (s_start - 1) in silence_cuts:
                     grp_start = all_words[group_word_start].start_time
-                    grp_end = all_words[s_start - 1].end_time
+                    grp_end = _segment_end_time(s_start - 1)
                     combined = " ".join(group_texts).strip()
                     if combined:
                         segments.append((grp_start, grp_end, combined))
@@ -1769,7 +2077,7 @@ class DatasetEditorWindow:
                 group_texts.append(s_text)
                 group_end_idx = s_end
                 grp_start_time = all_words[group_word_start].start_time
-                grp_end_time = all_words[min(group_end_idx, len(all_words) - 1)].end_time
+                grp_end_time = _segment_end_time(group_end_idx)
                 grp_duration = grp_end_time - grp_start_time
 
                 next_crosses_silence = False
@@ -1787,6 +2095,27 @@ class DatasetEditorWindow:
                     group_texts = []
                     if not is_last_sentence:
                         group_word_start = sentence_ranges[si + 1][0]
+
+            merged_segments: list[tuple[float, float, str]] = []
+            idx = 0
+            while idx < len(segments):
+                seg_start, seg_end, seg_text = segments[idx]
+                while (seg_end - seg_start) < min_duration and idx + 1 < len(segments):
+                    next_start, next_end, next_text = segments[idx + 1]
+                    seg_end = next_end
+                    seg_text = f"{seg_text} {next_text}".strip()
+                    idx += 1
+                merged_segments.append((seg_start, seg_end, seg_text))
+                idx += 1
+
+            if len(merged_segments) >= 2:
+                last_start, last_end, last_text = merged_segments[-1]
+                if (last_end - last_start) < min_duration:
+                    prev_start, _prev_end, prev_text = merged_segments[-2]
+                    merged_segments[-2] = (prev_start, last_end, f"{prev_text} {last_text}".strip())
+                    merged_segments.pop()
+
+            segments = merged_segments
 
             if max_duration > 0:
                 final_segments: list[tuple[float, float, str]] = []
@@ -1820,14 +2149,14 @@ class DatasetEditorWindow:
                         if should_cut:
                             sub_text = " ".join(get_word_text(j) for j in range(sub_start_idx, comma_wi + 1)).strip()
                             if sub_text:
-                                final_segments.append((sub_start_time, sub_end_time, sub_text))
+                                final_segments.append((sub_start_time, _segment_end_time(comma_wi), sub_text))
                             sub_start_idx = comma_wi + 1
 
                     last_word_idx = seg_word_indices[-1]
                     if sub_start_idx <= last_word_idx:
                         sub_text = " ".join(get_word_text(j) for j in range(sub_start_idx, last_word_idx + 1)).strip()
                         if sub_text:
-                            final_segments.append((all_words[sub_start_idx].start_time, all_words[last_word_idx].end_time, sub_text))
+                            final_segments.append((all_words[sub_start_idx].start_time, _segment_end_time(last_word_idx), sub_text))
 
                 # Hard safety pass: if punctuation-based splitting cannot reduce duration
                 # (e.g. long span without commas), enforce max_duration by word timings.
@@ -1863,7 +2192,7 @@ class DatasetEditorWindow:
                             strict_segments.append(
                                 (
                                     all_words[chunk_start_idx].start_time,
-                                    all_words[chunk_end_idx].end_time,
+                                    _segment_end_time(chunk_end_idx),
                                     chunk_text,
                                 )
                             )
@@ -2263,28 +2592,21 @@ class DatasetEditorWindow:
                     )
                     continue
 
-                final_out = normalized_audio_path.with_name(f"{normalized_audio_path.stem}_norm.wav")
-                suffix_index = 1
-                while final_out.exists() and final_out != normalized_audio_path:
-                    final_out = normalized_audio_path.with_name(
-                        f"{normalized_audio_path.stem}_norm_{suffix_index:03d}.wav"
-                    )
-                    suffix_index += 1
-
                 try:
-                    shutil.move(str(temp_out), str(final_out))
-                    source_caption = normalized_audio_path.with_suffix(".txt")
-                    target_caption = final_out.with_suffix(".txt")
-                    if source_caption.exists() and source_caption.is_file() and not target_caption.exists():
-                        target_caption.write_text(source_caption.read_text(encoding="utf-8"), encoding="utf-8")
+                    _replace_audio_clip_with_output(normalized_audio_path, temp_out, "gain normalization")
                     normalized += 1
                     self.log(
-                        f"[Dataset Editor] Normalized gain: '{normalized_audio_path.name}' -> '{final_out.name}'"
+                        f"[Dataset Editor] Normalized gain in place: '{normalized_audio_path.name}'"
                     )
                 except OSError as exc:
                     errors += 1
                     self.log(
                         f"[Dataset Editor] Gain normalization move failed for '{normalized_audio_path.name}': {exc}"
+                    )
+                except RuntimeError as exc:
+                    errors += 1
+                    self.log(
+                        f"[Dataset Editor] Gain normalization failed for '{normalized_audio_path.name}': {exc}"
                     )
 
             self.log(
@@ -2321,25 +2643,39 @@ class DatasetEditorWindow:
             if not audio_file_paths:
                 return (0, 0)
 
-            scripts_dir = Path(sys.executable).resolve().parent
             preset_map: dict[str, dict[str, str]] = {
-                "deepfilternet": {
+                "ffmpeg_denoise": {
                     "label": "Denoise",
                     "suffix": "dfn",
-                    "exe": str(scripts_dir / "deepFilter.exe"),
                 },
                 "melband_roformer": {
                     "label": "Remove Music",
                     "suffix": "mbr",
-                    "exe": str(scripts_dir / "audio-separator.exe"),
-                    "model": "melband_roformer_inst_v1.ckpt",
+                    "model": "Kim_Vocal_2.onnx",
                 },
             }
             preset = preset_map.get(preset_key)
             if preset is None:
                 raise RuntimeError(f"Unknown enhancement preset: {preset_key}")
 
-            if preset_key == "melband_roformer" and not enhancement_notice_state["remove_music_download_logged"]:
+            if preset_key == "ffmpeg_denoise" and not enhancement_notice_state["denoise_download_logged"]:
+                message = (
+                    "[Dataset Editor] Denoise first run: downloading the FFmpeg RNNoise model if missing. "
+                    "This may take a minute."
+                )
+                self.log(message)
+                print(message, flush=True)
+                enhancement_notice_state["denoise_download_logged"] = True
+
+            remove_music_model = str(preset.get("model", "")).strip()
+            remove_music_model_path = _audio_separator_model_dir() / remove_music_model if remove_music_model else None
+
+            if (
+                preset_key == "melband_roformer"
+                and not enhancement_notice_state["remove_music_download_logged"]
+                and remove_music_model_path is not None
+                and not remove_music_model_path.exists()
+            ):
                 message = (
                     "[Dataset Editor] Remove Music first run: downloading model if missing in cache. "
                     "This may take a few minutes."
@@ -2351,6 +2687,16 @@ class DatasetEditorWindow:
             dataset_dir = self.dataset_dir_path(dataset_name)
             processed = 0
             errors = 0
+            produced_filter_arg = ""
+
+            if preset_key == "ffmpeg_denoise":
+                cli_executable = _resolve_ffmpeg_executable()
+                arnndn_model_path = _ensure_arnndn_model_path()
+                produced_filter_arg = (
+                    f"arnndn=m={_escape_ffmpeg_filter_value(str(arnndn_model_path))}:mix=1"
+                )
+            else:
+                cli_executable = _resolve_audio_separator_executable()
 
             self.log(
                 f"[Dataset Editor] {preset['label']} start for '{dataset_name}' ({len(audio_file_paths)} clip(s))"
@@ -2372,28 +2718,35 @@ class DatasetEditorWindow:
                     continue
 
                 output_dir = normalized_audio_path.parent
-                cli_executable = preset.get("exe", "")
-                if not cli_executable or (not Path(cli_executable).exists()):
-                    errors += 1
-                    self.log(
-                        f"[Dataset Editor] {preset['label']} failed: CLI not found at '{cli_executable}'"
-                    )
-                    continue
-
                 run_started_at = time.time()
                 before_outputs = {
                     path.resolve()
                     for path in output_dir.glob("*.wav")
                     if path.is_file()
                 }
+                ffmpeg_temp_out = normalized_audio_path.with_name(
+                    f"{normalized_audio_path.stem}_{preset['suffix']}__tmp.wav"
+                )
+                if ffmpeg_temp_out.exists():
+                    try:
+                        ffmpeg_temp_out.unlink()
+                    except OSError:
+                        pass
 
-                if preset_key == "deepfilternet":
-                    # DeepFilterNet currently breaks with torchaudio>=2.11 due removed torchaudio.backend API.
+                if preset_key == "ffmpeg_denoise":
                     cli_cmd = [
                         cli_executable,
+                        "-y",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-i",
                         str(normalized_audio_path),
-                        "-o",
-                        str(output_dir),
+                        "-af",
+                        produced_filter_arg,
+                        "-c:a",
+                        "pcm_s16le",
+                        str(ffmpeg_temp_out),
                     ]
                 else:
                     cli_cmd = [
@@ -2407,37 +2760,45 @@ class DatasetEditorWindow:
                         "WAV",
                         "--single_stem",
                         "Vocals",
+                        "--model_file_dir",
+                        str(_audio_separator_model_dir()),
                     ]
+                    mdxc_segment_size = str(preset.get("mdxc_segment_size", "")).strip()
+                    if mdxc_segment_size:
+                        cli_cmd.extend([
+                            "--mdxc_override_model_segment_size",
+                            "--mdxc_segment_size",
+                            mdxc_segment_size,
+                        ])
 
                 cli_result = subprocess.run(cli_cmd, capture_output=True, text=True, check=False)
                 if cli_result.returncode != 0:
                     errors += 1
                     stderr_text = (cli_result.stderr or "").strip()
                     stdout_text = (cli_result.stdout or "").strip()
-                    if preset_key == "deepfilternet" and "torchaudio.backend" in (stderr_text + "\n" + stdout_text):
-                        self.log(
-                            "[Dataset Editor] DeepFilterNet failed: installed package is incompatible with current torchaudio API "
-                            "(missing 'torchaudio.backend')."
-                        )
-                    else:
-                        self.log(
-                            f"[Dataset Editor] {preset['label']} failed for '{normalized_audio_path.name}': "
-                            f"{stderr_text or stdout_text or 'tool failed'}"
-                        )
+                    failure_message = (
+                        f"[Dataset Editor] {preset['label']} failed for '{normalized_audio_path.name}': "
+                        f"{stderr_text or stdout_text or 'tool failed'}"
+                    )
+                    self.log(failure_message)
+                    print(failure_message, flush=True)
                     continue
 
-                after_outputs = {
-                    path.resolve()
-                    for path in output_dir.glob("*.wav")
-                    if path.is_file()
-                }
-                changed_outputs: list[Path] = []
-                for output_path in after_outputs:
-                    try:
-                        if output_path not in before_outputs or output_path.stat().st_mtime >= (run_started_at - 0.5):
-                            changed_outputs.append(output_path)
-                    except OSError:
-                        continue
+                if preset_key == "ffmpeg_denoise":
+                    changed_outputs: list[Path] = [ffmpeg_temp_out] if ffmpeg_temp_out.exists() else []
+                else:
+                    after_outputs = {
+                        path.resolve()
+                        for path in output_dir.glob("*.wav")
+                        if path.is_file()
+                    }
+                    changed_outputs = []
+                    for output_path in after_outputs:
+                        try:
+                            if output_path not in before_outputs or output_path.stat().st_mtime >= (run_started_at - 0.5):
+                                changed_outputs.append(output_path)
+                        except OSError:
+                            continue
 
                 if preset_key == "melband_roformer":
                     vocals_outputs = [path for path in changed_outputs if "vocals" in path.name.lower()]
@@ -2446,39 +2807,42 @@ class DatasetEditorWindow:
 
                 if not changed_outputs:
                     errors += 1
-                    self.log(
-                        f"[Dataset Editor] {preset['label']} failed for '{normalized_audio_path.name}': no output file was created or updated"
+                    failure_message = (
+                        f"[Dataset Editor] {preset['label']} failed for '{normalized_audio_path.name}': "
+                        "no output file was created or updated"
                     )
+                    self.log(failure_message)
+                    print(failure_message, flush=True)
                     continue
 
                 changed_outputs.sort(key=lambda path: path.stat().st_mtime, reverse=True)
                 produced_output = changed_outputs[0]
-                final_out = normalized_audio_path.with_name(f"{normalized_audio_path.stem}_{preset['suffix']}.wav")
-                suffix_index = 1
-                while final_out.exists() and final_out != produced_output:
-                    final_out = normalized_audio_path.with_name(
-                        f"{normalized_audio_path.stem}_{preset['suffix']}_{suffix_index:03d}.wav"
-                    )
-                    suffix_index += 1
-
                 try:
-                    if produced_output.resolve() != final_out.resolve():
-                        if final_out.exists():
-                            final_out.unlink()
-                        shutil.move(str(produced_output), str(final_out))
-                    source_caption = normalized_audio_path.with_suffix(".txt")
-                    target_caption = final_out.with_suffix(".txt")
-                    if source_caption.exists() and source_caption.is_file() and not target_caption.exists():
-                        target_caption.write_text(source_caption.read_text(encoding="utf-8"), encoding="utf-8")
+                    _replace_audio_clip_with_output(normalized_audio_path, produced_output, preset['label'])
+                    for stale_output in changed_outputs[1:]:
+                        try:
+                            if stale_output.exists():
+                                stale_output.unlink()
+                        except OSError:
+                            pass
                     processed += 1
                     self.log(
-                        f"[Dataset Editor] {preset['label']}: '{normalized_audio_path.name}' -> '{final_out.name}'"
+                        f"[Dataset Editor] {preset['label']} in place: '{normalized_audio_path.name}'"
                     )
                 except OSError as exc:
                     errors += 1
-                    self.log(
+                    failure_message = (
                         f"[Dataset Editor] {preset['label']} move failed for '{normalized_audio_path.name}': {exc}"
                     )
+                    self.log(failure_message)
+                    print(failure_message, flush=True)
+                except RuntimeError as exc:
+                    errors += 1
+                    failure_message = (
+                        f"[Dataset Editor] {preset['label']} failed for '{normalized_audio_path.name}': {exc}"
+                    )
+                    self.log(failure_message)
+                    print(failure_message, flush=True)
 
             self.log(
                 f"[Dataset Editor] {preset['label']} complete for '{dataset_name}': processed={processed}, errors={errors}"
@@ -2491,7 +2855,7 @@ class DatasetEditorWindow:
                 return
 
             label_map = {
-                "deepfilternet": "Denoise",
+                "ffmpeg_denoise": "Denoise",
                 "melband_roformer": "Remove Music",
             }
             label = label_map.get(preset_key, "Enhancement")
@@ -2504,15 +2868,13 @@ class DatasetEditorWindow:
                     def _finish_enhance() -> None:
                         _set_transcribe_busy(False, f"{label}: {processed_count} clip(s), {errors} errors")
                         if processed_count == 0 and errors > 0:
-                            if preset_key == "deepfilternet":
+                            if preset_key == "ffmpeg_denoise":
                                 self.messagebox.showerror(
                                     label,
                                     (
-                                        "Denoise failed to run in this environment.\n\n"
-                                        "Current blocker: DeepFilterNet 0.5.6 expects older torchaudio APIs "
-                                        "(missing module 'torchaudio.backend').\n\n"
-                                        "Use Remove Music for now, or move DeepFilterNet into a separate "
-                                        "audio-tools environment pinned to older torch/torchaudio."
+                                        "Denoise failed to produce any output files.\n\n"
+                                        "FFmpeg with the 'arnndn' filter must be available in PATH, and the RNNoise model must be downloadable. "
+                                        "Check the terminal log for the exact FFmpeg error."
                                     ),
                                     parent=dialog,
                                 )
@@ -2914,7 +3276,6 @@ class DatasetEditorWindow:
             trim_prompt.withdraw()
             trim_prompt.title(f"Trim Audio: {normalized_audio_path.name}")
             trim_prompt.transient(dialog)
-            trim_prompt.grab_set()
             trim_prompt.configure(bg=self.bg_panel)
             trim_prompt.resizable(False, False)
             self.set_dark_title_bar(trim_prompt)
@@ -2922,6 +3283,36 @@ class DatasetEditorWindow:
             root_frame = self.ttk.Frame(trim_prompt, padding=10)
             root_frame.grid(row=0, column=0, sticky="nsew")
             root_frame.columnconfigure(0, weight=1)
+
+            trim_busy_overlay = self.tk.Frame(
+                trim_prompt,
+                bg="#0b1018",
+                highlightthickness=1,
+                highlightbackground="#4a6ea3",
+                bd=0,
+            )
+            trim_busy_overlay.columnconfigure(0, weight=1)
+            trim_busy_overlay.rowconfigure(0, weight=1)
+            trim_busy_status_var = self.tk.StringVar(master=trim_prompt, value="")
+            self.tk.Label(
+                trim_busy_overlay,
+                textvariable=trim_busy_status_var,
+                bg="#0b1018",
+                fg=self.fg_text,
+                anchor="center",
+                justify="center",
+                padx=16,
+                pady=16,
+            ).grid(row=0, column=0, sticky="nsew")
+
+            def _set_trim_busy(is_busy: bool, status_text: str = "") -> None:
+                if is_busy:
+                    trim_busy_status_var.set(status_text or "Working...")
+                    trim_busy_overlay.place(in_=root_frame, relx=0.0, rely=0.0, relwidth=1.0, relheight=1.0)
+                    trim_busy_overlay.lift()
+                    trim_prompt.update_idletasks()
+                else:
+                    trim_busy_overlay.place_forget()
 
             start_var = self.tk.DoubleVar(master=trim_prompt, value=0.0)
             end_var = self.tk.DoubleVar(master=trim_prompt, value=float(duration_s))
@@ -3443,33 +3834,44 @@ class DatasetEditorWindow:
                 return False
 
             def _normalize_current_clip() -> None:
-                processed_count, errors = _run_normalize_audio_gain([working_audio_path])
-                if processed_count <= 0:
-                    self.messagebox.showerror("Normalize", f"Normalize failed ({errors} error(s)).", parent=trim_prompt)
-                    return
-                if not _adopt_generated_variant("norm"):
-                    self.messagebox.showerror("Normalize", "Normalized output was not found.", parent=trim_prompt)
-                    return
-                _refresh_working_clip_state()
+                _set_trim_busy(True, "Normalizing audio...")
+                try:
+                    processed_count, errors = _run_normalize_audio_gain([working_audio_path])
+                    if processed_count <= 0:
+                        self.messagebox.showerror("Normalize", f"Normalize failed ({errors} error(s)).", parent=trim_prompt)
+                        return
+                    _refresh_working_clip_state()
+                finally:
+                    _set_trim_busy(False)
 
             def _enhance_current_clip(preset_key: str) -> None:
-                label = "Denoise" if preset_key == "deepfilternet" else "Remove Music"
-                processed_count, errors = _run_audio_enhancement_preset([working_audio_path], preset_key)
-                if processed_count <= 0:
-                    if preset_key == "deepfilternet":
-                        self.messagebox.showerror(
-                            label,
-                            "Denoise failed in this environment (torchaudio.backend mismatch).",
-                            parent=trim_prompt,
-                        )
-                    else:
-                        self.messagebox.showerror(label, f"{label} failed ({errors} error(s)).", parent=trim_prompt)
+                label = "Denoise" if preset_key == "ffmpeg_denoise" else "Remove Music"
+                _set_trim_busy(True, f"Applying {label}...")
+                try:
+                    processed_count, errors = _run_audio_enhancement_preset([working_audio_path], preset_key)
+                    if processed_count <= 0:
+                        if preset_key == "ffmpeg_denoise":
+                            self.messagebox.showerror(
+                                label,
+                                "Denoise failed. Check the terminal log for the FFmpeg error.",
+                                parent=trim_prompt,
+                            )
+                        else:
+                            self.messagebox.showerror(label, f"{label} failed ({errors} error(s)).", parent=trim_prompt)
+                        return
+                    _refresh_working_clip_state()
+                finally:
+                    _set_trim_busy(False)
+
+            def _revert_current_clip() -> None:
+                if not _revert_audio_clip(normalized_audio_path, parent=trim_prompt):
                     return
-                expected_suffix = "dfn" if preset_key == "deepfilternet" else "mbr"
-                if not _adopt_generated_variant(expected_suffix):
-                    self.messagebox.showerror(label, f"{label} output was not found.", parent=trim_prompt)
-                    return
-                _refresh_working_clip_state()
+                try:
+                    shutil.rmtree(session_temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                trim_prompt.destroy()
+                _refresh_media_grid()
 
             def _cancel_trim_prompt() -> None:
                 nonlocal playback_poll_after_id
@@ -3504,13 +3906,10 @@ class DatasetEditorWindow:
 
             def _commit_trim_prompt() -> None:
                 try:
-                    stop_media(working_audio_path)
-                    if normalized_audio_path.exists():
-                        normalized_audio_path.unlink()
-                    shutil.move(str(working_audio_path), str(normalized_audio_path))
+                    _replace_audio_clip_with_output(normalized_audio_path, working_audio_path, "trim")
                     if temp_caption_path.exists():
                         temp_caption_path.unlink()
-                except OSError as exc:
+                except (OSError, RuntimeError) as exc:
                     self.messagebox.showerror("Trim Audio", f"Could not commit edited clip:\n{exc}", parent=trim_prompt)
                     return
                 try:
@@ -3537,7 +3936,7 @@ class DatasetEditorWindow:
             tools_row = self.ttk.Frame(actions_row)
             tools_row.grid(row=0, column=1)
             self.ttk.Button(tools_row, text="Normalize", command=_normalize_current_clip).grid(row=0, column=0, padx=(0, 6))
-            self.ttk.Button(tools_row, text="Denoise", command=lambda: _enhance_current_clip("deepfilternet")).grid(
+            self.ttk.Button(tools_row, text="Denoise", command=lambda: _enhance_current_clip("ffmpeg_denoise")).grid(
                 row=0,
                 column=1,
                 padx=(0, 6),
@@ -3547,6 +3946,7 @@ class DatasetEditorWindow:
                 text="Remove Music",
                 command=lambda: _enhance_current_clip("melband_roformer"),
             ).grid(row=0, column=2, padx=(0, 6))
+            self.ttk.Button(tools_row, text="Revert", command=_revert_current_clip).grid(row=0, column=3)
 
             right_actions = self.ttk.Frame(actions_row)
             right_actions.grid(row=0, column=2, sticky="e")
@@ -3601,6 +4001,18 @@ class DatasetEditorWindow:
                     command=lambda p=media_path: _start_normalize_audio_gain([p]),
                 )
                 menu.add_command(
+                    label="Denoise",
+                    command=lambda p=media_path: _start_audio_enhancement_preset([p], "ffmpeg_denoise"),
+                )
+                menu.add_command(
+                    label="Remove Music",
+                    command=lambda p=media_path: _start_audio_enhancement_preset([p], "melband_roformer"),
+                )
+                menu.add_command(
+                    label="Revert To Original",
+                    command=lambda p=media_path: (_revert_audio_clip(p, parent=dialog) and _refresh_media_grid()),
+                )
+                menu.add_command(
                     label="Trim...",
                     command=lambda p=media_path: _open_trim_audio_dialog(p),
                 )
@@ -3617,7 +4029,13 @@ class DatasetEditorWindow:
             menu.add_separator()
             menu.add_command(label="Delete", command=lambda p=media_path: _delete_media_item(p, ask_confirmation=True))
 
+            menu_dismissed = False
+
             def _dismiss_menu(_event: Any = None) -> None:
+                nonlocal menu_dismissed
+                if menu_dismissed:
+                    return
+                menu_dismissed = True
                 try:
                     menu.unpost()
                 except self.tk.TclError:
@@ -3647,8 +4065,12 @@ class DatasetEditorWindow:
                     current = getattr(current, "master", None)
                 _dismiss_menu()
 
+            def _handle_menu_unmap(_event: Any = None) -> None:
+                dialog.after_idle(_dismiss_menu)
+
             button_binding_id = dialog.bind("<Button-1>", _dismiss_if_outside, add="+")
             escape_binding_id = dialog.bind("<Escape>", _dismiss_menu, add="+")
+            menu.bind("<Unmap>", _handle_menu_unmap, add="+")
             try:
                 menu.tk_popup(event.x_root, event.y_root)
             finally:
@@ -3686,7 +4108,7 @@ class DatasetEditorWindow:
                         (0, 0, tile_size_px - 1, 28),
                         fill=(90, 15, 15),
                     )
-                    draw.text((10, 8), "SPLIT AUDIO >15s", fill=(255, 200, 200))
+                    draw.text((10, 8), "SPLIT AUDIO >25s", fill=(255, 200, 200))
             else:
                 margin = max(16, tile_size_px // 9)
                 draw.rectangle(
@@ -3729,15 +4151,19 @@ class DatasetEditorWindow:
             item_frame = self.ttk.Frame(editor_inner, padding=(4, 4, 4, 6), style="TFrame")
             item_frame.columnconfigure(0, weight=1)
 
+            def _handle_tile_double_click(_event: Any = None, path: Path = media_path, kind: str = media_kind) -> str:
+                if kind == "audio":
+                    _open_trim_audio_dialog(path)
+                else:
+                    play_media(path, kind)
+                return "break"
+
             long_audio_warning = media_kind == "audio" and _is_long_audio_clip(media_path)
             photo = build_media_thumb(media_kind, show_split_warning=long_audio_warning)
             image_label = self.ttk.Label(item_frame, image=photo, anchor="center")
             image_label.image = photo  # keep a reference alive (avoids a separate thumb_refs list)
             image_label.grid(row=0, column=0, sticky="n")
-            if media_kind == "audio":
-                image_label.bind("<Double-Button-1>", lambda _event, p=media_path: _open_trim_audio_dialog(p))
-            else:
-                image_label.bind("<Double-Button-1>", lambda _event, p=media_path, k=media_kind: play_media(p, k))
+            image_label.bind("<Double-Button-1>", _handle_tile_double_click)
             image_label.bind("<MouseWheel>", on_editor_mousewheel)
             image_label.bind("<Button-4>", on_editor_linux_up)
             image_label.bind("<Button-5>", on_editor_linux_down)
@@ -3758,6 +4184,7 @@ class DatasetEditorWindow:
                 cursor="hand2",
             )
             play_badge.place(in_=image_label, relx=1.0, rely=1.0, x=-10, y=-10, anchor="se")
+            play_badge.bind("<Double-Button-1>", _handle_tile_double_click)
 
             name_label = self.ttk.Label(
                 item_frame,
@@ -3768,6 +4195,7 @@ class DatasetEditorWindow:
             )
             name_label.grid(row=1, column=0, sticky="ew", pady=(6, 0))
             _set_single_line_name(name_label, media_path.name, tile_size_px)
+            name_label.bind("<Double-Button-1>", _handle_tile_double_click)
 
             caption_shell = self.tk.Frame(
                 item_frame,
@@ -3781,6 +4209,9 @@ class DatasetEditorWindow:
             )
             caption_shell.grid(row=2, column=0, sticky="ew", pady=(4, 0))
             caption_shell.grid_propagate(False)
+            caption_shell.bind("<Double-Button-1>", _handle_tile_double_click)
+
+            item_frame.bind("<Double-Button-1>", _handle_tile_double_click)
 
             caption_widget = self.tk.Text(
                 caption_shell,
@@ -3881,9 +4312,13 @@ class DatasetEditorWindow:
             header_label.configure(text=f"{dataset_name} ({_media_header_text(len(audio_paths), len(video_paths))})")
 
         def _populate_initial_media_grid() -> None:
-            for media_path, media_kind in media_items:
-                _build_media_tile(media_path, media_kind)
-            _regrid_media_tiles()
+            try:
+                for media_path, media_kind in media_items:
+                    _build_media_tile(media_path, media_kind)
+                _regrid_media_tiles()
+            finally:
+                if loading_label.winfo_exists():
+                    loading_label.destroy()
 
         transcribe_all_button.configure(
             command=lambda: _start_whisper_transcription(audio_paths, bool(replace_existing_var.get()))
@@ -3893,6 +4328,12 @@ class DatasetEditorWindow:
         )
         normalize_audio_button.configure(
             command=lambda: _start_normalize_audio_gain(audio_paths)
+        )
+        denoise_audio_button.configure(
+            command=lambda: _start_audio_enhancement_preset(audio_paths, "ffmpeg_denoise")
+        )
+        remove_music_button.configure(
+            command=lambda: _start_audio_enhancement_preset(audio_paths, "melband_roformer")
         )
 
         def close_editor() -> None:

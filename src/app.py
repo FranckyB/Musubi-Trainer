@@ -49,6 +49,7 @@ from .train_wan import run_job as _run_job_wan
 from .train_zimage import run_job as _run_job_zimage
 from .train_qwen import run_job as _run_job_qwen
 from .train_krea2 import run_job as _run_job_krea2
+from .train_minimax import run_job as _run_job_minimax
 from .lora_merge_utils import (
     compact_merge_selection_token,
     merge_preset_file_token,
@@ -83,6 +84,7 @@ from .launcher_shared import (
     scan_training_folders,
     dataset_image_files,
     dataset_audio_files,
+    dataset_video_files,
     is_step1_ready,
     is_step2_ready,
     is_step3_ready,
@@ -97,6 +99,7 @@ _WAN_MODELS = {"wan2.1-t2v-14b", "wan2.1-i2v-720p-14b", "wan2.1-i2v-480p-14b", "
 _ZIMAGE_MODELS = {"zimage-de-turbo"}
 _QWEN_MODELS = {"qwen-image", "qwen-image-edit", "qwen-image-edit-2509", "qwen-image-edit-2511", "qwen-image-layered"}
 _KREA2_MODELS = {"krea2"}
+_MINIMAX_MODELS = {"minimax-h3"}
 
 MUSUBI_MAIN_REPO_URL = "https://github.com/kohya-ss/musubi-tuner.git"
 MUSUBI_LTX_REPO_URL = "https://github.com/AkaneTendo25/musubi-tuner.git"
@@ -120,7 +123,89 @@ def _run_job_for_model(model_name: str):
         return _run_job_qwen
     if model_name in _KREA2_MODELS:
         return _run_job_krea2
+    if model_name in _MINIMAX_MODELS:
+        return _run_job_minimax
     return None
+
+
+def _load_model_paths_payload(settings: dict[str, str]) -> dict[str, dict[str, str]]:
+    try:
+        payload = json.loads(settings.get(app_settings.MODEL_PATHS_KEY, "{}") or "{}")
+    except Exception:
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _required_model_components_for_launch(model_name: str) -> list[tuple[str, str]]:
+    normalized_model_name = (model_name or "").strip().lower()
+    if normalized_model_name in _MINIMAX_MODELS:
+        return [
+            ("dit", "Model (DiT)"),
+            ("video_vae", "Video VAE"),
+            ("audio_vae", "Audio VAE"),
+            ("text_encoder", "Text Encoder"),
+        ]
+    if normalized_model_name in _WAN_MODELS:
+        required = [
+            ("dit", "Model (DiT)"),
+            ("vae", "VAE"),
+            ("text_encoder", "Text Encoder"),
+        ]
+        if "i2v" in normalized_model_name:
+            required.append(("clip", "CLIP"))
+        return required
+    if normalized_model_name in _LTX_MODELS:
+        return [
+            ("dit", "Model"),
+            ("text_encoder", "Text Encoder"),
+        ]
+    if normalized_model_name in _SDXL_MODELS:
+        return [("dit", "Model")]
+    return [
+        ("dit", "Model (DiT)"),
+        ("vae", "VAE"),
+        ("text_encoder", "Text Encoder"),
+    ]
+
+
+def _legacy_component_path(settings: dict[str, str], model_name: str, component: str) -> str:
+    normalized_model_name = (model_name or "").strip().lower()
+    if normalized_model_name in _KLEIN_MODELS:
+        selected_model = (settings.get(app_settings.KLEIN_MODEL_VERSION_KEY, "").strip() or "klein-base-9b").lower()
+        if normalized_model_name != selected_model:
+            return ""
+        key_map = {
+            "dit": app_settings.KLEIN_DIT_KEY,
+            "vae": app_settings.KLEIN_VAE_KEY,
+            "text_encoder": app_settings.KLEIN_TEXT_ENCODER_KEY,
+        }
+        legacy_key = key_map.get(component)
+        return settings.get(legacy_key, "").strip() if legacy_key else ""
+    if normalized_model_name in _LTX_MODELS:
+        key_map = {
+            "dit": app_settings.LTX_DIT_KEY,
+            "vae": app_settings.LTX_VAE_KEY,
+            "text_encoder": app_settings.LTX_TEXT_ENCODER_KEY,
+        }
+        legacy_key = key_map.get(component)
+        return settings.get(legacy_key, "").strip() if legacy_key else ""
+    return ""
+
+
+def _missing_model_components_for_launch(settings: dict[str, str], model_name: str) -> list[str]:
+    model_paths_payload = _load_model_paths_payload(settings)
+    stored_paths = model_paths_payload.get(model_name, {})
+    if not isinstance(stored_paths, dict):
+        stored_paths = {}
+
+    missing_labels: list[str] = []
+    for component_key, component_label in _required_model_components_for_launch(model_name):
+        raw_path = str(stored_paths.get(component_key, "") or "").strip()
+        if not raw_path:
+            raw_path = _legacy_component_path(settings, model_name, component_key)
+        if not raw_path:
+            missing_labels.append(component_label)
+    return missing_labels
 
 
 class LauncherApplication:
@@ -863,6 +948,7 @@ def _launch_ui_impl() -> int:
     thumbnail_cache: dict[tuple[str, str, int, int], ImageTk.PhotoImage] = {}
     first_image_cache: dict[str, Path | None] = {}
     audio_count_cache: dict[str, int] = {}
+    video_count_cache: dict[str, int] = {}
     checkpoint_cache: dict[str, tuple[Path | None, int]] = {}
     run_state_by_name: dict[str, str] = {}
     card_frame_by_name: dict[str, ttk.Frame] = {}
@@ -1242,6 +1328,222 @@ def _launch_ui_impl() -> int:
     def training_job_dir_path(training_name: str) -> Path:
         return runtime_config.training_dir / training_name
 
+    def resolve_ffmpeg_executable() -> str:
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path:
+            raise RuntimeError(
+                "ffmpeg was not found in PATH. Install ffmpeg to convert MiniMax audio clips into video clips."
+            )
+        ffmpeg_executable = str(Path(ffmpeg_path).resolve())
+        if not Path(ffmpeg_executable).exists():
+            raise RuntimeError(f"Resolved ffmpeg path does not exist: {ffmpeg_executable}")
+        return ffmpeg_executable
+
+    def unique_media_stem(base_stem: str, used_stems: set[str], fallback_suffix: str) -> str:
+        candidate = base_stem
+        if candidate not in used_stems:
+            used_stems.add(candidate)
+            return candidate
+
+        normalized_suffix = fallback_suffix.strip().lower() or "audio"
+        candidate = f"{base_stem}_{normalized_suffix}"
+        if candidate not in used_stems:
+            used_stems.add(candidate)
+            return candidate
+
+        counter = 2
+        while True:
+            candidate = f"{base_stem}_{normalized_suffix}_{counter}"
+            if candidate not in used_stems:
+                used_stems.add(candidate)
+                return candidate
+            counter += 1
+
+    def prepare_minimax_audio_only_videos(
+        dataset_name: str,
+        audio_files: list[Path],
+        synthetic_dir: Path,
+        caption_text: str,
+        create_missing_captions: bool,
+    ) -> tuple[Path, int]:
+        def _source_key(path: Path) -> str:
+            return str(path.resolve())
+
+        def _path_signature(path: Path | None) -> dict[str, int] | None:
+            if path is None or not path.exists() or not path.is_file():
+                return None
+            try:
+                stat_result = path.stat()
+            except OSError:
+                return None
+            return {
+                "size": int(stat_result.st_size),
+                "mtime_ns": int(stat_result.st_mtime_ns),
+            }
+
+        def _manifest_path() -> Path:
+            return synthetic_dir / ".synthetic_audio_videos.json"
+
+        def _load_manifest() -> dict[str, dict[str, object]]:
+            manifest_path = _manifest_path()
+            if not manifest_path.exists() or not manifest_path.is_file():
+                return {}
+            try:
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+            if not isinstance(payload, dict):
+                return {}
+            entries = payload.get("entries", {})
+            return entries if isinstance(entries, dict) else {}
+
+        def _save_manifest(entries: dict[str, dict[str, object]]) -> None:
+            payload = {
+                "dataset_name": dataset_name,
+                "entries": entries,
+            }
+            _manifest_path().write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        ffmpeg_executable = resolve_ffmpeg_executable()
+        synthetic_dir.mkdir(parents=True, exist_ok=True)
+        created_caption_count = 0
+        used_stems: set[str] = set()
+        existing_entries = _load_manifest()
+        current_audio_paths = [path.resolve() for path in audio_files]
+        current_audio_keys = {_source_key(path) for path in current_audio_paths}
+        desired_entries: dict[str, dict[str, object]] = {}
+        removed_outputs = 0
+        generated_videos = 0
+        refreshed_videos = 0
+        reused_videos = 0
+        synced_captions = 0
+
+        for source_key, entry in existing_entries.items():
+            if source_key not in current_audio_keys:
+                output_stem = str(entry.get("output_stem", "") or "").strip()
+                if not output_stem:
+                    continue
+                for stale_path in (synthetic_dir / f"{output_stem}.mp4", synthetic_dir / f"{output_stem}.txt"):
+                    if stale_path.exists() and stale_path.is_file():
+                        try:
+                            stale_path.unlink()
+                            removed_outputs += 1
+                        except OSError:
+                            pass
+
+        for audio_path in current_audio_paths:
+            caption_path = audio_path.with_suffix(".txt")
+            if create_missing_captions and not caption_path.exists():
+                caption_path.write_text(caption_text, encoding="utf-8")
+                created_caption_count += 1
+
+            source_key = _source_key(audio_path)
+            prior_entry = existing_entries.get(source_key, {})
+            output_stem = str(prior_entry.get("output_stem", "") or "").strip()
+            if output_stem:
+                used_stems.add(output_stem)
+            else:
+                output_stem = unique_media_stem(audio_path.stem, used_stems, audio_path.suffix.lstrip("."))
+
+            output_video_path = synthetic_dir / f"{output_stem}.mp4"
+            output_caption_path = synthetic_dir / f"{output_stem}.txt"
+            audio_signature = _path_signature(audio_path)
+            caption_signature = _path_signature(caption_path)
+            needs_video_refresh = (
+                not output_video_path.exists()
+                or prior_entry.get("audio_signature") != audio_signature
+                or prior_entry.get("caption_signature") != caption_signature
+            )
+
+            if needs_video_refresh:
+                was_existing_video = output_video_path.exists()
+                ffmpeg_cmd = [
+                    ffmpeg_executable,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=512x512:r=24",
+                    "-i",
+                    str(audio_path),
+                    "-shortest",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-movflags",
+                    "+faststart",
+                    str(output_video_path),
+                ]
+                completed = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=False)
+                if completed.returncode != 0:
+                    stderr_text = (completed.stderr or completed.stdout or "").strip()
+                    raise RuntimeError(
+                        f"Failed to convert audio-only dataset '{dataset_name}' clip '{audio_path.name}' into a synthetic video: "
+                        f"{stderr_text or 'ffmpeg failed'}"
+                    )
+                if was_existing_video:
+                    refreshed_videos += 1
+                else:
+                    generated_videos += 1
+            else:
+                reused_videos += 1
+
+            if caption_path.exists():
+                if (
+                    needs_video_refresh
+                    or not output_caption_path.exists()
+                    or prior_entry.get("caption_signature") != caption_signature
+                ):
+                    shutil.copyfile(caption_path, output_caption_path)
+                    synced_captions += 1
+            elif output_caption_path.exists():
+                try:
+                    output_caption_path.unlink()
+                    removed_outputs += 1
+                except OSError:
+                    pass
+
+            desired_entries[source_key] = {
+                "output_stem": output_stem,
+                "audio_signature": audio_signature,
+                "caption_signature": caption_signature,
+            }
+
+        desired_stems = {
+            str(entry.get("output_stem", "") or "").strip()
+            for entry in desired_entries.values()
+            if str(entry.get("output_stem", "") or "").strip()
+        }
+        for candidate in synthetic_dir.iterdir():
+            if not candidate.is_file():
+                continue
+            if candidate.name == ".synthetic_audio_videos.json":
+                continue
+            if candidate.suffix.lower() not in {".mp4", ".txt"}:
+                continue
+            if candidate.stem in desired_stems:
+                continue
+            try:
+                candidate.unlink()
+                removed_outputs += 1
+            except OSError:
+                pass
+
+        _save_manifest(desired_entries)
+        log(
+            "[MiniMax] Synthetic audio-video sync for "
+            f"'{dataset_name}': generated={generated_videos}, refreshed={refreshed_videos}, "
+            f"reused={reused_videos}, captions_synced={synced_captions}, removed={removed_outputs}"
+        )
+
+        return synthetic_dir, created_caption_count
+
     def ensure_training_job_structure(
         training_name: str,
         default_caption_keyword: str,
@@ -1282,7 +1584,7 @@ def _launch_ui_impl() -> int:
             "[general]",
             f"resolution = [{toml_width}, {toml_height}]",
             'caption_extension = ".txt"',
-            f"batch_size = {batch_size}",
+            f"batch_size = {1 if model_name_key == 'minimax-h3' else batch_size}",
             "enable_bucket = true",
             "bucket_no_upscale = false",
             "",
@@ -1293,6 +1595,7 @@ def _launch_ui_impl() -> int:
         for ds_idx, ds in enumerate(datasets):
             ds_name = ds["name"]
             num_repeats = int(ds.get("num_repeats", 1))
+            dataset_entry_kind = "image"
 
             if is_ltx_audio_mode:
                 audio_files = dataset_audio_files(datasets_root_dir(), ds_name)
@@ -1307,6 +1610,47 @@ def _launch_ui_impl() -> int:
                             continue
                         caption_path.write_text(caption_text, encoding="utf-8")
                         created_captions += 1
+            elif model_name_key == "minimax-h3":
+                video_files = dataset_video_files(datasets_root_dir(), ds_name)
+                image_files = dataset_image_files(datasets_root_dir(), ds_name)
+                audio_files = dataset_audio_files(datasets_root_dir(), ds_name)
+
+                if video_files:
+                    media_dir = video_files[0].parent
+                    dataset_entry_kind = "video"
+
+                    if create_missing_captions:
+                        for video_path in video_files:
+                            caption_path = video_path.with_suffix(".txt")
+                            if caption_path.exists():
+                                continue
+                            caption_path.write_text(caption_text, encoding="utf-8")
+                            created_captions += 1
+                elif audio_files and not image_files:
+                    synthetic_dir = job_dir / ("video_dataset" if ds_idx == 0 else f"video_dataset_{ds_name}")
+                    media_dir, created_caption_count = prepare_minimax_audio_only_videos(
+                        ds_name,
+                        audio_files,
+                        synthetic_dir,
+                        caption_text,
+                        create_missing_captions,
+                    )
+                    created_captions += created_caption_count
+                    dataset_entry_kind = "video"
+                else:
+                    if not image_files:
+                        raise RuntimeError(
+                            f"Dataset media not found for: {ds_name}. MiniMax expects video clips, audio clips, or images."
+                        )
+                    media_dir = image_files[0].parent
+
+                    if create_missing_captions:
+                        for image_path in image_files:
+                            caption_path = image_path.with_suffix(".txt")
+                            if caption_path.exists():
+                                continue
+                            caption_path.write_text(caption_text, encoding="utf-8")
+                            created_captions += 1
             else:
                 image_files = dataset_image_files(datasets_root_dir(), ds_name)
                 if not image_files:
@@ -1333,6 +1677,16 @@ def _launch_ui_impl() -> int:
                     f"num_repeats = {num_repeats}",
                     'audio_bucket_strategy = "truncate"',
                     "audio_bucket_interval = 15.0",
+                    "",
+                ]
+            elif dataset_entry_kind == "video":
+                toml_lines += [
+                    "[[datasets]]",
+                    f'video_directory = "{media_dir.resolve().as_posix()}"',
+                    f'cache_directory = "{cache_dir.resolve().as_posix()}"',
+                    f"num_repeats = {num_repeats}",
+                    "target_frames = [124]",
+                    'frame_extraction = "head"',
                     "",
                 ]
             else:
@@ -3928,7 +4282,7 @@ def _launch_ui_impl() -> int:
             ("command", {"label": "LoRA Post-Hoc EMA Merge", "command": lambda: merge_job_output_loras(clicked)}),
             ("command", {"label": "Duplicate Job", "command": lambda: duplicate_job(clicked)}),
             ("command", {"label": "Edit Job", "command": lambda: open_create_job_dialog(existing_job=job_queue[clicked])}),
-            ("command", {"label": "Clear Job Cache", "command": clear_clicked_job_cache}),
+            ("command", {"label": "Force Recache (Clear Cached Latents)", "command": clear_clicked_job_cache}),
             ("command", {"label": "Reset Job (Fresh Start)", "command": reset_clicked_job}),
         ]
         if clicked_status == "broken":
@@ -4465,14 +4819,14 @@ def _launch_ui_impl() -> int:
         job_name = job.get("job_name", "unnamed")
         cache_dirs = _job_cache_dirs(job)
         if not cache_dirs:
-            messagebox.showinfo("Clear job cache", f"No cache folders found for '{job_name}'.", parent=root)
+            messagebox.showinfo("Force recache", f"No cache folders found for '{job_name}'.", parent=root)
             return
 
         if not messagebox.askyesno(
-            "Clear job cache",
+            "Force recache",
             (
                 f"Delete cached latents/text encodes for '{job_name}'?\n\n"
-                "This removes files inside cache folders so they can be regenerated on next run."
+                "This forces the next run to rebuild the cache from source clips."
             ),
             parent=root,
         ):
@@ -4491,18 +4845,21 @@ def _launch_ui_impl() -> int:
                         deleted_files += 1
                 except OSError as exc:
                     messagebox.showerror(
-                        "Clear job cache failed",
+                        "Force recache failed",
                         f"Could not remove:\n{child}\n\n{exc}",
                         parent=root,
                     )
                     return
 
         log(
-            f"[Queue] Cleared cache for {job_name}: {deleted_files} file(s), {deleted_dirs} folder(s) removed."
+            f"[Queue] Forced recache for {job_name}: {deleted_files} file(s), {deleted_dirs} folder(s) removed."
         )
         messagebox.showinfo(
-            "Clear job cache",
-            f"Cleared cache for '{job_name}'.\nRemoved {deleted_files} file(s) and {deleted_dirs} folder(s).",
+            "Force recache",
+            (
+                f"Forced recache for '{job_name}'.\n"
+                f"Removed {deleted_files} file(s) and {deleted_dirs} folder(s)."
+            ),
             parent=root,
         )
 
@@ -4910,6 +5267,14 @@ def _launch_ui_impl() -> int:
         audio_count_cache[dataset_name] = count
         return count
 
+    def dataset_video_count(dataset_name: str) -> int:
+        cached = video_count_cache.get(dataset_name)
+        if cached is not None:
+            return cached
+        count = len(dataset_video_files(datasets_root_dir(), dataset_name))
+        video_count_cache[dataset_name] = count
+        return count
+
     def make_thumbnail(
         image_path: Path | None,
         run_state: str,
@@ -5156,6 +5521,7 @@ def _launch_ui_impl() -> int:
         if force:
             first_image_cache.clear()
             audio_count_cache.clear()
+            video_count_cache.clear()
             thumbnail_cache.clear()
             checkpoint_cache.clear()
 
@@ -5174,6 +5540,7 @@ def _launch_ui_impl() -> int:
         for stale_name in stale_names:
             first_image_cache.pop(stale_name, None)
             audio_count_cache.pop(stale_name, None)
+            video_count_cache.pop(stale_name, None)
             checkpoint_cache.pop(stale_name, None)
 
         if not names:
@@ -5213,6 +5580,7 @@ def _launch_ui_impl() -> int:
 
             image_path = first_image_path(name)
             audio_count = dataset_audio_count(name)
+            video_count = dataset_video_count(name)
             thumb = make_thumbnail(image_path, train_state, thumb_px, has_audio=(audio_count > 0))
             card_thumb_by_name[name] = thumb
 
@@ -5225,7 +5593,11 @@ def _launch_ui_impl() -> int:
             title_label = ttk.Label(card, text=name, style=title_style, anchor="center")
             title_label.grid(row=1, column=0, sticky="ew", pady=(6, 0))
             image_count = len(dataset_image_files(datasets_root_dir(), name))
-            if image_count > 0 and audio_count > 0:
+            if video_count > 0 and audio_count > 0:
+                status_text = f"{video_count} VID / {audio_count} AUD"
+            elif video_count > 0:
+                status_text = f"{video_count} VID"
+            elif image_count > 0 and audio_count > 0:
                 status_text = f"{image_count} IMG / {audio_count} CLIP"
             elif audio_count > 0:
                 status_text = f"{audio_count} CLIP"
@@ -5489,14 +5861,10 @@ def _launch_ui_impl() -> int:
                     queued_model_name = queued_job.get("model", "klein-base-9b") or "klein-base-9b"
                     queued_runtime_config = runtime_config_for_model(settings_state, queued_model_name) or runtime_config
 
-                    if queued_runtime_config is None or queued_runtime_config.dit is None or queued_runtime_config.vae is None or queued_runtime_config.text_encoder is None:
-                        missing = []
-                        if queued_runtime_config is None or queued_runtime_config.dit is None:
-                            missing.append("Model (DiT)")
-                        if queued_runtime_config is None or queued_runtime_config.vae is None:
-                            missing.append("VAE")
-                        if queued_runtime_config is None or queued_runtime_config.text_encoder is None:
-                            missing.append("Text Encoder")
+                    missing = _missing_model_components_for_launch(settings_state, queued_model_name)
+                    if queued_runtime_config is None or missing:
+                        if queued_runtime_config is None and not missing:
+                            missing = [label for _component, label in _required_model_components_for_launch(queued_model_name)]
 
                         queue_play_mode = False
 
@@ -5680,6 +6048,19 @@ def _launch_ui_impl() -> int:
                                         run_job_kwargs["turbo_lora_multiplier"] = 1.0
                                 run_job_kwargs["convrot_int8"] = flag_to_bool(job.get("krea2_convrot_int8", "0"))
                                 run_job_kwargs["convrot_int8_bwd"] = str(job.get("krea2_convrot_int8_bwd", "bf16") or "bf16")
+                            elif job_run_fn is _run_job_minimax:
+                                try:
+                                    model_paths_payload = json.loads(settings_state.get(app_settings.MODEL_PATHS_KEY, "{}") or "{}")
+                                except Exception:
+                                    model_paths_payload = {}
+                                minimax_model_paths = model_paths_payload.get("minimax-h3", {}) if isinstance(model_paths_payload, dict) else {}
+                                video_vae_raw = str(minimax_model_paths.get("video_vae", "") or "").strip()
+                                audio_vae_raw = str(minimax_model_paths.get("audio_vae", "") or "").strip()
+                                if video_vae_raw:
+                                    run_job_kwargs["video_vae_path"] = Path(video_vae_raw).expanduser()
+                                if audio_vae_raw:
+                                    run_job_kwargs["audio_vae_path"] = Path(audio_vae_raw).expanduser()
+                                run_job_kwargs["blocks_to_swap"] = get_non_negative_int_setting(job, "blocks_to_swap", 0)
                             elif job_run_fn is _run_job_sdxl:
                                 run_job_kwargs["lr_scheduler"] = str(job.get("lr_scheduler", "constant") or "constant")
                                 run_job_kwargs["lr_warmup_steps"] = get_non_negative_int_setting(job, "lr_warmup_steps", 0)

@@ -6,6 +6,14 @@ from pathlib import Path
 from . import app_settings
 
 VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+VALID_VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".webm",
+    ".avi",
+    ".m4v",
+}
 VALID_AUDIO_EXTENSIONS = {
     ".wav",
     ".flac",
@@ -132,6 +140,14 @@ def dataset_audio_files(training_dir: Path, dataset_name: str) -> list[Path]:
         return []
 
     return sorted([p for p in dataset_dir.iterdir() if p.is_file() and p.suffix.lower() in VALID_AUDIO_EXTENSIONS])
+
+
+def dataset_video_files(training_dir: Path, dataset_name: str) -> list[Path]:
+    dataset_dir = training_dir / dataset_name
+    if not dataset_dir.exists() or not dataset_dir.is_dir():
+        return []
+
+    return sorted([p for p in dataset_dir.iterdir() if p.is_file() and p.suffix.lower() in VALID_VIDEO_EXTENSIONS])
 
 
 def is_step1_ready(training_dir: Path, dataset_name: str) -> bool:

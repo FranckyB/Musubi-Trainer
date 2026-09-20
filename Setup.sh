@@ -140,10 +140,6 @@ while IFS= read -r requirement; do
             SKIPPED_REQUIREMENTS+=("$requirement (optional on this Linux setup; skipped to avoid interpreter-specific wheel issues)")
             continue
             ;;
-        deepfilternet==*)
-            SKIPPED_REQUIREMENTS+=("$requirement (optional; pulls Rust build dependency and is currently incompatible with the torchaudio version used here)")
-            continue
-            ;;
     esac
     printf '%s\n' "$requirement" >> "$REQ_FILE"
 done < requirements.txt

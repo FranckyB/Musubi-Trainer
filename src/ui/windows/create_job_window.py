@@ -197,7 +197,7 @@ class CreateJobWindow:
             )
             dialog.destroy()
             return
-        _AUDIO_CAPABLE_MODELS = {"ltx-2.3"}
+        _AUDIO_CAPABLE_MODELS = {"ltx-2.3", "minimax-h3"}
         _VALID_AUDIO_EXTENSIONS = {
             ".wav",
             ".flac",
@@ -207,6 +207,14 @@ class CreateJobWindow:
             ".opus",
             ".aac",
             ".wma",
+        }
+        _VALID_VIDEO_EXTENSIONS = {
+            ".mp4",
+            ".mov",
+            ".mkv",
+            ".webm",
+            ".avi",
+            ".m4v",
         }
         selected_dataset_names_for_type_check: list[str] = [
             str(ds.get("name", "")).strip()
@@ -226,8 +234,27 @@ class CreateJobWindow:
                 ]
             )
 
+        def _dataset_video_files(dataset_name_value: str) -> list[Path]:
+            dataset_dir = self.datasets_root_dir() / dataset_name_value
+            if not dataset_dir.exists() or not dataset_dir.is_dir():
+                return []
+            return sorted(
+                [
+                    path
+                    for path in dataset_dir.iterdir()
+                    if path.is_file() and path.suffix.lower() in _VALID_VIDEO_EXTENSIONS
+                ]
+            )
+
+        def _dataset_is_audio_only(dataset_name_value: str) -> bool:
+            return bool(
+                _dataset_audio_files(dataset_name_value)
+                and not self.dataset_image_files(self.datasets_root_dir(), dataset_name_value)
+                and not _dataset_video_files(dataset_name_value)
+            )
+
         def _selected_datasets_require_audio_mode() -> bool:
-            return any(_dataset_audio_files(name) for name in selected_dataset_names_for_type_check)
+            return any(_dataset_is_audio_only(name) for name in selected_dataset_names_for_type_check)
 
         if existing_job is not None and model_var.get() not in _avail_models:
             model_var.set(_avail_models[0])
@@ -1745,7 +1772,7 @@ class CreateJobWindow:
             model_name = model_var.get().strip()
             is_sd_scripts = self.backend_kind_for_model(model_name) == "sd-scripts"
             family_name = _model_to_family.get(model_name, "")
-            supports_blocks_to_swap = family_name in {"LTX", "Krea2"}
+            supports_blocks_to_swap = family_name in {"LTX", "Krea2", "MiniMax"}
             supports_timestep_sampling = family_name in {"LTX", "Krea2"}
 
             for widget, enabled_state in _advanced_state_specs:
@@ -2000,6 +2027,23 @@ class CreateJobWindow:
                 "batch_size": "1",
                 "max_data_loader_n_workers": _recommended_data_loader_workers_text(),
             },
+            "MiniMax": {
+                "optimizer_type": "prodigy",
+                "optimizer_args": self.DEFAULT_PRODIGY_OPTIMIZER_ARGS,
+                "learning_rate": self.DEFAULT_LEARNING_RATE,
+                "train_steps": str(self.DEFAULT_TRAIN_STEPS),
+                "save_every_n_steps": _default_save_every_from_settings,
+                "network_dim": "16",
+                "network_alpha": "16",
+                "lr_scheduler": "constant",
+                "lr_warmup_steps": "0",
+                "gradient_accumulation_steps": "1",
+                "blocks_to_swap": "32",
+                "timestep_sampling": "sigma",
+                "resolution": "512",
+                "batch_size": "1",
+                "max_data_loader_n_workers": _recommended_data_loader_workers_text(),
+            },
             "LTX": {
                 "optimizer_type": "adamw8bit",
                 "optimizer_args": "",
@@ -2187,6 +2231,7 @@ class CreateJobWindow:
         # dataset_entries entries are {"name", "num_repeats_var", "frame"}
         dataset_image_count_cache: dict[str, int] = {}
         dataset_audio_count_cache: dict[str, int] = {}
+        dataset_video_count_cache: dict[str, int] = {}
         dataset_thumbnail_cache: dict[tuple[str, int, str, int], Any] = {}
         estimated_epochs_var = self.tk.StringVar(value="Est. epochs: n/a")
 
@@ -2253,10 +2298,21 @@ class CreateJobWindow:
             dataset_audio_count_cache[name] = count
             return count
 
+        def _dataset_video_count(name: str) -> int:
+            cached = dataset_video_count_cache.get(name)
+            if cached is not None:
+                return cached
+            count = len(_dataset_video_files(name))
+            dataset_video_count_cache[name] = count
+            return count
+
         def _dataset_sample_count(name: str) -> int:
             image_count = _dataset_image_count(name)
             if image_count > 0:
                 return image_count
+            video_count = _dataset_video_count(name)
+            if video_count > 0:
+                return video_count
             return _dataset_audio_count(name)
 
         def _refresh_estimated_epochs() -> None:
@@ -2326,8 +2382,13 @@ class CreateJobWindow:
                     row=0, column=1, sticky="w", padx=(0, 12)
                 )
                 image_count = _dataset_image_count(entry["name"])
+                video_count = _dataset_video_count(entry["name"])
                 audio_count = _dataset_audio_count(entry["name"])
-                if audio_count > 0 and image_count == 0:
+                if video_count > 0 and audio_count > 0:
+                    media_label = f"({video_count} Videos, {audio_count} Audio Clips)"
+                elif video_count > 0:
+                    media_label = f"({video_count} Video{'s' if video_count != 1 else ''})"
+                elif audio_count > 0 and image_count == 0:
                     media_label = f"({audio_count} Audio Clip{'s' if audio_count != 1 else ''})"
                 elif image_count > 0 and audio_count == 0:
                     media_label = f"({image_count} Image{'s' if image_count != 1 else ''})"

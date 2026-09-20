@@ -11,7 +11,7 @@ The app is now job-first:
 
 ## Current Support
 
-- Model families: Klein (FLUX.2), LTX, Wan, Z-Image, Qwen
+- Model families: Klein (FLUX.2), Krea2, MiniMax H3, LTX, Wan, Z-Image, Qwen
 - Tested in this launcher: Klein and LTX
 - Platform focus: Windows
 
@@ -136,6 +136,45 @@ On Linux:
 	- Klein VAE
 	- Klein Text Encoder
 4. Save Settings.
+
+For MiniMax H3 specifically, you must set all four MiniMax paths in Settings:
+
+- MiniMax H3 FL2VA/T2VA DiT
+- MiniMax H3 Video VAE
+- MiniMax H3 Audio VAE
+- Qwen3-VL 32B MiniMax-H3 Text Encoder
+
+MiniMax audio-only dataset preparation also requires `ffmpeg` to be available in PATH.
+
+## MiniMax H3 Notes
+
+MiniMax H3 support is available in the launcher, but it is still a heavier and less-forgiving path than Klein/LTX.
+
+Current launcher behavior:
+
+- Video datasets are used directly.
+- Image datasets are trained through MiniMax's image-compatible path.
+- Audio-only datasets are converted into synthetic black-frame `.mp4` files inside the job folder so MiniMax can ingest them.
+- Editing a MiniMax job re-syncs those synthetic `.mp4` files: stale ones are removed, new audio clips are converted, and changed clips are refreshed.
+
+Important limits and expectations:
+
+- MiniMax jobs are generated with `batch_size = 1`.
+- Audio-only MiniMax jobs currently use `target_frames = [124]` with `frame_extraction = "head"`.
+- At 24 fps, that means each training sample uses about the first `5.17s` of audio/video from a clip, not the full source duration.
+- Very long clips are therefore not especially useful for MiniMax in the current launcher flow; shorter clips around that range are a better fit.
+- MiniMax H3 has a high VRAM footprint. Even on a `32 GB` GPU, `512x512` with LoRA rank `32` may still run out of memory.
+
+If MiniMax H3 OOMs:
+
+- Lower LoRA `network_dim` / `network_alpha` first. A safer starting point is `16 / 16`.
+- Keep resolution conservative.
+- Use the job context menu option `Force Recache (Clear Cached Latents)` if you changed source clips and want a clean recache.
+- If the job still does not fit, use a lighter family for the same dataset.
+
+MiniMax-specific note:
+
+- Torch compile is disabled automatically for MiniMax jobs in this launcher because Inductor compile-time benchmarking can cause extra VRAM spikes.
 
 ## Job Workflow
 

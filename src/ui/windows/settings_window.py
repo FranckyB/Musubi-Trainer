@@ -350,7 +350,7 @@ class SettingsWindow:
         self.ttk.Label(trainers_section, textvariable=musubi_main_status_var).grid(row=2, column=1, sticky="w")
         self.ttk.Label(
             trainers_section,
-            text="Used for: FLUX2, KREA2, QWEN, ZIMAGE, WAN",
+            text="Used for: FLUX2, KREA2, MINIMAX, QWEN, WAN, ZIMAGE",
             foreground=self.fg_muted,
         ).grid(row=2, column=2, columnspan=2, sticky="w")
 
@@ -485,6 +485,8 @@ class SettingsWindow:
         _COMPONENT_LABELS: dict[str, str] = {
             "dit": "Model",
             "vae": "VAE",
+            "video_vae": "Video VAE",
+            "audio_vae": "Audio VAE",
             "text_encoder": "Text Encoder",
             "t5": "T5",
             "clip": "CLIP",

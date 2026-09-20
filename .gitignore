@@ -2,6 +2,7 @@
 Models/*
 !Models/.gitkeep
 Jobs/*
+Temp/
 !Jobs/.gitkeep
 Datasets/*
 !Datasets/.gitkeep

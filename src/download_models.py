@@ -402,12 +402,18 @@ MODELS: dict[str, dict[str, dict]] = {
         "dit": {
             "repo_id": "krea/Krea-2-Raw",
             "filename": "raw.safetensors",
+            "alt_filenames": [
+                "krea2_raw_int8_convrot.safetensors",
+            ],
             "shards": False,
             "folder_name": "krea2-raw",
         },
         "dit_turbo": {
             "repo_id": "krea/Krea-2-Turbo",
             "filename": "turbo.safetensors",
+            "alt_filenames": [
+                "krea2_turbo_int8_convrot.safetensors",
+            ],
             "shards": False,
             "folder_name": "krea2-turbo",
         },
@@ -422,6 +428,43 @@ MODELS: dict[str, dict[str, dict]] = {
             "filename": "text_encoders/qwen3vl_4b_bf16.safetensors",
             "shards": False,
             "folder_name": "qwen3-vl-4b",
+        },
+    },
+
+    # ── MiniMax H3 ─────────────────────────────────────────────────────
+    "minimax-h3": {
+        "dit": {
+            "repo_id": "Comfy-Org/MiniMax-H3",
+            "filename": "diffusion_models/minimax_h3_fl2va_bf16.safetensors",
+            "alt_filenames": [
+                "diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors",
+                "diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors",
+                "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            ],
+            "shards": False,
+            "folder_name": "minimax-h3-fl2va",
+        },
+        "video_vae": {
+            "repo_id": "Comfy-Org/MiniMax-H3",
+            "filename": "vae/minimax_h3_video_vae_fp16.safetensors",
+            "shards": False,
+            "folder_name": "minimax-h3-vae",
+        },
+        "audio_vae": {
+            "repo_id": "Comfy-Org/MiniMax-H3",
+            "filename": "vae/minimax_h3_audio_vae_fp32.safetensors",
+            "shards": False,
+            "folder_name": "minimax-h3-vae",
+        },
+        "text_encoder": {
+            "repo_id": "Comfy-Org/MiniMax-H3",
+            "filename": "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
+            "alt_filenames": [
+                "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+                "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            ],
+            "shards": False,
+            "folder_name": "minimax-h3-text-encoder",
         },
     },
 
@@ -460,6 +503,7 @@ MODEL_FAMILIES: dict[str, list[str]] = {
     "FLUX.2": ["flux2-dev", "klein-base-9b", "klein-9b", "klein-base-4b", "klein-4b"],
     "Krea2": ["krea2"],
     "LTX": ["ltx-2.3"],
+    "MiniMax": ["minimax-h3"],
     "Wan": ["wan2.1-t2v-14b", "wan2.1-i2v-720p-14b", "wan2.1-i2v-480p-14b", "wan2.2-t2v-14b"],
     "Z-Image": ["zimage-de-turbo"],
     "Qwen-Image": ["qwen-image", "qwen-image-edit", "qwen-image-edit-2509", "qwen-image-edit-2511", "qwen-image-layered"],
@@ -510,6 +554,10 @@ COMPONENT_FRIENDLY_NAMES: dict[str, str] = {
     "krea2-raw":           "Krea 2 RAW DiT",
     "krea2-turbo":         "Krea 2 Turbo DiT",
     "qwen3-vl-4b":         "Qwen3-VL 4B Text Encoder",
+    # MiniMax H3
+    "minimax-h3-fl2va":        "MiniMax-H3 FL2VA/T2VA DiT",
+    "minimax-h3-vae":          "MiniMax-H3 Video/Audio VAE",
+    "minimax-h3-text-encoder": "Qwen3-VL 32B MiniMax-H3 Text Encoder",
 }
 
 MODEL_DISPLAY_NAMES: dict[str, str] = {
@@ -533,6 +581,7 @@ MODEL_DISPLAY_NAMES: dict[str, str] = {
     "qwen-image-edit-2511": "Qwen-Image Edit 25.11",
     "qwen-image-layered": "Qwen-Image Layered",
     "krea2": "Krea 2",
+    "minimax-h3": "MiniMax H3",
 }
 
 # Optional per-model suffix used when Create Job auto-builds names like
@@ -559,7 +608,19 @@ JOB_NAME_EQUIVALENCE_BY_MODEL: dict[str, str] = {
     "qwen-image-edit-2511": "QwenEdit",
     "qwen-image-layered": "Qwen",
     "krea2": "Krea2",
+    "minimax-h3": "MiniMax",
 }
+
+
+def _candidate_filenames(info: dict) -> list[str]:
+    primary = str(info.get("filename", "") or "").strip()
+    alternates = info.get("alt_filenames", [])
+    values: list[str] = []
+    if primary:
+        values.append(primary)
+    if isinstance(alternates, list):
+        values.extend(str(value).strip() for value in alternates if str(value).strip())
+    return values
 
 # Canonical model version strings used as --model_version CLI argument
 # (keyed by model_name, value is the string passed to Musubi-Tuner training scripts)
@@ -623,11 +684,11 @@ def find_in_models_folder(
         return None
     folder_name = info.get("folder_name", model_name)
     folder = models_folder(ws_root) / folder_name
-    # The stored filename may contain subdirectory separators (e.g. Wan Comfy-Org
-    # repackaged files have "split_files/..." paths). Only keep the basename.
-    bare_name = Path(info["filename"]).name
-    candidate = folder / bare_name
-    return candidate if candidate.is_file() else None
+    for filename in _candidate_filenames(info):
+        candidate = folder / Path(filename).name
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def find_in_hf_cache(model_name: str, component: str) -> Path | None:
@@ -643,20 +704,22 @@ def find_in_hf_cache(model_name: str, component: str) -> Path | None:
         return None
 
     # 1. Exact repo match (fast path)
-    found = _hf_try_load(info["repo_id"], info["filename"])
-    if found:
-        return found
+    candidate_filenames = _candidate_filenames(info)
+    for filename in candidate_filenames:
+        found = _hf_try_load(info["repo_id"], filename)
+        if found:
+            return found
 
     # 2. Scan all cached repos for a file with the same basename.
     #    This handles cases where the file was cached from a mirror / repackaged repo.
-    target_name = Path(info["filename"]).name
+    target_names = {Path(filename).name.casefold() for filename in candidate_filenames}
     try:
         from huggingface_hub import scan_cache_dir  # type: ignore
         cache_info = scan_cache_dir()
         for repo in cache_info.repos:
             for rev in repo.revisions:
                 for cached_file in rev.files:
-                    if Path(cached_file.file_path).name == target_name:
+                    if Path(cached_file.file_path).name.casefold() in target_names:
                         p = Path(str(cached_file.file_path))
                         if p.is_file():
                             return p
@@ -678,14 +741,13 @@ def find_in_extra_paths(
     info = MODELS.get(model_name, {}).get(component)
     if not info:
         return None
-    target_name = Path(info["filename"]).name
-    target_lower = target_name.casefold()
+    target_lowers = {Path(filename).name.casefold() for filename in _candidate_filenames(info)}
     for root_dir in extra_paths:
         root = Path(root_dir)
         if not root.is_dir():
             continue
         for dirpath, _dirs, files in os.walk(root):
-            match_name = next((name for name in files if name.casefold() == target_lower), None)
+            match_name = next((name for name in files if name.casefold() in target_lowers), None)
             if match_name:
                 candidate = Path(dirpath) / match_name
                 if candidate.is_file():
